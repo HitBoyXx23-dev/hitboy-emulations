@@ -1,0 +1,10 @@
+[package]
+name = "gba"
+version = "0.1.0"
+edition = "2021"
+description = "Game Boy Advance on our own ARM7TDMI core: PPU, sound, DMA, timers, saves, high-level BIOS"
+
+[dependencies]
+state = { path = "../state" }
+cpuarm7 = { path = "../cpuarm7" }
+gb = { path = "../gb" }

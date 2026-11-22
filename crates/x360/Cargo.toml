@@ -1,0 +1,8 @@
+[package]
+name = "x360"
+version = "0.1.0"
+edition = "2021"
+description = "Xbox 360 on our own cores (work in progress)"
+
+[dependencies]
+cpuxenon = { path = "../cpuxenon" }

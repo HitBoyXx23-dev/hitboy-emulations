@@ -1,0 +1,8 @@
+[package]
+name = "cpuz80"
+version = "0.1.0"
+edition = "2021"
+description = "Zilog Z80 interpreter (ColecoVision, Master System, Game Gear, Genesis sound CPU)"
+
+[dependencies]
+state = { path = "../state" }

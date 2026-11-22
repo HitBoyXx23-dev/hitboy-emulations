@@ -1,0 +1,12 @@
+[package]
+name = "cpur3000"
+version = "0.1.0"
+edition = "2021"
+description = "MIPS R3000A (PlayStation CPU) interpreter core in C++"
+
+[dependencies]
+state = { path = "../state" }
+
+[build-dependencies]
+cc = "1"
+

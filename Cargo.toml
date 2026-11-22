@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/cpu6502", "crates/cpui686", "crates/state", "crates/state_derive", "crates/pchw", "crates/xbox", "crates/xboxone", "crates/ps5", "crates/gamedump", "crates/cpur5900", "crates/ps2", "crates/cpu8086", "crates/cpu65816", "crates/cpur3000", "crates/cpuarm7", "crates/cpuvr4300", "crates/n64", "crates/cpugekko", "crates/gc", "crates/cpuxenon", "crates/x360", "crates/switch", "crates/gba", "crates/cpusm83", "crates/nes", "crates/atari2600", "crates/intv", "crates/cpuz80", "crates/sms", "crates/atari7800", "crates/web", "crates/pce", "crates/ws", "crates/vb", "crates/cpu68k", "crates/md", "crates/ios", "crates/gb", "crates/snes", "crates/psx", "crates/pc", "crates/frontend", "crates/apps/hitboy"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,9 @@
+[package]
+name = "sms"
+version = "0.1.0"
+edition = "2021"
+description = "Sega Master System and Game Gear on our own Z80, VDP and SN76489"
+
+[dependencies]
+cpuz80 = { path = "../cpuz80" }
+state = { path = "../state" }

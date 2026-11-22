@@ -1,0 +1,11 @@
+[package]
+name = "md"
+version = "0.1.0"
+edition = "2021"
+description = "Sega Genesis / Mega Drive on our own 68000, Z80, VDP, YM2612 and SN76489"
+
+[dependencies]
+state = { path = "../state" }
+cpu68k = { path = "../cpu68k" }
+cpuz80 = { path = "../cpuz80" }
+sms = { path = "../sms" }

@@ -1,0 +1,8 @@
+[package]
+name = "ps5"
+version = "0.1.0"
+edition = "2021"
+description = "PlayStation 5 / PlayStation 4 games decrypted from your own console: program loader, import resolver and package info"
+
+[dependencies]
+cpui686 = { path = "../cpui686" }

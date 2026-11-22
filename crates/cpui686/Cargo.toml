@@ -1,0 +1,5 @@
+[package]
+name = "cpui686"
+version = "0.1.0"
+edition = "2021"
+description = "Intel Pentium III (i686) interpreter: real and protected mode, paging, the original Xbox's CPU"

@@ -1,0 +1,8 @@
+[package]
+name = "ws"
+version = "0.1.0"
+edition = "2021"
+description = "Bandai WonderSwan / WonderSwan Color on our own V30MZ"
+
+[dependencies]
+state = { path = "../state" }

@@ -1,0 +1,5 @@
+[package]
+name = "wasmlibc"
+version = "0.1.0"
+edition = "2021"
+description = "The few C library pieces our C++ CPU cores need when built for the browser (WebAssembly)"

@@ -1,0 +1,11 @@
+[package]
+name = "ios"
+version = "0.1.0"
+edition = "2021"
+description = "iPhone / iPad apps on our own core (in progress): .ipa, plist and Mach-O reading"
+
+[dependencies]
+cpuarm7 = { path = "../cpuarm7" }
+lzfse_rust = "0.2"
+switch = { path = "../switch" }
+zip = { version = "2", default-features = false, features = ["deflate"] }

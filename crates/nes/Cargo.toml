@@ -1,0 +1,9 @@
+[package]
+name = "nes"
+version = "0.1.0"
+edition = "2021"
+description = "Nintendo Entertainment System: bus, PPU, cartridges and controllers"
+
+[dependencies]
+state = { path = "../state" }
+cpu6502 = { path = "../cpu6502" }

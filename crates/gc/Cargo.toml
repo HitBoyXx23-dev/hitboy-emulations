@@ -1,0 +1,10 @@
+[package]
+name = "gc"
+version = "0.1.0"
+edition = "2021"
+description = "Nintendo GameCube on our own Gekko core"
+
+[dependencies]
+cpugekko = { path = "../cpugekko" }
+aes = "0.8"
+cbc = "0.1"

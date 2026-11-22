@@ -1,0 +1,8 @@
+[package]
+name = "pce"
+version = "0.1.0"
+edition = "2021"
+description = "NEC TurboGrafx-16 / PC Engine on our own HuC6280, VDC, VCE and PSG"
+
+[dependencies]
+state = { path = "../state" }

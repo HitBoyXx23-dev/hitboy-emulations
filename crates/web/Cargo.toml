@@ -1,0 +1,25 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2021"
+description = "Play-in-the-browser build: our cores compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "=0.2.127"
+sms = { path = "../sms" }
+pce = { path = "../pce" }
+ws = { path = "../ws" }
+vb = { path = "../vb" }
+md = { path = "../md" }
+nes = { path = "../nes" }
+gb = { path = "../gb" }
+gba = { path = "../gba" }
+snes = { path = "../snes" }
+atari2600 = { path = "../atari2600" }
+atari7800 = { path = "../atari7800" }
+wasmlibc = { path = "../wasmlibc" }
+state = { path = "../state" }
+zip = { version = "2", default-features = false, features = ["deflate"] }

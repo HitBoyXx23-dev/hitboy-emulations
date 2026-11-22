@@ -1,0 +1,9 @@
+[package]
+name = "ps2"
+version = "0.1.0"
+edition = "2021"
+description = "PlayStation 2: the Emotion Engine, its memory map and hardware registers (in progress)"
+
+[dependencies]
+cpur5900 = { path = "../cpur5900" }
+cpur3000 = { path = "../cpur3000" }

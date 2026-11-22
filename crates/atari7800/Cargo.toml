@@ -1,0 +1,10 @@
+[package]
+name = "atari7800"
+version = "0.1.0"
+edition = "2021"
+description = "Atari 7800 on our own 6502 and MARIA, with the 2600's TIA (sound) and RIOT"
+
+[dependencies]
+state = { path = "../state" }
+cpu6502 = { path = "../cpu6502" }
+atari2600 = { path = "../atari2600" }

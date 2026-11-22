@@ -1,0 +1,13 @@
+/target
+/dist
+websites/hitboy/
+# Never commit game images, BIOS or firmware dumps.
+*.nes
+*.iso
+*.bin
+*.pkg
+*.nsp
+*.xci
+*.ipsw
+*.xvc
+*.msixvc

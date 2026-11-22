@@ -1,0 +1,8 @@
+[package]
+name = "vb"
+version = "0.1.0"
+edition = "2021"
+description = "Nintendo Virtual Boy on our own V810, VIP and VSU"
+
+[dependencies]
+state = { path = "../state" }

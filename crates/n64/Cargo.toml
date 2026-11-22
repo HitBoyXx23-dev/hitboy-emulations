@@ -1,0 +1,8 @@
+[package]
+name = "n64"
+version = "0.1.0"
+edition = "2021"
+description = "Nintendo 64 on our own VR4300 core: RCP (RSP + RDP), video, audio, controllers, saves"
+
+[dependencies]
+cpuvr4300 = { path = "../cpuvr4300" }

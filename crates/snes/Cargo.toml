@@ -1,0 +1,10 @@
+[package]
+name = "snes"
+version = "0.1.0"
+edition = "2021"
+description = "Super Nintendo: bus, DMA/HDMA, PPU, APU/DSP on our own 65C816 + SPC700 cores"
+
+[dependencies]
+state = { path = "../state" }
+cpu65816 = { path = "../cpu65816" }
+

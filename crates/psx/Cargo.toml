@@ -1,0 +1,10 @@
+[package]
+name = "psx"
+version = "0.1.0"
+edition = "2021"
+description = "Sony PlayStation on our own R3000A core: GTE, GPU, SPU, CD-ROM, DMA, timers"
+
+[dependencies]
+cpur3000 = { path = "../cpur3000" }
+state = { path = "../state" }
+

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{FULL}} — console emulation and virtual machines for Windows</title>
+<meta name="description" content="{{FULL}} plays NES, SNES, Game Boy, Game Boy Color and PlayStation games on its own emulation cores, and runs virtual machines. Free for Windows.">
+<link rel="icon" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --primary: {{PRIMARY}};
+    --secondary: {{SECONDARY}};
+    --bg: #07070b;
+    --panel: #0e0e15;
+    --line: #1d1d29;
+    --text: #ececf3;
+    --muted: #9696a8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--bg); color: var(--text); font-family: Inter, "Segoe UI", system-ui, sans-serif; line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  a { color: inherit; text-decoration: none; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  header { position: sticky; top: 0; z-index: 10; background: rgba(7,7,11,.85); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
+  header .wrap { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 18px; letter-spacing: -.01em; }
+  .brand img { width: 30px; height: 30px; border-radius: 8px; }
+  .brand span { color: var(--muted); font-weight: 500; }
+  nav { display: flex; gap: 28px; font-size: 14px; color: var(--muted); }
+  nav a:hover { color: var(--text); }
+
+  .hero { padding: 96px 0 72px; position: relative; overflow: hidden; }
+  .hero::before { content: ""; position: absolute; inset: -30% -10% auto; height: 520px; background: radial-gradient(closest-side, color-mix(in srgb, var(--primary) 28%, transparent), transparent 70%), radial-gradient(closest-side at 70% 40%, color-mix(in srgb, var(--secondary) 22%, transparent), transparent 70%); pointer-events: none; }
+  .hero .wrap { position: relative; display: grid; grid-template-columns: 1.2fr .8fr; gap: 48px; align-items: center; }
+  .eyebrow { display: inline-block; font-size: 13px; font-weight: 600; color: var(--primary); border: 1px solid color-mix(in srgb, var(--primary) 45%, transparent); padding: 4px 12px; border-radius: 99px; margin-bottom: 22px; }
+  h1 { font-size: clamp(38px, 6vw, 62px); line-height: 1.04; letter-spacing: -.035em; font-weight: 800; }
+  h1 em { font-style: normal; background: linear-gradient(90deg, var(--primary), var(--secondary)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lead { font-size: 18px; color: var(--muted); margin: 22px 0 34px; max-width: 540px; }
+  .cta { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  .btn { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; padding: 14px 24px; border-radius: 12px; transition: transform .15s, box-shadow .15s; }
+  .btn-primary { background: linear-gradient(135deg, var(--primary), var(--secondary)); color: #fff; box-shadow: 0 10px 30px -10px var(--primary); }
+  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 14px 34px -10px var(--primary); }
+  .btn-ghost { border: 1px solid var(--line); color: var(--text); }
+  .btn-ghost:hover { border-color: var(--muted); }
+  .tabs { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--line); padding: 4px; border-radius: 12px; }
+  .tabs a { padding: 7px 16px; border-radius: 9px; font-size: 14px; font-weight: 600; color: var(--muted); }
+  .tabs a.on { background: linear-gradient(135deg, var(--primary), var(--secondary)); color: #fff; }
+  .tabs a:not(.on):hover { color: var(--text); }
+  .meta { font-size: 13px; color: var(--muted); margin-top: 14px; }
+  .mark { justify-self: center; width: min(320px, 70vw); aspect-ratio: 1; border-radius: 28%; box-shadow: 0 40px 90px -30px color-mix(in srgb, var(--primary) 60%, transparent); }
+
+  section { padding: 80px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 32px; letter-spacing: -.02em; font-weight: 800; margin-bottom: 10px; }
+  .sub { color: var(--muted); margin-bottom: 40px; max-width: 620px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 24px; }
+  .card h3 { font-size: 16px; margin-bottom: 6px; }
+  .card p { color: var(--muted); font-size: 14px; }
+  .dot { width: 34px; height: 34px; border-radius: 10px; margin-bottom: 16px; background: linear-gradient(135deg, color-mix(in srgb, var(--primary) 30%, transparent), color-mix(in srgb, var(--secondary) 30%, transparent)); border: 1px solid color-mix(in srgb, var(--primary) 40%, transparent); display: grid; place-items: center; font-size: 15px; font-weight: 800; color: var(--text); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  .ok { color: #4ade80; font-weight: 600; }
+  .soon { color: var(--muted); }
+
+  .steps { counter-reset: s; display: grid; gap: 14px; }
+  .steps li { list-style: none; counter-increment: s; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px 18px 64px; position: relative; color: var(--muted); }
+  .steps li strong { color: var(--text); }
+  .steps li::before { content: counter(s); position: absolute; left: 20px; top: 16px; width: 28px; height: 28px; border-radius: 8px; background: var(--primary); color: #fff; font-weight: 700; display: grid; place-items: center; font-size: 14px; }
+
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; margin-bottom: 10px; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p { color: var(--muted); margin-top: 10px; }
+
+  .download { text-align: center; }
+  .download .btn { font-size: 17px; padding: 18px 32px; }
+  footer { border-top: 1px solid var(--line); padding: 32px 0; color: var(--muted); font-size: 13px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+  @media (max-width: 820px) {
+    .hero .wrap { grid-template-columns: 1fr; }
+    .mark { width: 180px; order: -1; justify-self: start; }
+    .grid { grid-template-columns: 1fr; }
+    nav { display: none; }
+    th:nth-child(3), td:nth-child(3) { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <a class="brand" href="#"><img src="logo.png" alt="">{{NAME}} <span>Emulations</span></a>
+    <nav><a href="#features">Features</a><a href="#consoles">Consoles</a><a href="#start">Get started</a><a href="#faq">FAQ</a></nav>
+    <div class="tabs"><a class="on" href="index.html">Download</a><a href="play/index.html">Use online</a></div>
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <div class="wrap">
+      <div>
+        <span class="eyebrow">Free for Windows · Version {{VERSION}}</span>
+        <h1>Your games and machines,<br><em>one app.</em></h1>
+        <p class="lead">{{FULL}} plays NES, SNES, Game Boy, Game Boy Advance, Nintendo 64, PlayStation, Atari, Sega, TurboGrafx-16, WonderSwan and Virtual Boy games on emulation cores we built ourselves, finds free games for you, and runs virtual machines.</p>
+        <div class="cta">
+          <a class="btn btn-primary" href="{{ZIP}}" download>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 20h16"/></svg>
+            Download for Windows
+          </a>
+          <a class="btn btn-ghost" href="play/index.html">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+            Play online
+          </a>
+        </div>
+        <p class="meta">Windows 10 or 11, 64-bit · {{SIZE}} download · No installer needed</p>
+      </div>
+      <img class="mark" src="logo.png" alt="{{FULL}} logo">
+    </div>
+  </div>
+
+  <section id="features">
+    <div class="wrap">
+      <h2>Built from scratch</h2>
+      <p class="sub">Every console runs on our own C++ and Rust cores. Nothing is borrowed from another emulator.</p>
+      <div class="grid">
+        <div class="card"><div class="dot">▶</div><h3>Play on our own cores</h3><p>CPU, graphics and sound for each console, written in C++ and Rust for speed.</p></div>
+        <div class="card"><div class="dot">★</div><h3>Free games built in</h3><p>Browse over a thousand free homebrew games by console, genre, year and maker, and add them in one click.</p></div>
+        <div class="card"><div class="dot">⌂</div><h3>A tidy library</h3><p>Box art is found automatically. Games you add are copied into the app's own folder.</p></div>
+        <div class="card"><div class="dot">◎</div><h3>Controllers just work</h3><p>Xbox, PlayStation and Switch Pro controllers, with per-game controls you can remap.</p></div>
+        <div class="card"><div class="dot">♪</div><h3>Clean sound and sharp pictures</h3><p>Smooth, crackle-free audio, crisp pixels at any size, and frame rates up to 240 FPS.</p></div>
+        <div class="card"><div class="dot">▣</div><h3>Virtual machines</h3><p>Run ISO and disk images, with a guided Arch Linux setup.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="consoles">
+    <div class="wrap">
+      <h2>Consoles</h2>
+      <p class="sub">More are on the way: GameCube 3D graphics, Wii, PlayStation 2, the original Xbox and Xbox 360.</p>
+      <table>
+        <thead><tr><th>Console</th><th>Status</th><th>Files</th></tr></thead>
+        <tbody>
+          <tr><td>NES / Famicom</td><td class="ok">Playable</td><td>.nes, .zip</td></tr>
+          <tr><td>Super Nintendo</td><td class="ok">Playable</td><td>.sfc, .smc</td></tr>
+          <tr><td>Game Boy / Game Boy Color</td><td class="ok">Playable</td><td>.gb, .gbc, .zip</td></tr>
+          <tr><td>Game Boy Advance</td><td class="ok">Playable (no BIOS needed)</td><td>.gba, .zip</td></tr>
+          <tr><td>Nintendo 64</td><td class="ok">Early access</td><td>.z64, .n64, .v64</td></tr>
+          <tr><td>GameCube</td><td class="ok">Early access (homebrew)</td><td>.dol, .iso, .gcm</td></tr>
+          <tr><td>PlayStation</td><td class="ok">Playable (needs your BIOS)</td><td>.cue, .bin, .iso, .exe</td></tr>
+          <tr><td>PlayStation 2</td><td class="soon">In development</td><td>.iso</td></tr>
+          <tr><td>Xbox / Xbox 360</td><td class="soon">In development</td><td>.iso</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="wrap">
+      <h2>Get started</h2>
+      <p class="sub">Up and running in under a minute.</p>
+      <ol class="steps">
+        <li><strong>Download and unzip.</strong> Put the folder anywhere, for example your Documents.</li>
+        <li><strong>Open {{EXE}}.</strong> If Windows SmartScreen appears, click <em>More info</em>, then <em>Run anyway</em>.</li>
+        <li><strong>Add games.</strong> Pick a console in Games and click <em>Add files</em>, or grab free games from Discover.</li>
+        <li><strong>Play.</strong> Click a game. Plug in a controller any time.</li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="faq">
+    <div class="wrap">
+      <h2>Questions</h2>
+      <p class="sub">&nbsp;</p>
+      <details><summary>Is it free?</summary><p>Yes. The app is free, and so are the homebrew games in Discover.</p></details>
+      <details><summary>Why does PlayStation need a BIOS?</summary><p>PlayStation games start from the console's own startup software. Dump it from your console and add it in Settings › BIOS files.</p></details>
+      <details><summary>Where are my saves?</summary><p>Next to each game: <code>.sav</code> for cartridge games and <code>.mcd</code> memory cards for PlayStation.</p></details>
+      <details><summary>Windows says the app is unrecognised</summary><p>New apps without a paid code-signing certificate show this warning. Click <em>More info</em> and then <em>Run anyway</em>.</p></details>
+    </div>
+  </section>
+
+  <section class="download">
+    <div class="wrap">
+      <h2>Ready to play?</h2>
+      <p class="sub" style="margin:0 auto 32px">{{FULL}} {{VERSION}} for Windows · {{SIZE}}</p>
+      <a class="btn btn-primary" href="{{ZIP}}" download>Download {{FULL}}</a>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>© {{YEAR}} {{FULL}}</span>
+    <span>Only play games you own or that are freely shared by their creators.</span>
+  </div>
+</footer>
+</body>
+</html>

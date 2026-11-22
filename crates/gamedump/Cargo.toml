@@ -1,0 +1,19 @@
+[package]
+name = "gamedump"
+version = "0.1.0"
+edition = "2021"
+description = "Game Dump Helper: checks and verifies game dumps from your own discs and consoles, lists disc drives, copies data discs to ISO, and hashes files"
+
+[lib]
+name = "gamedump"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gamedump"
+path = "src/main.rs"
+
+[dependencies]
+ps5 = { path = "../ps5" }
+xbox = { path = "../xbox" }
+xboxone = { path = "../xboxone" }
+switch = { path = "../switch" }

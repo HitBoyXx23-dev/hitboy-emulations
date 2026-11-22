@@ -1,0 +1,9 @@
+[package]
+name = "gb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+state = { path = "../state" }
+cpusm83 = { path = "../cpusm83" }
+

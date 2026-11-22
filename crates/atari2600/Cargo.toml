@@ -1,0 +1,9 @@
+[package]
+name = "atari2600"
+version = "0.1.0"
+edition = "2021"
+description = "Atari 2600 (VCS) on our own 6507, TIA and RIOT"
+
+[dependencies]
+state = { path = "../state" }
+cpu6502 = { path = "../cpu6502" }

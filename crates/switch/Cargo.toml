@@ -1,0 +1,7 @@
+[package]
+name = "switch"
+version = "0.1.0"
+edition = "2021"
+description = "Nintendo Switch on our own cores (work in progress): packages, keys, then the ARM64 CPU"
+
+[dependencies]

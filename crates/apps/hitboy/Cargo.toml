@@ -1,0 +1,11 @@
+[package]
+name = "hitboy"
+version = "0.1.0"
+edition = "2021"
+description = "HitBoy's Emulations desktop app"
+
+[dependencies]
+frontend = { path = "../../frontend" }
+
+[build-dependencies]
+winresource = "0.1"

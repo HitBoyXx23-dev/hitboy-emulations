@@ -1,0 +1,102 @@
+GETTING YOUR OWN GAMES FROM YOUR OWN CONSOLES AND DISCS
+
+Everything here is for games you own, on discs and consoles you own. Nothing in this app or tool contains keys or ways around a console's protection, and none of it should be used to share games. Where a step would need to break a console's protection, this guide says so and stops.
+
+----------------------------------------------------------------------
+Step 0. Check what you have
+----------------------------------------------------------------------
+Run:  gamedump check <file or folder>
+It says which console the file is for, which game it is, and whether the dump looks complete. Use it before and after every step below.
+Run:  gamedump hash <file>
+It prints SHA-1 and CRC-32. The public Redump database (redump.org) lists those numbers for known-good discs, so you can tell a perfect copy from a damaged one.
+
+----------------------------------------------------------------------
+PlayStation 1 (and PlayStation 2)
+----------------------------------------------------------------------
+Discs are readable by an ordinary PC disc drive.
+  PlayStation 1: make a RAW image (a .bin plus a .cue sheet). A plain .iso loses music and video tracks. Free tools that do this well: ImgBurn, and the Redump project's recommended dumpers (redumper, DiscImageCreator) described on redump.org.
+  PlayStation 2: a DVD drive can copy the data to an .iso. "gamedump drives" lists your drives and "gamedump rip E: out.iso" copies a plain data disc (2048-byte sectors) to an ISO file, zero-filling and reporting any sector it can't read.
+PlayStation 1 games also need a console BIOS from your own PlayStation (SCPH1001.BIN etc.). The app never downloads one; use Settings > BIOS files > Find on this PC.
+
+----------------------------------------------------------------------
+Original Xbox and Xbox 360
+----------------------------------------------------------------------
+Retail Xbox and Xbox 360 game discs hide their game data from normal PC drives, so a normal drive and tool see only a short video partition. Getting the real data needs a disc drive with special firmware, which is outside what this tool does. The Redump project documents the accepted methods and which drives work. The result is an .iso (original Xbox: "XISO"; 360: a game .iso). Check it with "gamedump check".
+Original Xbox: also needs the console's flash BIOS and MCPX boot ROM from your own console (Settings > BIOS files).
+Xbox 360 games already installed on the console's hard drive are packaged for that console; they can't be used elsewhere without the console's own tools.
+
+----------------------------------------------------------------------
+GameCube and Wii
+----------------------------------------------------------------------
+These discs aren't readable by a normal PC drive. The usual route is a homebrew disc dumper that you run on your own Wii (it reads the disc in the Wii's drive and writes a .iso to an SD card or USB drive). Use the full image, not a trimmed or compressed one: "gamedump check" warns when an image is smaller than a full disc.
+
+----------------------------------------------------------------------
+Xbox One and Xbox Series X|S
+----------------------------------------------------------------------
+Store and disc games are encrypted for the console they were installed on. The keys live in the
+console's secure hardware and never come out, so there is no way to copy a retail title to a PC
+and no tool can change that. If you have seen a download offering to do it, it cannot work, and
+those downloads are very often malware.
+
+What genuinely works, and what this tool supports:
+
+  Developer Mode apps. On an Xbox you own, Microsoft's Developer Mode runs apps and games you
+  build yourself or are given as developer packages. These are not encrypted, so they can be
+  copied to a PC and run. Put the package folder (the one holding MicrosoftGame.config or
+  appxmanifest.xml) where you can reach it and run:
+
+      gamedump xbox <package folder>
+
+  That reads the manifest, checks the package is complete, lists every library the game imports
+  and says which ones this PC can already provide. Then it maps the game's own x86-64 code into
+  this process and runs it on your processor, reporting what it printed, which functions our
+  replacements answered, and which are still missing.
+
+  To check a package without running it, use "gamedump check <folder>". To list the Xbox
+  libraries that still need writing, see crates/xboxone/src/modules.rs: everything marked
+  "not available yet" there is what is stopping a given title from getting further.
+
+Honest limits: the graphics, audio and input libraries are not written yet, so a title gets as
+far as its start-up code and stops. That is the next piece of work, not a setting you can change.
+
+----------------------------------------------------------------------
+PlayStation 4 and PlayStation 5
+----------------------------------------------------------------------
+Store and disc games are encrypted for the console. Sony provides no way to copy them off the console. Games and homebrew that someone has legitimately decrypted from their own console come out as a folder with an eboot.bin and an sce_sys folder; this app can read such a folder (title, program segments, and the system functions it calls). Running them is still being built.
+This guide doesn't cover modifying a console's software.
+
+----------------------------------------------------------------------
+Nintendo Switch
+----------------------------------------------------------------------
+Game cards and eShop games are encrypted with keys that belong to your console. Getting a game
+off the console means running software on it that Nintendo did not approve; this guide doesn't
+cover that, and this tool doesn't contain keys.
+
+If you already have an .nsp or .xci file you made from a game you own, "gamedump check <file>"
+reads the package, counts the game content inside and tells you whether a ticket is included.
+It doesn't open the encrypted content.
+
+----------------------------------------------------------------------
+Why there is no "dump it from the console" button
+----------------------------------------------------------------------
+A tool that copies games off an Xbox, PlayStation or Switch has to run on the console itself,
+and consoles only run software their maker has signed. Making one run anyway means exploiting
+the console, which this project does not provide, so there is no console-side dumper here. What
+the tool does do is everything on the PC side: identify the file, check it is complete, hash it,
+copy a data disc from a PC drive, and read packages you already have.
+
+----------------------------------------------------------------------
+Sending files from another device to this PC
+----------------------------------------------------------------------
+Run:  gamedump receive [folder] [--max-gb N]
+(The default limit is 64 GB per file; --max-gb raises or lowers it, for example --max-gb 200.)
+It prints a web address. Open that address in the browser on another device on your network (an
+Xbox, a PlayStation, a Switch, a phone, another PC), choose files and press Send. They are
+saved into the folder. The address contains a secret and only works while the command runs.
+This only sends files the other device's browser is allowed to read, such as files on a USB
+drive. It can't reach a console's protected game data, and it is not a way around that.
+
+----------------------------------------------------------------------
+After you have a good dump
+----------------------------------------------------------------------
+Put the file in a games folder, open the app, and add it with "Add files". Save files, save states and rewind are handled by the app.

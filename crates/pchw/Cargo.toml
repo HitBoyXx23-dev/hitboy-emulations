@@ -1,0 +1,5 @@
+[package]
+name = "pchw"
+version = "0.1.0"
+edition = "2021"
+description = "PC support chips shared by our x86 machines: 8259 interrupt controllers, 8254 timer, CMOS clock"

@@ -1,0 +1,7 @@
+[package]
+name = "intv"
+version = "0.1.0"
+edition = "2021"
+description = "Mattel Intellivision on our own CP1610, STIC and AY-3-8914"
+
+[dependencies]

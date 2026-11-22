@@ -1,0 +1,45 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop GUI: game library, virtual machines, settings, and the game player"
+
+[dependencies]
+nes = { path = "../nes" }
+atari2600 = { path = "../atari2600" }
+atari7800 = { path = "../atari7800" }
+sms = { path = "../sms" }
+pce = { path = "../pce" }
+ws = { path = "../ws" }
+vb = { path = "../vb" }
+md = { path = "../md" }
+ios = { path = "../ios" }
+switch = { path = "../switch" }
+pc = { path = "../pc" }
+gb = { path = "../gb" }
+snes = { path = "../snes" }
+psx = { path = "../psx" }
+gba = { path = "../gba" }
+n64 = { path = "../n64" }
+gc = { path = "../gc" }
+xbox = { path = "../xbox" }
+x360 = { path = "../x360" }
+xboxone = { path = "../xboxone" }
+intv = { path = "../intv" }
+ps5 = { path = "../ps5" }
+gamedump = { path = "../gamedump" }
+ps2 = { path = "../ps2" }
+eframe = "0.31"
+gilrs = "0.11"
+rfd = "0.15"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+cpal = "0.15"
+resvg = "0.45"
+sevenz-rust = { version = "0.6", features = ["compress"] }
+rars = "0.9"
+state = { path = "../state" }

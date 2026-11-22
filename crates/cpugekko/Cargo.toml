@@ -1,0 +1,8 @@
+[package]
+name = "cpugekko"
+version = "0.1.0"
+edition = "2021"
+description = "IBM Gekko (GameCube CPU) PowerPC interpreter core in C++"
+
+[build-dependencies]
+cc = "1"

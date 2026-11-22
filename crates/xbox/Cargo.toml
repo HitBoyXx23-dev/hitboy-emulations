@@ -1,0 +1,9 @@
+[package]
+name = "xbox"
+version = "0.1.0"
+edition = "2021"
+description = "Original Xbox (2001): XISO discs, XBE executables and the machine (Pentium III, NV2A, MCPX)"
+
+[dependencies]
+cpui686 = { path = "../cpui686" }
+pchw = { path = "../pchw" }

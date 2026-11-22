@@ -1,0 +1,5 @@
+[package]
+name = "xboxone"
+version = "0.1.0"
+edition = "2021"
+description = "Xbox One / Series X|S: reads decrypted game packages (appxmanifest, MicrosoftGame.config, PE32+) for our own API-translation layer"

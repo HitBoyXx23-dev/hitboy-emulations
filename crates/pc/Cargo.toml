@@ -1,0 +1,9 @@
+[package]
+name = "pc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpui686 = { path = "../cpui686" }
+
+pchw = { path = "../pchw" }

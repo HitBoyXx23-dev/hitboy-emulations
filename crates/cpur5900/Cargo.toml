@@ -1,0 +1,8 @@
+[package]
+name = "cpur5900"
+version = "0.1.0"
+edition = "2021"
+description = "PlayStation 2 Emotion Engine CPU (R5900): 64-bit MIPS with 128-bit registers, in Rust"
+
+[dependencies]
+state = { path = "../state" }

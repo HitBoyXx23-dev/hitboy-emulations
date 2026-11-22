@@ -1,0 +1,11 @@
+[package]
+name = "cpu6502"
+version = "0.1.0"
+edition = "2021"
+description = "MOS 6502 interpreter core written in C++, exposed to Rust over a C ABI"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+state = { path = "../state" }

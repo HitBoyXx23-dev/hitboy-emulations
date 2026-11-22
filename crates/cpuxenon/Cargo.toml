@@ -1,0 +1,8 @@
+[package]
+name = "cpuxenon"
+version = "0.1.0"
+edition = "2021"
+description = "IBM Xenon (Xbox 360 CPU) 64-bit PowerPC interpreter core in C++"
+
+[build-dependencies]
+cc = "1"

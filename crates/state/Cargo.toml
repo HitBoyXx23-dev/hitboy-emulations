@@ -1,0 +1,8 @@
+[package]
+name = "state"
+version = "0.1.0"
+edition = "2021"
+description = "Save states and rewind: one symmetric description of a machine's state, used for both saving and loading"
+
+[dependencies]
+state_derive = { path = "../state_derive" }
