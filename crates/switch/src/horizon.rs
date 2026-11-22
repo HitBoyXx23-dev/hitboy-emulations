@@ -96,6 +96,10 @@ pub struct Process {
     /// Live 0RGB framebuffer scanout for desktop display.
     pub framebuffer: Vec<u32>,
     pub fb_size: (usize, usize),
+    /// Interleaved stereo f32 PCM samples appended via `audout:u` `AppendAudioOutBuffer`.
+    pub audio_samples: Vec<f32>,
+    /// Tags of audio buffers already consumed and ready for `GetReleasedAudioOutBuffer`.
+    pub(crate) released_audio_tags: Vec<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -164,7 +168,14 @@ impl Process {
             pad_buttons: 0,
             framebuffer: vec![0; 640 * 360],
             fb_size: (640, 360),
+            audio_samples: Vec::new(),
+            released_audio_tags: Vec::new(),
         })
+    }
+
+    /// Drains interleaved stereo f32 PCM audio produced by `audout:u`.
+    pub fn take_audio(&mut self, out: &mut Vec<f32>) {
+        out.append(&mut self.audio_samples);
     }
 
     /// Maps the shared frontend 12-bit controller mask to Switch `HidNpadButton` flags.

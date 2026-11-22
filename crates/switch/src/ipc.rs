@@ -478,6 +478,44 @@ impl Process {
             }
             (Service::AudOut, 0) => Ok(Reply { data: 0u32.to_le_bytes().to_vec(), ..Reply::default() }),
             (Service::AudOut, 1 | 2) => Ok(Reply::default()),
+            (Service::AudOut, 3 | 7) => {
+                // AppendAudioOutBuffer / AppendAudioOutBufferAuto:
+                // args[0..8] = tag, input buffer A/X holds AudioOutBuffer descriptor (next:u64, data_addr:u64, buf_size:u64, data_size:u64, data_offset:u64)
+                let tag = req.args.get(0..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+                if let Some(desc_buf) = req.buffers.iter().find(|b| matches!(b.kind, 'A' | 'X')) {
+                    if let Some(desc) = self.mem.read_bytes(desc_buf.addr, desc_buf.size.min(40) as usize) {
+                        if desc.len() >= 32 {
+                            let data_addr = u64::from_le_bytes(desc[8..16].try_into().unwrap());
+                            let data_size = u64::from_le_bytes(desc[24..32].try_into().unwrap()).min(65536) as usize;
+                            if data_addr != 0 && data_size >= 4 && self.audio_samples.len() < 48_000 * 2 {
+                                if let Some(pcm) = self.mem.read_bytes(data_addr, data_size) {
+                                    for c in pcm.chunks_exact(4) {
+                                        let l = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
+                                        let r = i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0;
+                                        self.audio_samples.push(l);
+                                        self.audio_samples.push(r);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                self.released_audio_tags.push(tag);
+                Ok(Reply::default())
+            }
+            (Service::AudOut, 4 | 8) => {
+                // GetReleasedAudioOutBuffer / GetReleasedAudioOutBufferAuto
+                let mut written = 0u32;
+                if let Some(out) = req.buffers.iter().find(|b| b.kind == 'B' || b.kind == 'W') {
+                    let cap = (out.size as usize) / 8;
+                    let n = cap.min(self.released_audio_tags.len());
+                    for (i, tag) in self.released_audio_tags.drain(..n).enumerate() {
+                        let _ = self.mem.write_bytes(out.addr + (i as u64) * 8, &tag.to_le_bytes());
+                        written += 1;
+                    }
+                }
+                Ok(Reply { data: written.to_le_bytes().to_vec(), ..Reply::default() })
+            }
             (Service::Account, 0) => Ok(Reply { data: 1u32.to_le_bytes().to_vec(), ..Reply::default() }),
             (Service::Account, 1) => Ok(Reply { data: vec![1u8], ..Reply::default() }),
             (Service::Account, 2) => {
@@ -790,5 +828,50 @@ mod tests {
         let hid_h = reply_of(&mut p).moves[0];
         assert!(send(&mut p, hid_h, &request(4, 103, &[0; 8], true, &[])).is_none());
         assert_eq!(reply_of(&mut p).result, 0);
+    }
+
+    #[test]
+    fn audout_append_buffer_decodes_stereo_pcm_and_releases_tag() {
+        let mut p = process();
+        p.cpu.x[1] = 0x20_0000;
+        p.svc(0x01); // SetHeapSize
+        let sm = connect_sm(&mut p);
+        assert!(send(&mut p, sm, &request(4, 0, &[0; 8], true, &[])).is_none());
+        assert!(send(&mut p, sm, &request(4, 1, b"audout:u", false, &[])).is_none());
+        let root = reply_of(&mut p).moves[0];
+        assert!(send(&mut p, root, &request(4, 1, &[0; 16], false, &[])).is_none());
+        let aud = reply_of(&mut p).moves[0];
+
+        // Write 2 stereo S16 frames at HEAP_BASE + 0x100 and descriptor at HEAP_BASE
+        let pcm_addr = HEAP_BASE + 0x100;
+        let mut pcm = Vec::new();
+        pcm.extend_from_slice(&16384i16.to_le_bytes());
+        pcm.extend_from_slice(&(-16384i16).to_le_bytes());
+        pcm.extend_from_slice(&8192i16.to_le_bytes());
+        pcm.extend_from_slice(&(-8192i16).to_le_bytes());
+        assert!(p.mem.write_bytes(pcm_addr, &pcm));
+
+        let mut desc = [0u8; 40];
+        desc[8..16].copy_from_slice(&pcm_addr.to_le_bytes());
+        desc[16..24].copy_from_slice(&(pcm.len() as u64).to_le_bytes());
+        desc[24..32].copy_from_slice(&(pcm.len() as u64).to_le_bytes());
+        assert!(p.mem.write_bytes(HEAP_BASE, &desc));
+
+        let tag = 0x1122_3344_5566_7788u64;
+        assert!(send(&mut p, aud, &request(4, 3, &tag.to_le_bytes(), false, &[('A', HEAP_BASE, 40)])).is_none());
+        assert_eq!(reply_of(&mut p).result, 0);
+
+        let mut samples = Vec::new();
+        p.take_audio(&mut samples);
+        assert_eq!(samples.len(), 4);
+        assert!((samples[0] - 0.5).abs() < 1e-4);
+        assert!((samples[1] + 0.5).abs() < 1e-4);
+
+        let out_tags = HEAP_BASE + 0x200;
+        assert!(send(&mut p, aud, &request(4, 4, &[], false, &[('B', out_tags, 16)])).is_none());
+        let rep = reply_of(&mut p);
+        assert_eq!(u32::from_le_bytes(rep.data[..4].try_into().unwrap()), 1);
+        let got_tag = u64::from_le_bytes(p.mem.read_bytes(out_tags, 8).unwrap().try_into().unwrap());
+        assert_eq!(got_tag, tag);
     }
 }

@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+mod ios_core;
 mod playstation;
 mod switch_core;
 mod x360_core;
@@ -915,7 +916,7 @@ pub struct Loaded {
     pub save_path: PathBuf,
 }
 
-const KNOWN: &[(&str, &str)] = &[("a26", "a2600"), ("a78", "a7800"), ("sms", "sms"), ("gg", "gg"), ("pce", "pce"), ("ws", "ws"), ("wsc", "ws"), ("int", "intv"), ("rom", "intv"), ("vb", "vb"), ("vboy", "vb"), ("md", "md"), ("gen", "md"), ("smd", "md"), ("nes", "nes"), ("fds", "nes"), ("gb", "gb"), ("gbc", "gb"), ("sfc", "snes"), ("smc", "snes"), ("gba", "gba"), ("agb", "gba"), ("z64", "n64"), ("n64", "n64"), ("v64", "n64"), ("dol", "gc"), ("gcm", "gc"), ("xbe", "xbox"), ("xiso", "xbox"), ("xex", "x360"), ("xvc", "xone"), ("msixvc", "xone"), ("msix", "xone"), ("appx", "xone"), ("msixbundle", "xone"), ("appxbundle", "xone"), ("cue", "ps1"), ("bin", "ps1"), ("iso", "ps1"), ("exe", "ps1")];
+const KNOWN: &[(&str, &str)] = &[("a26", "a2600"), ("a78", "a7800"), ("sms", "sms"), ("gg", "gg"), ("pce", "pce"), ("ws", "ws"), ("wsc", "ws"), ("int", "intv"), ("rom", "intv"), ("vb", "vb"), ("vboy", "vb"), ("md", "md"), ("gen", "md"), ("smd", "md"), ("nes", "nes"), ("fds", "nes"), ("gb", "gb"), ("gbc", "gb"), ("sfc", "snes"), ("smc", "snes"), ("gba", "gba"), ("agb", "gba"), ("z64", "n64"), ("n64", "n64"), ("v64", "n64"), ("dol", "gc"), ("gcm", "gc"), ("nsp", "switch"), ("xci", "switch"), ("ipsw", "ios"), ("ipa", "ios"), ("xbe", "xbox"), ("xiso", "xbox"), ("xex", "x360"), ("xvc", "xone"), ("msixvc", "xone"), ("msix", "xone"), ("appx", "xone"), ("msixbundle", "xone"), ("appxbundle", "xone"), ("cue", "ps1"), ("bin", "ps1"), ("iso", "ps1"), ("exe", "ps1")];
 
 pub fn console_for(name: &str) -> Option<&'static str> {
     let ext = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
@@ -1267,6 +1268,9 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     }
     if lower_ext_of(path) == "xex" {
         return x360_core::load(path);
+    }
+    if matches!(lower_ext_of(path).as_str(), "ipsw" | "ipa") {
+        return ios_core::load(path);
     }
     if let Some(res) = try_load_xboxone(path) {
         return res;

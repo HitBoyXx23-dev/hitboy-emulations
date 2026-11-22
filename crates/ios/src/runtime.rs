@@ -817,6 +817,296 @@ pub fn run_macho_arm64(data: &[u8], device_tree: Option<&[u8]>, max_steps: u64) 
     })
 }
 
+/// Stateful incremental ARM64e XNU kernel VM for live UI execution and UART console streaming.
+pub struct Arm64Machine {
+    cpu: switch::a64::Cpu,
+    mem: Arm64Mem,
+    instructions: u64,
+    last_abort: (u64, u64),
+    repeat_aborts: u32,
+    stop_reason: Option<String>,
+}
+
+impl Arm64Machine {
+    pub fn load(data: &[u8], device_tree: Option<&[u8]>) -> Result<Self, String> {
+        let m = macho::parse(data)?;
+        let slice = m
+            .slices
+            .iter()
+            .find(|s| s.arch == "arm64" || s.arch == "arm64e")
+            .ok_or("No arm64/arm64e slice found in this Mach-O.")?;
+        if slice.encrypted {
+            return Err("This arm64 Mach-O is encrypted.".into());
+        }
+
+        let mut mem = Arm64Mem::new(false);
+        for seg in &slice.segments {
+            if seg.name == "__PAGEZERO" || seg.vmsize == 0 {
+                continue;
+            }
+            let foff = seg.fileoff as usize;
+            let fsz = (seg.filesize as usize).min(seg.vmsize as usize);
+            if fsz > 0 {
+                if let Some(chunk) = data.get(foff..foff.saturating_add(fsz)) {
+                    mem.write_bytes(seg.vmaddr, chunk);
+                }
+            }
+            if seg.vmsize > fsz as u64 {
+                let extra = (seg.vmsize - fsz as u64).min(16 << 20);
+                mem.map_zero(seg.vmaddr.wrapping_add(fsz as u64), extra);
+            }
+        }
+
+        let mem_size: u64 = 512 << 20;
+        let boot_stack_va: u64 = XNU_VIRT_BASE + 0x1000_0000;
+        let boot_args_va: u64 = XNU_VIRT_BASE + 0x0FF0_0000;
+        let dt_va: u64 = XNU_VIRT_BASE + 0x0F00_0000;
+        let boot_stack_pa = Arm64Mem::virt_to_phys_linear(boot_stack_va);
+        let boot_args_pa = Arm64Mem::virt_to_phys_linear(boot_args_va);
+        let entry_pa = Arm64Mem::virt_to_phys_linear(slice.entry);
+
+        mem.map_zero(boot_stack_va - 0x4_0000, 0x4_0000);
+        mem.map_zero(boot_args_va, 0x4000);
+
+        let mut ba = [0u8; 0x300];
+        ba[0..2].copy_from_slice(&2u16.to_le_bytes());
+        ba[2..4].copy_from_slice(&2u16.to_le_bytes());
+        ba[8..16].copy_from_slice(&XNU_VIRT_BASE.to_le_bytes());
+        ba[16..24].copy_from_slice(&XNU_PHYS_BASE.to_le_bytes());
+        ba[24..32].copy_from_slice(&mem_size.to_le_bytes());
+        ba[32..40].copy_from_slice(&boot_stack_pa.to_le_bytes());
+        let fb_pa = XNU_PHYS_BASE + 0x1E00_0000;
+        ba[0x28..0x30].copy_from_slice(&fb_pa.to_le_bytes());
+        ba[0x30..0x38].copy_from_slice(&1u64.to_le_bytes());
+        ba[0x38..0x40].copy_from_slice(&(1179u64 * 4).to_le_bytes());
+        ba[0x40..0x48].copy_from_slice(&1179u64.to_le_bytes());
+        ba[0x48..0x50].copy_from_slice(&2556u64.to_le_bytes());
+        ba[0x50..0x58].copy_from_slice(&32u64.to_le_bytes());
+        if let Some(dt) = device_tree {
+            mem.write_bytes(dt_va, dt);
+            ba[0x60..0x68].copy_from_slice(&dt_va.to_le_bytes());
+            ba[0x68..0x6C].copy_from_slice(&(dt.len() as u32).to_le_bytes());
+        }
+        let cmdline = b"-v debug=0x8 serial=3\0";
+        ba[0x6C..0x6C + cmdline.len()].copy_from_slice(cmdline);
+        ba[0x2D8..0x2E0].copy_from_slice(&mem_size.to_le_bytes());
+        mem.write_bytes(boot_args_va, &ba);
+
+        let mut cpu = switch::a64::Cpu::new();
+        cpu.el1 = true;
+        cpu.sysregs.insert((3 << 14) | (6 << 11) | (15 << 7) | (12 << 3) | 4, 1);
+        cpu.pc = entry_pa;
+        cpu.sp = boot_stack_pa - 0x100;
+        cpu.x[0] = boot_args_pa;
+
+        Ok(Self {
+            cpu,
+            mem,
+            instructions: 0,
+            last_abort: (0, 0),
+            repeat_aborts: 0,
+            stop_reason: None,
+        })
+    }
+
+    /// Executes up to `max_steps` ARM64e instructions. Returns `Some(stop_reason)` once halted.
+    pub fn step_budget(&mut self, max_steps: u64) -> Option<&str> {
+        if self.stop_reason.is_some() {
+            return self.stop_reason.as_deref();
+        }
+        for _ in 0..max_steps {
+            let cur_pc = self.cpu.pc;
+            match self.cpu.step(&mut self.mem) {
+                Ok(()) => {
+                    self.instructions += 1;
+                    self.cpu.ticks = self.cpu.ticks.wrapping_add(1);
+                    let next_mmu = MmuRegs {
+                        sctlr: *self.cpu.sysregs.get(&SCTLR_EL1).unwrap_or(&0),
+                        tcr: *self.cpu.sysregs.get(&TCR_EL1).unwrap_or(&0),
+                        ttbr0: *self.cpu.sysregs.get(&TTBR0_EL1).unwrap_or(&0),
+                        ttbr1: *self.cpu.sysregs.get(&TTBR1_EL1).unwrap_or(&0),
+                    };
+                    self.mem.set_mmu(next_mmu);
+                }
+                Err(switch::a64::Exit::Undefined(pc, w)) => {
+                    self.stop_reason = Some(format!("Unimplemented ARM64 instruction {w:#010X} at {pc:#018X}"));
+                    break;
+                }
+                Err(switch::a64::Exit::Fault(a)) => {
+                    if self.mem.mmu.sctlr & 1 != 0 && a >= 0xFFFF_FF80_0000_0000 {
+                        if self.last_abort == (cur_pc, a) {
+                            self.repeat_aborts += 1;
+                        } else {
+                            self.last_abort = (cur_pc, a);
+                            self.repeat_aborts = 1;
+                        }
+                        let is_insn = a == cur_pc && !self.mem.last_fault_write;
+                        if self.repeat_aborts <= 8 && self.cpu.take_el1_sync_abort(cur_pc, a, self.mem.last_fault_write, is_insn) {
+                            continue;
+                        }
+                    }
+                    self.stop_reason = Some(format!("MMU/Memory fault on {a:#018X} at PC {:#018X}", self.cpu.pc));
+                    break;
+                }
+                Err(switch::a64::Exit::Svc(n)) => {
+                    self.stop_reason = Some(format!("SVC #{n:#x} at PC {:#018X}", self.cpu.pc));
+                    break;
+                }
+                Err(switch::a64::Exit::Brk(n)) => {
+                    self.stop_reason = Some(format!("BRK #{n:#x} at PC {:#018X}", self.cpu.pc));
+                    break;
+                }
+            }
+        }
+        self.stop_reason.as_deref()
+    }
+
+    pub fn instructions(&self) -> u64 {
+        self.instructions
+    }
+
+    pub fn uart_output(&self) -> &str {
+        &self.mem.uart_output
+    }
+
+    pub fn mmu_enabled(&self) -> bool {
+        self.mem.mmu.sctlr & 1 != 0
+    }
+
+    pub fn pc(&self) -> u64 {
+        self.cpu.pc
+    }
+
+    pub fn mmio_regions(&self) -> &[u64] {
+        &self.mem.mmio_regions
+    }
+
+    /// Renders a live 640x360 0RGB serial console display showing XNU boot status & live S5L UART output.
+    pub fn render_console_frame(&self, title: &str, banner: Option<&str>) -> Vec<u32> {
+        const W: usize = 640;
+        const H: usize = 360;
+        let mut fb = vec![0x000A_0D14u32; W * H];
+        let mut lines: Vec<(String, u32)> = Vec::new();
+        lines.push((format!("=== {title} — XNU ARM64e Live Console ==="), 0x0078_A8FF));
+        if let Some(b) = banner {
+            for chunk in b.as_bytes().chunks(96) {
+                lines.push((String::from_utf8_lossy(chunk).into_owned(), 0x00B8_C4DC));
+            }
+        }
+        lines.push((
+            format!(
+                "CPU: {} insns | PC: {:#018X} | MMU: {} | MMIO: {} devs",
+                self.instructions,
+                self.cpu.pc,
+                if self.mmu_enabled() { "ON (16K)" } else { "OFF" },
+                self.mem.mmio_regions.len()
+            ),
+            0x003D_DC97,
+        ));
+        if !self.mem.mmio_regions.is_empty() {
+            let devs: Vec<String> = self.mem.mmio_regions.iter().take(6).map(|a| format!("{a:#x}")).collect();
+            lines.push((format!("SoC MMIO: {}", devs.join(", ")), 0x008A_90A6));
+        }
+        lines.push((String::new(), 0x00E8_EAF2));
+        lines.push(("--- Apple S5L UART0 Serial Output ---".into(), 0x00E8_C068));
+        if self.mem.uart_output.is_empty() {
+            lines.push(("(booting XNU arm_init / pmap / device tree — waiting for UART0...)".into(), 0x008A_90A6));
+        } else {
+            for raw_line in self.mem.uart_output.lines() {
+                let clean = raw_line.trim_end_matches('\r');
+                for chunk in clean.as_bytes().chunks(96) {
+                    lines.push((String::from_utf8_lossy(chunk).into_owned(), 0x00F0_F4FF));
+                }
+            }
+        }
+        if let Some(ref stop) = self.stop_reason {
+            lines.push((String::new(), 0));
+            lines.push((format!("Stopped: {stop}"), 0x00F0_6A6A));
+        }
+        let max_lines = (H - 16) / 10;
+        let start = lines.len().saturating_sub(max_lines);
+        for (row, (text, color)) in lines[start..].iter().enumerate() {
+            draw_console_line(&mut fb, W, H, 10, 10 + row * 10, text, *color);
+        }
+        fb
+    }
+}
+
+fn draw_console_line(fb: &mut [u32], w: usize, h: usize, x0: usize, y0: usize, text: &str, color: u32) {
+    let mut x = x0;
+    for b in text.bytes() {
+        if x + 6 >= w {
+            break;
+        }
+        let glyph = glyph_5x7(b);
+        for (ry, &bits) in glyph.iter().enumerate() {
+            let py = y0 + ry;
+            if py >= h {
+                break;
+            }
+            for rx in 0..5 {
+                if (bits & (1 << (4 - rx))) != 0 {
+                    fb[py * w + x + rx] = color;
+                }
+            }
+        }
+        x += 6;
+    }
+}
+
+fn glyph_5x7(ch: u8) -> [u8; 7] {
+    match ch.to_ascii_uppercase() {
+        b'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+        b'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
+        b'D' => [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C],
+        b'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        b'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+        b'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
+        b'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'I' => [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        b'J' => [0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C],
+        b'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        b'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        b'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
+        b'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        b'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        b'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
+        b'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        b'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        b'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+        b'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
+        b'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+        b'Y' => [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+        b'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+        b'0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        b'1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        b'2' => [0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F],
+        b'3' => [0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E],
+        b'4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        b'5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+        b'6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        b'7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        b'8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        b'9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+        b':' => [0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00],
+        b'.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
+        b',' => [0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x08],
+        b'-' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
+        b'=' => [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00],
+        b'/' => [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10],
+        b'(' => [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
+        b')' => [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
+        b'|' => [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        b'_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F],
+        b' ' => [0x00; 7],
+        _ => [0x00, 0x0E, 0x01, 0x06, 0x04, 0x00, 0x04],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

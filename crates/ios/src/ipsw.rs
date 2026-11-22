@@ -516,6 +516,107 @@ pub fn read_ipsw_reader<R: Read + Seek>(reader: R) -> Result<IpswInfo, String> {
     Ok(info)
 }
 
+/// Unpacked XNU kernel Mach-O + sanitized Apple DeviceTree extracted from an `.ipsw` archive.
+pub struct BootImages {
+    pub title: String,
+    pub kernel: Vec<u8>,
+    pub device_tree: Option<Vec<u8>>,
+    pub banner: Option<String>,
+}
+
+/// Extracts the decrypted/decompressed arm64/arm64e XNU kernelcache and sanitized DeviceTree
+/// from an `.ipsw` archive so the live iOS runner can boot XNU incrementally.
+pub fn extract_boot_images(path: &Path) -> Result<BootImages, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("Couldn't open {}: {e}", path.display()))?;
+    let mut z = zip::ZipArchive::new(f).map_err(|e| format!("Not a valid .ipsw archive: {e}"))?;
+
+    let mut manifest_name: Option<String> = None;
+    let mut kernel_name: Option<String> = None;
+    let mut dt_name: Option<String> = None;
+
+    for i in 0..z.len() {
+        let Ok(entry) = z.by_index(i) else { continue };
+        let name = entry.name().to_string();
+        let lower = name.to_ascii_lowercase();
+        if lower == "restore.plist" {
+            manifest_name = Some(name);
+        } else if lower == "buildmanifest.plist" && manifest_name.is_none() {
+            manifest_name = Some(name);
+        } else if lower.contains("kernelcache") && kernel_name.is_none() && !entry.is_dir() {
+            kernel_name = Some(name);
+        } else if lower.contains("devicetree") && lower.ends_with(".im4p") && dt_name.is_none() && !entry.is_dir() {
+            dt_name = Some(name);
+        }
+    }
+
+    let mut title = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    if let Some(mname) = manifest_name {
+        if let Ok(mut f) = z.by_name(&mname) {
+            let mut raw = Vec::new();
+            if f.read_to_end(&mut raw).is_ok() {
+                if let Ok(val) = plist::parse(&raw) {
+                    let ver = val.get("ProductVersion").and_then(Value::as_str).unwrap_or("");
+                    let build = val.get("ProductBuildVersion").and_then(Value::as_str).unwrap_or("");
+                    if !ver.is_empty() {
+                        title = if build.is_empty() {
+                            format!("iOS {ver}")
+                        } else {
+                            format!("iOS {ver} ({build})")
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    let device_tree = dt_name.and_then(|dname| {
+        let mut f = z.by_name(&dname).ok()?;
+        let mut raw = Vec::new();
+        f.read_to_end(&mut raw).ok()?;
+        let payload = crate::im4p::parse_im4p(&raw).ok()?.payload;
+        let mut dt = if payload.starts_with(b"bvx2") || payload.starts_with(b"bvx1") || payload.starts_with(b"bvxn") || payload.starts_with(b"bvx-") {
+            crate::im4p::decompress_lzfse(&payload).ok()?
+        } else if payload.starts_with(b"complzss") {
+            crate::im4p::decompress_complzss(&payload).ok()?
+        } else {
+            payload
+        };
+        sanitize_apple_devicetree(&mut dt);
+        Some(dt)
+    });
+
+    let kname = kernel_name.ok_or("No kernelcache found inside this .ipsw archive.")?;
+    let mut kf = z.by_name(&kname).map_err(|e| format!("Couldn't open {kname}: {e}"))?;
+    let mut raw = Vec::new();
+    kf.read_to_end(&mut raw).map_err(|e| format!("Couldn't read {kname}: {e}"))?;
+
+    let kernel = if let Ok(im4p) = crate::im4p::parse_im4p(&raw) {
+        if im4p.payload.starts_with(b"complzss") {
+            crate::im4p::decompress_complzss(&im4p.payload)?
+        } else if im4p.payload.starts_with(b"bvx2")
+            || im4p.payload.starts_with(b"bvx1")
+            || im4p.payload.starts_with(b"bvxn")
+            || im4p.payload.starts_with(b"bvx-")
+        {
+            crate::im4p::decompress_lzfse(&im4p.payload)?
+        } else {
+            im4p.payload
+        }
+    } else if raw.starts_with(b"complzss") {
+        crate::im4p::decompress_complzss(&raw)?
+    } else {
+        raw
+    };
+
+    let banner = crate::im4p::extract_xnu_banner(&kernel);
+    Ok(BootImages {
+        title,
+        kernel,
+        device_tree,
+        banner,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
