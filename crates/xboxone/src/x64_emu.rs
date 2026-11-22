@@ -35,6 +35,13 @@ pub struct EmuResult {
     pub framebuffer: XboxFramebuffer,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmuStepState {
+    Running,
+    Exited(i32),
+    Stopped(String),
+}
+
 #[derive(Debug, Clone)]
 struct ThunkEntry {
     dll: String,
@@ -54,8 +61,11 @@ pub struct XboxX64Emu {
     unimplemented_apis: Vec<String>,
     exited: bool,
     exit_code: i32,
+    total_instructions: u64,
     tick_counter: u64,
     heap_allocs: HashMap<u64, u64>,
+    pads: [u16; 4],
+    pad_packet: u32,
 }
 
 impl XboxX64Emu {
@@ -138,45 +148,125 @@ impl XboxX64Emu {
             unimplemented_apis: Vec::new(),
             exited: false,
             exit_code: 0,
+            total_instructions: 0,
             tick_counter: 1000,
             heap_allocs: HashMap::new(),
+            pads: [0; 4],
+            pad_packet: 1,
         })
     }
 
-    /// Executes up to `max_instructions` instructions and returns the captured run report.
-    pub fn run(&mut self, max_instructions: u64) -> EmuResult {
-        let mut count = 0u64;
-        let mut stopped_reason = None;
+    /// Updates Xbox controller buttons for `pad` (0..4) using the shared frontend bitmask:
+    /// bit 0=A, 1=B, 2=Back/Select, 3=Start, 4=Up, 5=Down, 6=Left, 7=Right, 8=X, 9=Y, 10=LB, 11=RB.
+    pub fn set_buttons(&mut self, pad: usize, buttons: u16) {
+        if pad >= self.pads.len() {
+            return;
+        }
+        // Map frontend bitmask to XINPUT_GAMEPAD_* flags.
+        const MAP: [(u16, u16); 12] = [
+            (1 << 0, 0x1000),  // A
+            (1 << 1, 0x2000),  // B
+            (1 << 2, 0x0020),  // Back
+            (1 << 3, 0x0010),  // Start
+            (1 << 4, 0x0001),  // D-Pad Up
+            (1 << 5, 0x0002),  // D-Pad Down
+            (1 << 6, 0x0004),  // D-Pad Left
+            (1 << 7, 0x0008),  // D-Pad Right
+            (1 << 8, 0x4000),  // X
+            (1 << 9, 0x8000),  // Y
+            (1 << 10, 0x0100), // Left Shoulder
+            (1 << 11, 0x0200), // Right Shoulder
+        ];
+        let mut xinput = 0u16;
+        for (src, dst) in MAP {
+            if buttons & src != 0 {
+                xinput |= dst;
+            }
+        }
+        if self.pads[pad] != xinput {
+            self.pads[pad] = xinput;
+            self.pad_packet = self.pad_packet.wrapping_add(1);
+        }
+    }
 
+    pub fn total_instructions(&self) -> u64 {
+        self.total_instructions
+    }
+
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub fn api_calls(&self) -> &[String] {
+        &self.api_calls
+    }
+
+    pub fn unimplemented_apis(&self) -> &[String] {
+        &self.unimplemented_apis
+    }
+
+    /// Converts the RGBA8 offscreen framebuffer to `0RGB` `u32` pixels for desktop scanout.
+    pub fn fb_pixels_0rgb(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity((self.framebuffer.width * self.framebuffer.height) as usize);
+        for px in self.framebuffer.rgba.chunks_exact(4) {
+            out.push(((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32));
+        }
+        out
+    }
+
+    /// Runs up to `max_instructions` incrementally for frame-driven execution.
+    pub fn step_budget(&mut self, max_instructions: u64) -> EmuStepState {
+        if self.exited {
+            return EmuStepState::Exited(self.exit_code);
+        }
+        let mut count = 0u64;
         while count < max_instructions && !self.exited {
             if self.rip == EXIT_SENTINEL {
                 self.exit_code = self.regs[RAX] as i32;
                 self.exited = true;
-                break;
+                return EmuStepState::Exited(self.exit_code);
             }
             if let Some(thunk) = self.thunks.get(&self.rip).cloned() {
                 if let Err(e) = self.dispatch_hle(&thunk) {
-                    stopped_reason = Some(e);
-                    break;
+                    return EmuStepState::Stopped(e);
                 }
                 count += 1;
+                self.total_instructions += 1;
+                if self.exited {
+                    return EmuStepState::Exited(self.exit_code);
+                }
                 continue;
             }
             match self.step() {
-                Ok(()) => count += 1,
-                Err(e) => {
-                    stopped_reason = Some(e);
-                    break;
+                Ok(()) => {
+                    count += 1;
+                    self.total_instructions += 1;
                 }
+                Err(e) => return EmuStepState::Stopped(e),
             }
         }
-        if !self.exited && stopped_reason.is_none() && count >= max_instructions {
-            stopped_reason = Some(format!("instruction limit ({max_instructions}) reached at RIP {:#x}", self.rip));
+        if self.exited {
+            EmuStepState::Exited(self.exit_code)
+        } else {
+            EmuStepState::Running
         }
+    }
+
+    /// Executes up to `max_instructions` instructions and returns the captured run report.
+    pub fn run(&mut self, max_instructions: u64) -> EmuResult {
+        let before = self.total_instructions;
+        let stopped_reason = match self.step_budget(max_instructions) {
+            EmuStepState::Exited(_) => None,
+            EmuStepState::Stopped(reason) => Some(reason),
+            EmuStepState::Running => Some(format!(
+                "instruction limit ({max_instructions}) reached at RIP {:#x}",
+                self.rip
+            )),
+        };
 
         EmuResult {
             exit_code: self.exit_code,
-            instructions: count,
+            instructions: self.total_instructions - before,
             output: self.output.clone(),
             api_calls: self.api_calls.clone(),
             unimplemented_apis: self.unimplemented_apis.clone(),
@@ -325,10 +415,44 @@ impl XboxX64Emu {
             }
             n if n.eq_ignore_ascii_case("XDeviceCreate")
                 || n.eq_ignore_ascii_case("D3D12XBOX_CreateDevice")
-                || n.eq_ignore_ascii_case("D3D12CreateDevice") =>
+                || n.eq_ignore_ascii_case("D3D12CreateDevice")
+                || n.eq_ignore_ascii_case("D3D11XCreateDeviceX") =>
             {
-                self.framebuffer.clear(16, 20, 32, 255);
+                self.framebuffer.clear(18, 28, 52, 255);
                 self.framebuffer.present();
+                0
+            }
+            n if n.eq_ignore_ascii_case("XDevicePresent") || n.eq_ignore_ascii_case("D3D12XBOX_Present") => {
+                self.framebuffer.present();
+                0
+            }
+            n if n.eq_ignore_ascii_case("XDeviceClear") => {
+                self.framebuffer.clear(rcx as u8, rdx as u8, r8 as u8, 255);
+                0
+            }
+            n if n.eq_ignore_ascii_case("XInputGetState") => {
+                let idx = rcx as usize;
+                if idx < self.pads.len() && rdx != 0 {
+                    let mut state = [0u8; 16];
+                    state[0..4].copy_from_slice(&self.pad_packet.to_le_bytes());
+                    state[4..6].copy_from_slice(&self.pads[idx].to_le_bytes());
+                    let _ = self.mem.write_bytes(rdx, &state);
+                    0 // ERROR_SUCCESS
+                } else {
+                    1167 // ERROR_DEVICE_NOT_CONNECTED
+                }
+            }
+            n if n.eq_ignore_ascii_case("XInputGetCapabilities") => {
+                let idx = rcx as usize;
+                if idx < self.pads.len() && r8 != 0 {
+                    let _ = self.mem.write_bytes(r8, &[0u8; 20]);
+                    0
+                } else {
+                    1167
+                }
+            }
+            n if n.eq_ignore_ascii_case("Sleep") => {
+                self.tick_counter = self.tick_counter.wrapping_add(rcx.max(1));
                 0
             }
             _ => {
@@ -1534,5 +1658,35 @@ mod tests {
         assert_eq!(res.exit_code, 42);
         assert_eq!(res.output.trim(), "Hello Xbox Series X!");
         assert!(res.api_calls.iter().any(|s| s.contains("XGameRuntimePrint")));
+    }
+
+    #[test]
+    fn xinput_get_state_reports_pressed_buttons() {
+        // sub rsp, 0x38
+        // xor ecx, ecx               ; pad 0
+        // lea rdx, [rsp + 0x20]      ; &XINPUT_STATE
+        // call qword ptr [rip + iat] ; xinput1_4.dll!XInputGetState
+        // movzx eax, word ptr [rsp + 0x24] ; wButtons
+        // add rsp, 0x38
+        // ret
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);       // 0x00: sub rsp, 0x38
+        code.extend_from_slice(&[0x31, 0xC9]);                   // 0x04: xor ecx, ecx
+        code.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x20]); // 0x06: lea rdx, [rsp + 0x20]
+        // 0x0B: call [rip + (0x450 - 0x11)]
+        let disp_iat = (0x450i32 - 0x11i32).to_le_bytes();
+        code.extend_from_slice(&[0xFF, 0x15]);
+        code.extend_from_slice(&disp_iat);
+        code.extend_from_slice(&[0x0F, 0xB7, 0x44, 0x24, 0x24]); // 0x11: movzx eax, word ptr [rsp + 0x24]
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);       // 0x16: add rsp, 0x38
+        code.push(0xC3);                                         // 0x1A: ret
+
+        let pe = build_test_pe(&code, Some("xinput1_4.dll"), Some("XInputGetState"));
+        let mut emu = XboxX64Emu::load_pe(&pe).unwrap();
+        // Press A (bit 0 -> 0x1000) + Start (bit 3 -> 0x0010) + Up (bit 4 -> 0x0001)
+        emu.set_buttons(0, (1 << 0) | (1 << 3) | (1 << 4));
+        let res = emu.run(1000);
+        assert!(res.stopped_reason.is_none(), "{:?}", res.stopped_reason);
+        assert_eq!(res.exit_code as u16, 0x1011);
     }
 }

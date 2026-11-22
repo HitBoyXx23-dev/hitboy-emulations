@@ -86,10 +86,18 @@ pub struct GameEntry {
 fn bin_fits(path: &Path, console: &str) -> bool {
     let fname = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if fname == "eboot.bin" {
-        return console == "ps5";
+        return (console == "ps4" || console == "ps5") && crate::cores::ps_console_id(path) == console;
     }
     if console == "ps5" {
         return path.extension().is_some_and(|e| e.eq_ignore_ascii_case("elf") || e.eq_ignore_ascii_case("self"));
+    }
+    if console == "ps4" {
+        return path.extension().is_some_and(|e| {
+            e.eq_ignore_ascii_case("elf")
+                || e.eq_ignore_ascii_case("oelf")
+                || e.eq_ignore_ascii_case("self")
+                || e.eq_ignore_ascii_case("pkg")
+        });
     }
     if console == "xone" {
         let n = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
@@ -191,11 +199,35 @@ pub fn scan(console: &Console, dir: Option<&str>, added: &[String], hidden: &[St
     paths.dedup();
     let mut games: Vec<GameEntry> = paths
         .into_iter()
-        .map(|p| GameEntry {
-            title: clean_title(&p.file_stem().unwrap_or_default().to_string_lossy()),
-            size: std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
-            path: p,
-            console: console.id,
+        .map(|p| {
+            let fname = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            let title = if fname == "microsoftgame.config" || fname == "appxmanifest.xml" {
+                xboxone::read_game(&p)
+                    .ok()
+                    .map(|g| g.name)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        let folder = p.parent().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
+                        clean_title(&folder)
+                    })
+            } else if fname == "eboot.bin" {
+                ps5::metadata::read(&p)
+                    .ok()
+                    .map(|m| m.title)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        let folder = p.parent().and_then(|d| d.file_name()).unwrap_or_default().to_string_lossy();
+                        clean_title(&folder)
+                    })
+            } else {
+                clean_title(&p.file_stem().unwrap_or_default().to_string_lossy())
+            };
+            GameEntry {
+                title,
+                size: std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+                path: p,
+                console: console.id,
+            }
         })
         .collect();
     games.sort_by_key(|g| g.title.to_lowercase());
@@ -223,5 +255,44 @@ mod title_tests {
         assert_eq!(clean_title("Grand Theft Auto (USA)"), "Grand Theft Auto (USA)");
         assert_eq!(clean_title("Super Mario Bros. 3 (USA)"), "Super Mario Bros. 3 (USA)");
         assert_eq!(clean_title("12345-x"), "12345-x", "short digit runs are left alone");
+    }
+
+    #[test]
+    fn scans_ps4_ps5_and_xbox_one_folders_with_clean_titles() {
+        let root = std::env::temp_dir().join(format!("lib_scan_nextgen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ps4_dir = root.join("My PS4 Game");
+        let ps5_dir = root.join("My PS5 Game");
+        let xone_dir = root.join("My Series X Game");
+        std::fs::create_dir_all(&ps4_dir).unwrap();
+        std::fs::create_dir_all(ps5_dir.join("sce_sys")).unwrap();
+        std::fs::create_dir_all(&xone_dir).unwrap();
+
+        std::fs::write(ps4_dir.join("eboot.bin"), b"stub").unwrap();
+        std::fs::write(ps5_dir.join("eboot.bin"), b"stub").unwrap();
+        std::fs::write(
+            ps5_dir.join("sce_sys/param.json"),
+            r#"{"titleId":"PPSA99999","localizedParameters":{"en-US":{"titleName":"PS5 Scanner Title"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            xone_dir.join("MicrosoftGame.config"),
+            r#"<Game><Identity Name="X1" Version="1.0.0.0"/><ShellVisuals DefaultDisplayName="Series X Scanner Title"/></Game>"#,
+        )
+        .unwrap();
+
+        let root_str = root.to_string_lossy().into_owned();
+        let ps4_games = super::scan(super::console("ps4"), Some(&root_str), &[], &[]);
+        assert!(ps4_games.iter().any(|g| g.title == "My PS4 Game" && g.console == "ps4"));
+        assert!(!ps4_games.iter().any(|g| g.title == "PS5 Scanner Title"));
+
+        let ps5_games = super::scan(super::console("ps5"), Some(&root_str), &[], &[]);
+        assert!(ps5_games.iter().any(|g| g.title == "PS5 Scanner Title" && g.console == "ps5"));
+        assert!(!ps5_games.iter().any(|g| g.title == "My PS4 Game"));
+
+        let xone_games = super::scan(super::console("xone"), Some(&root_str), &[], &[]);
+        assert!(xone_games.iter().any(|g| g.title == "Series X Scanner Title" && g.console == "xone"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

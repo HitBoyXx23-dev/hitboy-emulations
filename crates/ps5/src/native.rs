@@ -1,7 +1,7 @@
 //! Native mode: instead of interpreting the program on our CPU core, map it into this
 //! process and run its machine code directly on the PC's processor, with every call into a
-//! Sony system library redirected to our own replacement written in Rust. This is the same
-//! idea as AnyPS5, built from scratch; it is much faster than emulating, but it only works
+//! Sony system library redirected to our own replacement written in Rust. Built from scratch,
+//! this direct-execution path is much faster than interpreting, but it only works
 //! where the host is x86-64 (Windows here), and the program must not use the `fs:` segment
 //! (thread-local storage), which Windows reserves. The relinker that rewrites such code
 //! isn't built yet, so those programs are refused with a clear message.

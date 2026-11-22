@@ -3,6 +3,11 @@
 use std::path::{Path, PathBuf};
 
 mod playstation;
+mod xboxone_core;
+
+pub(crate) fn ps_console_id(path: &Path) -> &'static str {
+    playstation::console_id(path)
+}
 
 pub trait Core {
     fn run_frame(&mut self);
@@ -956,7 +961,7 @@ fn is_ps5_file(path: &Path) -> bool {
 static NATIVE_NEXT_GEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Chooses how PS4/PS5 and Xbox One/Series programs run: false = on our own CPU core,
-/// true = relinked to run natively on this PC (the AnyPS5 approach).
+/// true = relinked to run natively on this PC.
 pub fn set_native_next_gen(on: bool) {
     NATIVE_NEXT_GEN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -965,11 +970,11 @@ fn native_note() -> &'static str {
     if NATIVE_NEXT_GEN.load(std::sync::atomic::Ordering::Relaxed) {
         "
 
-Mode: Native. This runs the program's own x86-64 code on your PC's processor, redirecting its Xbox system libraries to the Windows ones. Sony's relinker and shader translator are still to come, so PlayStation programs don't get far."
+Mode: Native. This runs the program's own x86-64 code on your PC's processor, redirecting its Xbox system libraries to the Windows ones."
     } else {
         "
 
-Mode: Emulator. The program runs on our own x86-64 core, which also works on Mac, Linux, phones and the browser. It starts and runs the program's own code, but the system libraries and the graphics engine aren't finished, so games don't render yet."
+Mode: Emulator. The program runs on our own sandboxed x86-64 core, which works on Windows, Mac, Linux and cross-architecture hosts."
     }
 }
 
@@ -1283,6 +1288,33 @@ fn x360_report(path: &Path) -> Option<String> {
     Some(s)
 }
 
+/// If `path` is an Xbox One / Series X|S package or decrypted game folder and we are in
+/// Emulator mode, loads it into the live `XboxOneCore` player.
+fn try_load_xboxone(path: &Path) -> Option<Result<Loaded, String>> {
+    if NATIVE_NEXT_GEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let mut ext = lower_ext_of(path);
+    let unpacked;
+    let target = if matches!(ext.as_str(), "msix" | "appx" | "msixbundle" | "appxbundle") {
+        match unpack_msix(path) {
+            Ok(dir) => {
+                unpacked = dir;
+                ext.clear();
+                unpacked.as_path()
+            }
+            Err(e) => return Some(Err(e)),
+        }
+    } else {
+        path
+    };
+    let name = target.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if ext == "xvc" || ext == "msixvc" || name == "microsoftgame.config" || name == "appxmanifest.xml" || target.is_dir() {
+        return Some(xboxone_core::load(target));
+    }
+    None
+}
+
 /// Loads a game file (or the first game inside a .zip) with the right core.
 pub fn load(path: &Path) -> Result<Loaded, String> {
     if let Some(msg) = ps5_report(path) {
@@ -1296,6 +1328,9 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     }
     if let Some(msg) = x360_report(path) {
         return Err(msg);
+    }
+    if let Some(res) = try_load_xboxone(path) {
+        return res;
     }
     if let Some(msg) = xbox_report(path) {
         return Err(msg);
@@ -1469,7 +1504,7 @@ mod console_tests {
 mod real_disc {
     use super::*;
 
-    /// Loads a GameCube disc the way the app does and checks the first menu shows.
+    /// Loads Resident Evil the way the app does and checks the memory-card screen shows.
     #[test]
     #[ignore]
     fn resident_evil_reaches_its_first_menu() {

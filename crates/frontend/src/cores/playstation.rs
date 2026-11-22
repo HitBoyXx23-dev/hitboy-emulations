@@ -220,6 +220,30 @@ mod tests {
         assert_eq!(core.size(), (1, 1));
         assert_eq!(core.frame(), &[0x1E140A]);
     }
+
+    #[test]
+    fn ps5_game_folder_loads_runs_and_resets_through_frontend() {
+        let dir = std::env::temp_dir().join(format!("ps5_live_core_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sce_sys")).unwrap();
+        std::fs::write(
+            dir.join("sce_sys/param.json"),
+            r#"{"titleId":"PPSA01234","localizedParameters":{"en-US":{"titleName":"PS5 Live Demo"}}}"#,
+        )
+        .unwrap();
+        let eboot = dir.join("eboot.bin");
+        std::fs::write(&eboot, program()).unwrap();
+
+        let mut loaded = crate::cores::load(&eboot).expect("PS5 folder should load cleanly");
+        assert_eq!(loaded.console, "ps5");
+        assert_eq!(loaded.title, "PS5 Live Demo");
+        loaded.core.run_frame_blocking();
+        assert_eq!(loaded.core.runtime_message(), Some("PlayStation program exited with code 7."));
+        loaded.core.reset();
+        assert!(loaded.core.runtime_message().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     #[ignore]
     fn real_launcher_cross_loads_registered_fortnite() {
