@@ -115,7 +115,9 @@ impl Core for XboxOneCore {
         16.0 / 9.0
     }
 
-    fn take_audio(&mut self, _out: &mut Vec<f32>) {}
+    fn take_audio(&mut self, out: &mut Vec<f32>) {
+        self.emu.take_audio(out);
+    }
 
     fn set_sample_rate(&mut self, _rate: u32) {}
 }

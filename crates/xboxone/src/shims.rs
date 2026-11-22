@@ -353,7 +353,7 @@ mod win {
         S_OK
     }
 
-    // ---- XGameSave (local in-memory container/blob store) / XDisplay / XSystem extra ----
+    // ---- XGameSave (local container/blob store with optional on-disk persistence) ----
 
     struct SaveStore {
         next_handle: u64,
@@ -361,9 +361,21 @@ mod win {
         containers: std::collections::BTreeMap<u64, String>,
         updates: std::collections::BTreeMap<u64, (String, Vec<(String, Vec<u8>)>)>,
         blobs: std::collections::BTreeMap<(String, String), Vec<u8>>,
+        root_dir: Option<std::path::PathBuf>,
     }
 
     static SAVE_STORE: Mutex<Option<SaveStore>> = Mutex::new(None);
+
+    fn safe_save_segment(raw: &str) -> String {
+        let mut s: String = raw
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect();
+        if s.is_empty() || s == "." || s == ".." {
+            s = "default".into();
+        }
+        s
+    }
 
     fn with_saves<R>(f: impl FnOnce(&mut SaveStore) -> R) -> R {
         let mut g = SAVE_STORE.lock().unwrap_or_else(|e| e.into_inner());
@@ -373,8 +385,17 @@ mod win {
             containers: std::collections::BTreeMap::new(),
             updates: std::collections::BTreeMap::new(),
             blobs: std::collections::BTreeMap::new(),
+            root_dir: None,
         });
         f(s)
+    }
+
+    /// Configures a host folder for persistent `XGameSave` blob storage.
+    pub fn set_save_root(dir: Option<std::path::PathBuf>) {
+        with_saves(|s| {
+            s.root_dir = dir;
+            s.blobs.clear();
+        });
     }
 
     pub extern "system" fn XGameSaveInitializeProvider(_user: u64, _scid: u64, _sync: bool, out: u64) -> i32 {
@@ -467,7 +488,15 @@ mod win {
         let ok = with_saves(|s| {
             let (cname, list) = s.updates.get_mut(&update)?;
             let cname = cname.clone();
-            for (bname, bytes) in list.drain(..) {
+            let root = s.root_dir.clone();
+            let pending: Vec<(String, Vec<u8>)> = list.drain(..).collect();
+            for (bname, bytes) in pending {
+                if let Some(ref root_dir) = root {
+                    let cdir = root_dir.join(safe_save_segment(&cname));
+                    if std::fs::create_dir_all(&cdir).is_ok() {
+                        let _ = std::fs::write(cdir.join(format!("{}.bin", safe_save_segment(&bname))), &bytes);
+                    }
+                }
                 s.blobs.insert((cname.clone(), bname), bytes);
             }
             Some(())
@@ -680,8 +709,20 @@ mod win {
         }
         let bname = unsafe { text(blob_name) };
         let data = with_saves(|s| {
-            let cname = s.containers.get(&container)?;
-            s.blobs.get(&(cname.clone(), bname)).cloned()
+            let cname = s.containers.get(&container)?.clone();
+            if let Some(bytes) = s.blobs.get(&(cname.clone(), bname.clone())) {
+                return Some(bytes.clone());
+            }
+            if let Some(ref root_dir) = s.root_dir {
+                let path = root_dir
+                    .join(safe_save_segment(&cname))
+                    .join(format!("{}.bin", safe_save_segment(&bname)));
+                if let Ok(bytes) = std::fs::read(&path) {
+                    s.blobs.insert((cname, bname), bytes.clone());
+                    return Some(bytes);
+                }
+            }
+            None
         });
         let Some(bytes) = data else { return E_FAIL };
         if out_written != 0 {
@@ -702,6 +743,12 @@ mod win {
         let ok = with_saves(|s| {
             let (cname, _) = s.updates.get(&update)?;
             let cname = cname.clone();
+            if let Some(ref root_dir) = s.root_dir {
+                let path = root_dir
+                    .join(safe_save_segment(&cname))
+                    .join(format!("{}.bin", safe_save_segment(&bname)));
+                let _ = std::fs::remove_file(path);
+            }
             s.blobs.remove(&(cname, bname));
             Some(())
         });
@@ -714,6 +761,9 @@ mod win {
         }
         let cname = unsafe { text(name) };
         with_saves(|s| {
+            if let Some(ref root_dir) = s.root_dir {
+                let _ = std::fs::remove_dir_all(root_dir.join(safe_save_segment(&cname)));
+            }
             s.blobs.retain(|(c, _), _| c != &cname);
         });
         S_OK
@@ -1125,6 +1175,56 @@ mod tests {
             assert_eq!(XDeviceCreate(0, &mut dev as *mut u64 as u64), S_OK);
             assert_ne!(dev, 0);
             assert_eq!(XGComputeOptimalTileMode(3, 28, 256, 256, 1, 8), crate::gpu_bridge::XgTileMode::Thin2D as u32);
+        }
+    }
+
+    #[test]
+    fn xgamesave_persists_blobs_to_disk_and_reloads() {
+        #[cfg(windows)]
+        {
+            use win::*;
+            let root = std::env::temp_dir().join(format!("xone_save_persist_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            set_save_root(Some(root.clone()));
+
+            let mut prov = 0u64;
+            let mut cont = 0u64;
+            let mut upd = 0u64;
+            let cname = b"ProfileSlot1\0";
+            let bname = b"progress.dat\0";
+            let payload = b"LEVEL=7;SCORE=9900";
+            assert_eq!(XGameSaveInitializeProvider(1, 0, false, &mut prov as *mut u64 as u64), S_OK);
+            assert_eq!(XGameSaveCreateContainer(prov, cname.as_ptr() as u64, &mut cont as *mut u64 as u64), S_OK);
+            assert_eq!(XGameSaveCreateUpdate(cont, cname.as_ptr() as u64, &mut upd as *mut u64 as u64), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(upd, bname.as_ptr() as u64, payload.as_ptr() as u64, payload.len()), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(upd), S_OK);
+            XGameSaveCloseUpdate(upd);
+            XGameSaveCloseContainer(cont);
+            XGameSaveCloseProvider(prov);
+
+            // Clear in-memory cache and reload from disk.
+            set_save_root(Some(root.clone()));
+            assert_eq!(XGameSaveInitializeProvider(1, 0, false, &mut prov as *mut u64 as u64), S_OK);
+            assert_eq!(XGameSaveCreateContainer(prov, cname.as_ptr() as u64, &mut cont as *mut u64 as u64), S_OK);
+            let mut buf = [0u8; 64];
+            let mut written = 0usize;
+            assert_eq!(
+                XGameSaveReadBlobData(
+                    cont,
+                    bname.as_ptr() as u64,
+                    buf.as_mut_ptr() as u64,
+                    buf.len(),
+                    &mut written as *mut usize as u64,
+                ),
+                S_OK
+            );
+            assert_eq!(&buf[..written], payload);
+            assert_eq!(XGameSaveDeleteContainer(prov, cname.as_ptr() as u64), S_OK);
+            XGameSaveCloseContainer(cont);
+            XGameSaveCloseProvider(prov);
+
+            set_save_root(None);
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }

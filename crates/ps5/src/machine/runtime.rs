@@ -18,9 +18,17 @@ pub(super) struct Runtime {
     virtual_ranges: Vec<(u64, u64)>,
     pub(super) direct_mappings: Vec<(u64, u64, u64)>,
     direct_backing: HashMap<u64, u64>,
+    audio_next_handle: i32,
+    audio_ports: HashMap<i32, (usize, u32)>,
+    pub(super) audio_samples: Vec<f32>,
 }
 
 impl Machine {
+    /// Drains interleaved stereo f32 PCM audio produced by `sceAudioOutOutput`.
+    pub fn take_audio(&mut self, out: &mut Vec<f32>) {
+        out.append(&mut self.runtime.audio_samples);
+    }
+
     fn register_application_heap(&mut self) -> u64 {
         let address = self.arg(0);
         if address == 0 { return 0x8002_0016; }
@@ -233,11 +241,90 @@ impl Machine {
                 self.ret(if ok { 0 } else { 0x8002_000E });
             }
             "sceKernelGetCurrentCpu" => self.ret(0),
-            "sceAudioOutOpen" => self.ret(1),
-            "sceAudioOutClose" | "sceAudioOutSetVolume" => self.ret(0),
+            "sceAudioOutOpen" => {
+                let grain = (self.arg(3) as usize).clamp(256, 2048);
+                let format = (self.arg(5) as u32) & 0xFF;
+                self.runtime.audio_next_handle += 1;
+                let h = self.runtime.audio_next_handle;
+                self.runtime.audio_ports.insert(h, (grain, format));
+                self.ret(h as u64);
+            }
+            "sceAudioOutClose" => {
+                let h = self.arg(0) as i32;
+                self.runtime.audio_ports.remove(&h);
+                self.ret(0);
+            }
+            "sceAudioOutSetVolume" => self.ret(0),
             "sceAudioOutOutput" => {
                 let handle = self.arg(0) as i32;
-                self.ret(if handle > 0 { 256 } else { 0x8026_0003 });
+                let ptr = self.arg(1);
+                if let Some(&(grain, format)) = self.runtime.audio_ports.get(&handle) {
+                    if ptr != 0 && self.runtime.audio_samples.len() < 48_000 * 2 {
+                        match format {
+                            0 => {
+                                // S16 mono -> stereo f32
+                                let mut raw = vec![0u8; grain * 2];
+                                if self.mem.read(ptr, &mut raw) {
+                                    for c in raw.chunks_exact(2) {
+                                        let s = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
+                                        self.runtime.audio_samples.push(s);
+                                        self.runtime.audio_samples.push(s);
+                                    }
+                                }
+                            }
+                            1 => {
+                                // S16 stereo -> stereo f32
+                                let mut raw = vec![0u8; grain * 4];
+                                if self.mem.read(ptr, &mut raw) {
+                                    for c in raw.chunks_exact(4) {
+                                        let l = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
+                                        let r = i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0;
+                                        self.runtime.audio_samples.push(l);
+                                        self.runtime.audio_samples.push(r);
+                                    }
+                                }
+                            }
+                            3 => {
+                                // F32 mono -> stereo f32
+                                let mut raw = vec![0u8; grain * 4];
+                                if self.mem.read(ptr, &mut raw) {
+                                    for c in raw.chunks_exact(4) {
+                                        let s = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).clamp(-1.0, 1.0);
+                                        self.runtime.audio_samples.push(s);
+                                        self.runtime.audio_samples.push(s);
+                                    }
+                                }
+                            }
+                            4 => {
+                                // F32 stereo -> stereo f32
+                                let mut raw = vec![0u8; grain * 8];
+                                if self.mem.read(ptr, &mut raw) {
+                                    for c in raw.chunks_exact(8) {
+                                        let l = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).clamp(-1.0, 1.0);
+                                        let r = f32::from_le_bytes([c[4], c[5], c[6], c[7]]).clamp(-1.0, 1.0);
+                                        self.runtime.audio_samples.push(l);
+                                        self.runtime.audio_samples.push(r);
+                                    }
+                                }
+                            }
+                            _ => {
+                                // S16 8ch -> downmix front L/R
+                                let mut raw = vec![0u8; grain * 16];
+                                if self.mem.read(ptr, &mut raw) {
+                                    for c in raw.chunks_exact(16) {
+                                        let l = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
+                                        let r = i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0;
+                                        self.runtime.audio_samples.push(l);
+                                        self.runtime.audio_samples.push(r);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.ret(grain as u64);
+                } else {
+                    self.ret(0x8026_0003);
+                }
             }
             "sceAudioOutOutputs" => self.ret(0),
             "sceSaveDataInitialize3" | "sceSaveDataTerminate" => self.ret(0),
@@ -691,4 +778,34 @@ mod tests {
         println!("{}", machine.output);
     }
 
+    #[test]
+    fn audio_out_decodes_s16_stereo_pcm_to_host_f32() {
+        let mut machine = Machine::load(&crate::machine::tests::hello_program()).unwrap();
+        // Open S16 stereo audio port (grain=256, format=1)
+        machine.cpu.r[ARG_REGS[3]] = 256;
+        machine.cpu.r[ARG_REGS[5]] = 1;
+        assert!(machine.call_runtime("sceAudioOutOpen"));
+        let handle = machine.cpu.r[0];
+        assert!(handle >= 1);
+
+        // Write 256 stereo S16 frames into guest memory (L = +16384 -> +0.5, R = -16384 -> -0.5)
+        let buf = machine.heap_alloc(256 * 4, 16);
+        let mut raw = Vec::with_capacity(256 * 4);
+        for _ in 0..256 {
+            raw.extend_from_slice(&16384i16.to_le_bytes());
+            raw.extend_from_slice(&(-16384i16).to_le_bytes());
+        }
+        assert!(machine.mem.write(buf, &raw));
+
+        machine.cpu.r[ARG_REGS[0]] = handle;
+        machine.cpu.r[ARG_REGS[1]] = buf;
+        assert!(machine.call_runtime("sceAudioOutOutput"));
+        assert_eq!(machine.cpu.r[0], 256);
+
+        let mut pcm = Vec::new();
+        machine.take_audio(&mut pcm);
+        assert_eq!(pcm.len(), 512);
+        assert!((pcm[0] - 0.5).abs() < 1e-4);
+        assert!((pcm[1] + 0.5).abs() < 1e-4);
+    }
 }

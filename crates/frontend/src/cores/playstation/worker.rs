@@ -11,6 +11,7 @@ pub(super) struct Frame {
 #[derive(Default)]
 struct State {
     frame: Option<Frame>,
+    audio: Vec<f32>,
     message: Option<String>,
 }
 
@@ -44,7 +45,7 @@ impl Worker {
                         let result = machine.reload(&image);
                         flips = 0;
                         stopped = result.is_err();
-                        *thread_state.lock().unwrap() = State { frame: None, message: result.as_ref().err().cloned() };
+                        *thread_state.lock().unwrap() = State { frame: None, audio: Vec::new(), message: result.as_ref().err().cloned() };
                         let _ = reply.send(result);
                     }
                     Work::Run(reply) => {
@@ -70,6 +71,14 @@ impl Worker {
                                         }).collect();
                                         thread_state.lock().unwrap().frame = Some(Frame { pixels, size: (width as usize, height as usize) });
                                         flips = machine.video.flips;
+                                    }
+                                }
+                                let mut pcm = Vec::new();
+                                machine.take_audio(&mut pcm);
+                                if !pcm.is_empty() {
+                                    let mut guard = thread_state.lock().unwrap();
+                                    if guard.audio.len() < 48_000 * 2 {
+                                        guard.audio.extend(pcm);
                                     }
                                 }
                                 if let Some(mut message) = message {
@@ -111,6 +120,12 @@ impl Worker {
     #[cfg(test)]
     pub fn buttons(&self) -> u32 {
         self.input.load(Ordering::Relaxed)
+    }
+
+    pub fn take_audio(&self, out: &mut Vec<f32>) {
+        if let Ok(mut state) = self.state.lock() {
+            out.append(&mut state.audio);
+        }
     }
 
     pub fn update(&self) -> (Option<Frame>, Option<String>) {

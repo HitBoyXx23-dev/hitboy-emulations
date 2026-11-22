@@ -743,6 +743,7 @@ impl Machine {
                     let packet = (self.frames & 0xFFFF_FFFF) as u32;
                     self.fill(state, 0x10, 0);
                     self.w32(state, packet);
+                    self.w16(state + 4, self.pad_buttons);
                     self.ret(0);
                 } else {
                     self.ret(ERROR_DEVICE_NOT_CONNECTED);

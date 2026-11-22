@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 
 mod playstation;
+mod switch_core;
+mod x360_core;
 mod xboxone_core;
 
 pub(crate) fn ps_console_id(path: &Path) -> &'static str {
@@ -1225,69 +1227,6 @@ pub fn is_genesis_bin(path: &Path) -> bool {
     std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut b)).is_ok() && md::is_genesis_rom(&b)
 }
 
-/// Xbox 360 `.xex` executables: parse the XEX2 header and, for unencrypted titles, run a
-/// bounded diagnostic on our Xenon PowerPC core with kernel HLE.
-fn x360_report(path: &Path) -> Option<String> {
-    if lower_ext_of(path) != "xex" {
-        return None;
-    }
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => return Some(format!("Couldn't read {}: {e}", path.display())),
-    };
-    let xex = match x360::xex::Xex::parse(&data) {
-        Ok(x) => x,
-        Err(e) => return Some(format!("Couldn't parse Xbox 360 XEX: {e}")),
-    };
-    let title = xex
-        .pe_name
-        .clone()
-        .unwrap_or_else(|| crate::library::clean_title(&path.file_stem().unwrap_or_default().to_string_lossy()));
-    let title_id = xex
-        .execution
-        .as_ref()
-        .map(|e| format!("{:08X}", e.title_id))
-        .unwrap_or_else(|| "unknown".into());
-    let imports: Vec<String> = xex.imports.iter().map(|i| i.name.clone()).collect();
-    let mut s = format!(
-        "{title} (Title ID {title_id}) — Xbox 360 XEX2\nLoad: {:#010X}, Size: {} KB, Entry: {:#010X}, Encryption: {:?}, Compression: {:?}.",
-        xex.load_address,
-        xex.image_size / 1024,
-        xex.entry_point,
-        xex.encryption,
-        match xex.compression {
-            x360::xex::Compression::None => "None",
-            x360::xex::Compression::Basic(_) => "Basic",
-            x360::xex::Compression::Normal { .. } => "LZX",
-            x360::xex::Compression::Delta => "Delta",
-        }
-    );
-    if !imports.is_empty() {
-        s.push_str(&format!("\nImports: {}.", imports.join(", ")));
-    }
-    let mut m = x360::Machine::new();
-    match m.load_xex(&data) {
-        Ok(()) => {
-            let stop = m.run(2_000_000);
-            s.push_str(&format!("\n\nXenon CPU ran {} cycles and stopped: {stop:?}.", m.cycles));
-            if !m.log.is_empty() {
-                let tail: Vec<&str> = m.log.iter().rev().take(8).rev().map(String::as_str).collect();
-                s.push_str(&format!("\n\nDebug log:\n{}", tail.join("\n")));
-            }
-            let unimpl = m.unimplemented_calls();
-            if !unimpl.is_empty() {
-                let names: Vec<String> = unimpl.iter().take(8).map(|(n, c)| format!("{n} ({c}x)")).collect();
-                s.push_str(&format!("\n\nUnimplemented kernel calls: {}.", names.join(", ")));
-            }
-            s.push_str("\n\nXenos GPU rendering is still being built, so no video frame is drawn yet.");
-        }
-        Err(e) => {
-            s.push_str(&format!("\n\nCouldn't start on the Xenon CPU yet: {e}"));
-        }
-    }
-    Some(s)
-}
-
 /// If `path` is an Xbox One / Series X|S package or decrypted game folder and we are in
 /// Emulator mode, loads it into the live `XboxOneCore` player.
 fn try_load_xboxone(path: &Path) -> Option<Result<Loaded, String>> {
@@ -1326,8 +1265,8 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     if lower_ext_of(path) == "pkg" {
         return Err("PlayStation PKG installation is not supported yet. Open a decrypted ELF/OELF executable or a game folder containing eboot.bin with the experimental PS4 core.".into());
     }
-    if let Some(msg) = x360_report(path) {
-        return Err(msg);
+    if lower_ext_of(path) == "xex" {
+        return x360_core::load(path);
     }
     if let Some(res) = try_load_xboxone(path) {
         return res;
@@ -1364,35 +1303,10 @@ The PlayStation 2 core is in progress: the main processor (Emotion Engine) and m
     if console_for(&path.to_string_lossy()) == Some("ps1") && !is_small_bin(path) && !is_genesis_bin(path) && !is_other_disc {
         return load_ps1(path);
     }
-    // Switch packages: unlock with prod.keys, boot ExeFS on the ARM64+NEON core, and report progress.
+    // Switch packages: unlock with prod.keys and boot ExeFS live on our ARM64+NEON SwitchCore.
     if lower_ext_of(path) == "nsp" || lower_ext_of(path) == "xci" {
         let key_path = bios_for("switch").ok_or("Switch games are encrypted. Add prod.keys (dumped from your own Switch) in Settings > BIOS files > Switch.")?;
-        let keys = switch::keys::Keys::parse(&std::fs::read_to_string(key_path).map_err(|e| e.to_string())?)?;
-        let files = switch::pfs::game_files(path)?;
-        let ncas = files.iter().filter(|f| f.name.ends_with(".nca") || f.name.ends_with(".ncz")).count();
-        match switch::launch::boot_game(path, &keys) {
-            Ok(mut proc) => {
-                let stop = proc.run(500_000);
-                let mut msg = format!(
-                    "Switch package unlocked ({ncas} NCA files, {} keys). Program ID {:016X} booted on our ARM64+NEON core.\n\nExecution stopped: {stop:?}.",
-                    keys.len(),
-                    proc.program_id,
-                );
-                if !proc.debug_output.is_empty() {
-                    let mut tail: Vec<&str> = proc.debug_output.lines().rev().take(8).collect();
-                    tail.reverse();
-                    msg.push_str(&format!("\n\nHorizon log output:\n{}", tail.join("\n")));
-                }
-                msg.push_str("\n\nGraphics (NVN/Maxwell), RomFS and remaining Horizon services are still being built, so no video frame is drawn yet.");
-                return Err(msg);
-            }
-            Err(e) => {
-                return Err(format!(
-                    "The package opened ({ncas} NCA files, {} keys), but booting its Program NCA stopped:\n\n{e}",
-                    keys.len()
-                ));
-            }
-        }
+        return switch_core::load(path, &key_path);
     }
     // Wii discs (.iso / .wbfs): read and decrypted with the user's common key.
     let lower_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();

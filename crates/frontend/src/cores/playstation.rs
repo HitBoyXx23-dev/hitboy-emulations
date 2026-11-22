@@ -140,7 +140,9 @@ impl Core for PlayStationCore {
         self.size.0 as f32 / self.size.1 as f32
     }
 
-    fn take_audio(&mut self, _out: &mut Vec<f32>) {}
+    fn take_audio(&mut self, out: &mut Vec<f32>) {
+        self.worker.take_audio(out);
+    }
 
     fn set_sample_rate(&mut self, _rate: u32) {}
 }

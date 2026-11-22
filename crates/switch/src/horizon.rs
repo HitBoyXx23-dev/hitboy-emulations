@@ -91,6 +91,11 @@ pub struct Process {
     pub(crate) next_thread_id: u64,
     /// Optional decrypted RomFS image exposed via `fsp-srv` `OpenDataStorageByCurrentProcess`.
     pub romfs: Option<Vec<u8>>,
+    /// Live Switch Npad button bitmask (populated by the frontend player).
+    pub pad_buttons: u64,
+    /// Live 0RGB framebuffer scanout for desktop display.
+    pub framebuffer: Vec<u32>,
+    pub fb_size: (usize, usize),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -156,7 +161,35 @@ impl Process {
             current_thread: 0,
             next_thread_id: 2,
             romfs: None,
+            pad_buttons: 0,
+            framebuffer: vec![0; 640 * 360],
+            fb_size: (640, 360),
         })
+    }
+
+    /// Maps the shared frontend 12-bit controller mask to Switch `HidNpadButton` flags.
+    pub fn set_buttons(&mut self, buttons: u16) {
+        const MAP: [(u16, u64); 12] = [
+            (1 << 0, 1 << 0),  // A
+            (1 << 1, 1 << 1),  // B
+            (1 << 2, 1 << 11), // Minus (Select)
+            (1 << 3, 1 << 10), // Plus (Start)
+            (1 << 4, 1 << 13), // D-Pad Up
+            (1 << 5, 1 << 15), // D-Pad Down
+            (1 << 6, 1 << 12), // D-Pad Left
+            (1 << 7, 1 << 14), // D-Pad Right
+            (1 << 8, 1 << 2),  // X
+            (1 << 9, 1 << 3),  // Y
+            (1 << 10, 1 << 6), // L
+            (1 << 11, 1 << 7), // R
+        ];
+        let mut mask = 0u64;
+        for (src, dst) in MAP {
+            if buttons & src != 0 {
+                mask |= dst;
+            }
+        }
+        self.pad_buttons = mask;
     }
 
     /// Switches execution to the next ready thread (round-robin). Returns false if no ready thread remains.

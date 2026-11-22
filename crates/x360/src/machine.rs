@@ -102,6 +102,11 @@ pub struct Machine {
     pub log: Vec<String>,
     pub(crate) exit_code: Option<u32>,
     pub frames: u64,
+    /// Live Xbox 360 XInput button bitmask for pad 0.
+    pub pad_buttons: u16,
+    /// Live 0RGB scanout buffer for the desktop player.
+    pub framebuffer: Vec<u32>,
+    pub fb_size: (usize, usize),
 }
 
 impl Machine {
@@ -141,11 +146,39 @@ impl Machine {
             log: Vec::new(),
             exit_code: None,
             frames: 0,
+            pad_buttons: 0,
+            framebuffer: vec![0; 640 * 360],
+            fb_size: (640, 360),
         };
         // Kernel thunk area: one 16-byte slot per imported function.
         m.thunk_base = m.alloc_virtual(0x10_0000);
         m.exit_thunk = m.add_thunk("kernel", 0, "ExitThreadReturn");
         m
+    }
+
+    /// Maps the shared frontend 12-bit controller mask to Xbox 360 XInput `wButtons`.
+    pub fn set_buttons(&mut self, buttons: u16) {
+        const MAP: [(u16, u16); 12] = [
+            (1 << 0, 0x1000),  // A
+            (1 << 1, 0x2000),  // B
+            (1 << 2, 0x0020),  // Back
+            (1 << 3, 0x0010),  // Start
+            (1 << 4, 0x0001),  // Up
+            (1 << 5, 0x0002),  // Down
+            (1 << 6, 0x0004),  // Left
+            (1 << 7, 0x0008),  // Right
+            (1 << 8, 0x4000),  // X
+            (1 << 9, 0x8000),  // Y
+            (1 << 10, 0x0100), // LB
+            (1 << 11, 0x0200), // RB
+        ];
+        let mut mask = 0u16;
+        for (src, dst) in MAP {
+            if buttons & src != 0 {
+                mask |= dst;
+            }
+        }
+        self.pad_buttons = mask;
     }
 
     // ------------------------------------------------------------------ memory
