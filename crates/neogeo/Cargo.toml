@@ -1,0 +1,9 @@
+[package]
+name = "neogeo"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room SNK Neo Geo AES / MVS emulator core: Motorola 68000 (cpu68k), .neo/.zip loader, 320x224 Fix+Sprite PPU, and 4-button arcade controls"
+
+[dependencies]
+cpu68k = { path = "../cpu68k" }
+zip = { version = "2", default-features = false, features = ["deflate"] }

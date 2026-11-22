@@ -1,0 +1,8 @@
+[package]
+name = "saturn"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Sega Saturn emulator core: SH-2 CPU (cpush), Work RAM, VDP1/VDP2 320x224 scanout, and SMPC 6-button input"
+
+[dependencies]
+cpush = { path = "../cpush" }

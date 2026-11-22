@@ -1,0 +1,9 @@
+[package]
+name = "vita"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room PlayStation Vita emulator core: ARMv7-A Cortex-A9 CPU, .vpk/.self/.elf loader, 960x544 OLED display, touch, and Vita HLE"
+
+[dependencies]
+cpuarm_v7 = { path = "../cpuarm_v7" }
+zip = { version = "2", default-features = false, features = ["deflate"] }

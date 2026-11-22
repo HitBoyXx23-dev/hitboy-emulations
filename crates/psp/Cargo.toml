@@ -1,0 +1,8 @@
+[package]
+name = "psp"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room PlayStation Portable (PSP / PSP Go) emulator core: MIPS32R2 Allegrex CPU, PBP/ISO/CSO loader, GE rasterizer, and HLE kernel"
+
+[dependencies]
+flate2 = "1"

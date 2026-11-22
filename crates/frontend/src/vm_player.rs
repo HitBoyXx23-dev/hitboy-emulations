@@ -1,17 +1,23 @@
-//! In-app screen for VMs running on the built-in HitBoy x86 engine.
+//! In-app screen for VMs running on our built-in x86 PC core and Android Device / APK Runtime.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align2, Color32, ColorImage, FontId, Key, Rect, Sense, TextureHandle, TextureOptions, Vec2};
+use android::{AndroidDevice, NavKey};
+use eframe::egui::{self, Align2, Color32, ColorImage, CornerRadius, FontId, Key, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 use pc::keys;
 use pc::{Machine, Screen};
 
 use crate::theme::t;
 
+enum Backend {
+    Pc(Machine),
+    Android(AndroidDevice),
+}
+
 pub struct VmSession {
     pub name: String,
-    pub machine: Machine,
+    backend: Backend,
     pub paused: bool,
     last_tick: Instant,
     gfx: Option<TextureHandle>,
@@ -37,7 +43,7 @@ impl VmSession {
         let now = Instant::now();
         Ok(Self {
             name: name.to_owned(),
-            machine,
+            backend: Backend::Pc(machine),
             paused: false,
             last_tick: now,
             gfx: None,
@@ -49,6 +55,84 @@ impl VmSession {
             buttons: 0,
             hovered: false,
         })
+    }
+
+    pub fn start_android(name: &str, portrait: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            name: name.to_owned(),
+            backend: Backend::Android(AndroidDevice::new(name, portrait)),
+            paused: false,
+            last_tick: now,
+            gfx: None,
+            mips: 0.0,
+            mips_acc: 0,
+            mips_since: now,
+            blink: now,
+            mods: egui::Modifiers::NONE,
+            buttons: 0,
+            hovered: false,
+        }
+    }
+
+    pub fn is_android(&self) -> bool {
+        matches!(self.backend, Backend::Android(_))
+    }
+
+    pub fn engine_label(&self) -> String {
+        if self.is_android() {
+            format!("{} Android", t().name)
+        } else {
+            format!("{} x86", t().name)
+        }
+    }
+
+    pub fn reboot(&mut self) {
+        match &mut self.backend {
+            Backend::Pc(m) => m.reboot(),
+            Backend::Android(dev) => {
+                dev.active_app = None;
+                dev.recents_open = false;
+                dev.log.push("Rebooted Android device.".into());
+            }
+        }
+    }
+
+    pub fn install_apk(&mut self, path: &Path) -> Result<String, String> {
+        if let Backend::Android(dev) = &mut self.backend {
+            let idx = dev.install_apk(path)?;
+            let label = dev.apps[idx].label.clone();
+            dev.launch_app(idx);
+            Ok(label)
+        } else {
+            Err("Install APK is available on Android VMs.".into())
+        }
+    }
+
+    pub fn toggle_rotation(&mut self) {
+        if let Backend::Android(dev) = &mut self.backend {
+            dev.toggle_rotation();
+        }
+    }
+
+    pub fn press_nav(&mut self, key: NavKey) {
+        match &mut self.backend {
+            Backend::Android(dev) => dev.press_nav(key),
+            Backend::Pc(m) => match key {
+                NavKey::Back => {
+                    m.key_down(keys::ESC, 0x1B);
+                    m.key_up(keys::ESC);
+                }
+                NavKey::Home => {
+                    m.key_down(keys::HOME, 0);
+                    m.key_up(keys::HOME);
+                }
+                NavKey::Recents => {
+                    m.key_down(keys::TAB, 0x09);
+                    m.key_up(keys::TAB);
+                }
+            },
+        }
     }
 
     pub fn mips(&self) -> f64 {
@@ -63,30 +147,36 @@ impl VmSession {
         if self.paused {
             return;
         }
-        self.forward_keys(ctx);
-        let stats = self.machine.run_frame(dt, Duration::from_millis(14));
-        self.mips_acc += stats.instructions;
-        if self.mips_since.elapsed() >= Duration::from_secs(1) {
-            self.mips = self.mips_acc as f64 / self.mips_since.elapsed().as_secs_f64() / 1e6;
-            self.mips_acc = 0;
-            self.mips_since = now;
+        if matches!(self.backend, Backend::Android(_)) {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.press_nav(NavKey::Back);
+            }
+            return;
         }
-        ctx.request_repaint();
+        self.forward_keys(ctx);
+        if let Backend::Pc(machine) = &mut self.backend {
+            let stats = machine.run_frame(dt, Duration::from_millis(14));
+            self.mips_acc += stats.instructions;
+            if self.mips_since.elapsed() >= Duration::from_secs(1) {
+                self.mips = self.mips_acc as f64 / self.mips_since.elapsed().as_secs_f64() / 1e6;
+                self.mips_acc = 0;
+                self.mips_since = now;
+            }
+            ctx.request_repaint();
+        }
     }
 
     fn forward_keys(&mut self, ctx: &egui::Context) {
-        // Modifier keys as make/break scan codes (Shift, Ctrl, Alt), for guests that read the
-        // keyboard directly.
+        let Backend::Pc(machine) = &mut self.backend else { return };
         let mods = ctx.input(|i| i.modifiers);
         for (now, before, scan) in [(mods.shift, self.mods.shift, 0x2Au8), (mods.ctrl, self.mods.ctrl, 0x1D), (mods.alt, self.mods.alt, 0x38)] {
             if now && !before {
-                self.machine.key_down(scan, 0);
+                machine.key_down(scan, 0);
             } else if !now && before {
-                self.machine.key_up(scan);
+                machine.key_up(scan);
             }
         }
         self.mods = mods;
-        // Mouse: relative movement and buttons while the pointer is over the screen.
         if self.hovered {
             let (delta, buttons) = ctx.input(|i| {
                 let p = &i.pointer;
@@ -94,7 +184,7 @@ impl VmSession {
                 (p.delta(), b)
             });
             if delta != Vec2::ZERO || buttons != self.buttons {
-                self.machine.mouse(delta.x.round() as i32, delta.y.round() as i32, buttons);
+                machine.mouse(delta.x.round() as i32, delta.y.round() as i32, buttons);
                 self.buttons = buttons;
             }
         }
@@ -105,24 +195,22 @@ impl VmSession {
                     for c in text.chars() {
                         let ascii = if c.is_ascii() { c as u8 } else { b'?' };
                         let scan = keys::scan_for_char(c).unwrap_or(0);
-                        self.machine.key_down(scan, ascii);
+                        machine.key_down(scan, ascii);
                     }
                 }
                 egui::Event::Key { key, pressed, modifiers, repeat, .. } => {
                     let Some(scan) = scan_for_key(key) else { continue };
                     if !pressed {
-                        self.machine.key_up(scan);
+                        machine.key_up(scan);
                         continue;
                     }
                     let _ = repeat;
                     if let Some(ascii) = special_ascii(key) {
-                        self.machine.key_down(scan, ascii);
+                        machine.key_down(scan, ascii);
                     } else if modifiers.ctrl && is_letter(key) {
-                        // Ctrl+letter produces control codes (Ctrl+C = 0x03).
                         let letter = key.name().as_bytes()[0].to_ascii_uppercase();
-                        self.machine.key_down(scan, letter - b'@');
+                        machine.key_down(scan, letter - b'@');
                     }
-                    // Printable keys arrive through Event::Text.
                 }
                 _ => {}
             }
@@ -131,18 +219,20 @@ impl VmSession {
 
     /// Draws the guest display into `rect`.
     pub fn draw(&mut self, ui: &mut egui::Ui, avail: Rect) -> egui::Response {
+        if let Backend::Android(dev) = &mut self.backend {
+            return draw_android_device(ui, avail, dev);
+        }
         let resp = ui.allocate_rect(avail, Sense::click());
         self.hovered = resp.hovered();
         let painter = ui.painter_at(avail);
-        match self.machine.screen() {
+        let Backend::Pc(machine) = &mut self.backend else { return resp };
+        match machine.screen() {
             Screen::Text { cols, rows, cells, cursor } => {
-                // 9x16 character cells, like VGA text mode.
                 let (w, h) = (cols as f32 * 9.0, rows as f32 * 16.0);
                 let scale = (avail.width() / w).min(avail.height() / h);
                 let (cw, ch) = (9.0 * scale, 16.0 * scale);
                 let origin = avail.center() - Vec2::new(w * scale, h * scale) / 2.0;
                 let font = FontId::monospace(ch * 0.78);
-                // Backgrounds: one rectangle per run of equal colour (typically a few per row).
                 for row in 0..rows {
                     let line = &cells[row * cols..(row + 1) * cols];
                     let mut start = 0;
@@ -186,7 +276,6 @@ impl VmSession {
                     Some(tex) => tex.set(image, TextureOptions::NEAREST),
                     None => self.gfx = Some(ui.ctx().load_texture("vm_screen", image, TextureOptions::NEAREST)),
                 }
-                // Preserve native aspect ratio (supports 4:3 VGA, 16:9 desktop Linux/Windows, and portrait phone VMs).
                 let (w, h) = if width == 320 && height == 200 {
                     (4.0, 3.0)
                 } else {
@@ -199,7 +288,7 @@ impl VmSession {
                 }
             }
         }
-        if let Some(err) = self.machine.error() {
+        if let Some(err) = machine.error() {
             let card = Rect::from_center_size(avail.center(), Vec2::new(460.0, 90.0));
             painter.rect_filled(card, 12.0, t().panel);
             painter.text(card.center() - Vec2::new(0.0, 12.0), Align2::CENTER_CENTER, "Boot failed", FontId::proportional(20.0), t().danger);
@@ -207,6 +296,124 @@ impl VmSession {
         }
         resp
     }
+}
+
+/// Interactive Android Phone / Tablet screen with launcher, APK runtime, and Android nav bar.
+fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice) -> egui::Response {
+    let resp = ui.allocate_rect(avail, Sense::hover());
+    let (aspect_w, aspect_h) = if dev.portrait { (9.0_f32, 16.0_f32) } else { (16.0_f32, 10.0_f32) };
+    let pad = 20.0;
+    let max_w = (avail.width() - pad * 2.0).max(260.0);
+    let max_h = (avail.height() - pad * 2.0).max(320.0);
+    let scale = (max_w / aspect_w).min(max_h / aspect_h);
+    let bezel = Rect::from_center_size(avail.center(), Vec2::new(aspect_w * scale, aspect_h * scale));
+    let screen = bezel.shrink(10.0);
+
+    let p = ui.painter();
+    p.rect_filled(bezel, CornerRadius::same(26), Color32::from_rgb(0x14, 0x16, 0x20));
+    p.rect_stroke(bezel, CornerRadius::same(26), Stroke::new(2.0_f32, Color32::from_rgb(0x2E, 0x33, 0x48)), egui::StrokeKind::Inside);
+    p.rect_filled(screen, CornerRadius::same(18), Color32::from_rgb(0x0B, 0x0E, 0x18));
+
+    // Inner interactive UI inside the phone/tablet screen
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(screen.shrink(12.0)));
+    // Status bar
+    child.horizontal(|ui| {
+        ui.label(RichText::new("12:00").strong().size(12.0).color(Color32::WHITE));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new("100%  Wi-Fi  5G").size(11.5).color(Color32::from_rgb(0xA6, 0xB4, 0xD0)));
+        });
+    });
+    child.add_space(8.0);
+
+    let body_h = (screen.height() - 104.0).max(120.0);
+    let mut launch_idx = None;
+    let mut nav_pressed = None;
+
+    egui::ScrollArea::vertical().max_height(body_h).show(&mut child, |ui| {
+        if dev.recents_open {
+            ui.label(RichText::new("Recent apps").strong().size(16.0).color(Color32::WHITE));
+            ui.add_space(8.0);
+            if dev.recent_apps.is_empty() {
+                ui.label(RichText::new("No recent apps yet.").color(t().muted));
+            } else {
+                for &idx in &dev.recent_apps {
+                    if let Some(app) = dev.apps.get(idx) {
+                        if ui.button(RichText::new(format!("{}  ({})", app.label, app.package)).size(14.0)).clicked() {
+                            launch_idx = Some(idx);
+                        }
+                    }
+                }
+            }
+        } else if let Some(idx) = dev.active_app {
+            if let Some(app) = dev.apps.get(idx) {
+                ui.label(RichText::new(&app.label).strong().size(20.0).color(Color32::WHITE));
+                ui.label(RichText::new(format!("{}  v{}", app.package, if app.version_name.is_empty() { "1.0" } else { &app.version_name })).size(12.5).color(t().muted));
+                ui.add_space(10.0);
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(0x13, 0x18, 0x26))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x26, 0x2E, 0x45)))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Android Runtime & Dalvik VM").strong().color(t().primary));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("Activity: {}", if app.launcher_activity.is_empty() { "MainActivity" } else { &app.launcher_activity })).size(12.5).color(Color32::WHITE));
+                        ui.label(RichText::new(format!("DEX files: {} · Classes: {} · Methods: {}", app.dex_count, app.dex_classes, app.dex_methods)).size(12.0).color(t().muted));
+                        let abis = if app.abis.is_empty() { "Universal (Dalvik/ART)".to_string() } else { app.abis.join(", ") };
+                        ui.label(RichText::new(format!("Native ABIs: {abis}")).size(12.0).color(t().muted));
+                    });
+                ui.add_space(10.0);
+                if !dev.log.is_empty() {
+                    ui.label(RichText::new("Logcat").strong().size(12.0).color(t().muted));
+                    for line in dev.log.iter().rev().take(6).rev() {
+                        ui.label(RichText::new(line).monospace().size(11.0).color(Color32::from_rgb(0x9E, 0xE6, 0xB8)));
+                    }
+                }
+            }
+        } else {
+            ui.label(RichText::new("Android 14").strong().size(22.0).color(Color32::WHITE));
+            ui.label(RichText::new("Click any app to launch, or click Install APK in the top bar.").size(12.0).color(t().muted));
+            ui.add_space(12.0);
+            let cols = if dev.portrait { 3 } else { 5 };
+            egui::Grid::new("android_apps_grid").spacing(Vec2::new(10.0, 12.0)).show(ui, |ui| {
+                for (i, app) in dev.apps.iter().enumerate() {
+                    let btn = egui::Button::new(RichText::new(&app.label).strong().size(12.5).color(Color32::WHITE))
+                        .fill(if i < 3 { Color32::from_rgb(0x1B, 0x22, 0x36) } else { t().primary })
+                        .corner_radius(CornerRadius::same(14))
+                        .min_size(Vec2::new(82.0, 64.0));
+                    if ui.add(btn).on_hover_text(&app.package).clicked() {
+                        launch_idx = Some(i);
+                    }
+                    if (i + 1) % cols == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        }
+    });
+
+    // Bottom Android navigation bar: Back / Home / Recents
+    let nav_rect = Rect::from_min_max(egui::pos2(screen.left() + 12.0, screen.bottom() - 42.0), egui::pos2(screen.right() - 12.0, screen.bottom() - 8.0));
+    let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav_rect));
+    nav_ui.columns(3, |cols| {
+        if cols[0].centered_and_justified(|ui| ui.button(RichText::new("< Back").color(Color32::WHITE))).inner.clicked() {
+            nav_pressed = Some(NavKey::Back);
+        }
+        if cols[1].centered_and_justified(|ui| ui.button(RichText::new("O Home").color(Color32::WHITE))).inner.clicked() {
+            nav_pressed = Some(NavKey::Home);
+        }
+        if cols[2].centered_and_justified(|ui| ui.button(RichText::new("[] Recents").color(Color32::WHITE))).inner.clicked() {
+            nav_pressed = Some(NavKey::Recents);
+        }
+    });
+
+    if let Some(idx) = launch_idx {
+        dev.launch_app(idx);
+    }
+    if let Some(k) = nav_pressed {
+        dev.press_nav(k);
+    }
+    resp
 }
 
 fn rgb(c: u32) -> Color32 {

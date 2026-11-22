@@ -1,0 +1,5 @@
+[package]
+name = "cpuarm_v7"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room ARMv5TE / ARMv6K / ARMv7-A + Thumb CPU interpreter for 3DS, PS Vita, Nintendo DS ARM9, and Android"

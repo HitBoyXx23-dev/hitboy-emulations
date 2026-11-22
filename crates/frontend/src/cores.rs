@@ -1,13 +1,18 @@
-//! Uniform interface over the console cores so the player works for every system.
+﻿//! Uniform interface over the console cores so the player works for every system.
 
 use std::path::{Path, PathBuf};
 
 mod ios_core;
+mod next_wave;
 mod playstation;
 mod ps2_core;
 mod switch_core;
 mod x360_core;
 mod xboxone_core;
+
+pub fn is_psp_iso(path: &Path) -> bool {
+    next_wave::is_psp_iso(path)
+}
 
 pub(crate) fn ps_console_id(path: &Path) -> &'static str {
     playstation::console_id(path)
@@ -28,6 +33,8 @@ pub trait Core {
     /// Bitmask shared by all cores: A, B, Select, Start, Up, Down, Left, Right (bits 0-7),
     /// then X, Y, L, R (bits 8-11) for consoles that have them.
     fn set_buttons(&mut self, pad: usize, buttons: u16);
+    /// Pointer / touchscreen input in normalized 0..1 coordinates over the game frame (3DS, NDS, Vita, Wii U, Wii).
+    fn set_touch(&mut self, _pressed: bool, _x: f32, _y: f32) {}
     fn reset(&mut self);
     fn save_ram(&self) -> Option<Vec<u8>> {
         None
@@ -917,7 +924,7 @@ pub struct Loaded {
     pub save_path: PathBuf,
 }
 
-const KNOWN: &[(&str, &str)] = &[("a26", "a2600"), ("a78", "a7800"), ("sms", "sms"), ("gg", "gg"), ("pce", "pce"), ("ws", "ws"), ("wsc", "ws"), ("int", "intv"), ("rom", "intv"), ("vb", "vb"), ("vboy", "vb"), ("md", "md"), ("gen", "md"), ("smd", "md"), ("nes", "nes"), ("fds", "nes"), ("gb", "gb"), ("gbc", "gb"), ("sfc", "snes"), ("smc", "snes"), ("gba", "gba"), ("agb", "gba"), ("z64", "n64"), ("n64", "n64"), ("v64", "n64"), ("dol", "gc"), ("gcm", "gc"), ("nsp", "switch"), ("xci", "switch"), ("ipsw", "ios"), ("ipa", "ios"), ("xbe", "xbox"), ("xiso", "xbox"), ("xex", "x360"), ("xvc", "xone"), ("msixvc", "xone"), ("msix", "xone"), ("appx", "xone"), ("msixbundle", "xone"), ("appxbundle", "xone"), ("cue", "ps1"), ("bin", "ps1"), ("iso", "ps1"), ("exe", "ps1")];
+const KNOWN: &[(&str, &str)] = &[("a26", "a2600"), ("a78", "a7800"), ("sms", "sms"), ("gg", "gg"), ("pce", "pce"), ("ws", "ws"), ("wsc", "ws"), ("int", "intv"), ("rom", "intv"), ("vb", "vb"), ("vboy", "vb"), ("md", "md"), ("gen", "md"), ("smd", "md"), ("nes", "nes"), ("fds", "nes"), ("gb", "gb"), ("gbc", "gb"), ("sfc", "snes"), ("smc", "snes"), ("gba", "gba"), ("agb", "gba"), ("z64", "n64"), ("n64", "n64"), ("v64", "n64"), ("dol", "gc"), ("gcm", "gc"), ("nds", "nds"), ("dsi", "nds"), ("3dsx", "3ds"), ("3ds", "3ds"), ("cci", "3ds"), ("cia", "3ds"), ("rpx", "wiiu"), ("wua", "wiiu"), ("wud", "wiiu"), ("wux", "wiiu"), ("pbp", "psp"), ("cso", "psp"), ("vpk", "vita"), ("velf", "vita"), ("gdi", "dc"), ("cdi", "dc"), ("neo", "neogeo"), ("nsp", "switch"), ("xci", "switch"), ("ipsw", "ios"), ("ipa", "ios"), ("xbe", "xbox"), ("xiso", "xbox"), ("xex", "x360"), ("xvc", "xone"), ("msixvc", "xone"), ("msix", "xone"), ("appx", "xone"), ("msixbundle", "xone"), ("appxbundle", "xone"), ("cue", "ps1"), ("bin", "ps1"), ("iso", "ps1"), ("exe", "ps1")];
 
 pub fn console_for(name: &str) -> Option<&'static str> {
     let ext = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
@@ -926,6 +933,12 @@ pub fn console_for(name: &str) -> Option<&'static str> {
 
 /// Console id for a game file path (zips are assumed to hold NES games unless named otherwise).
 pub fn console_for_path(path: &Path) -> Option<&'static str> {
+    if let Some(c) = next_wave::elf_console_id(path) {
+        return Some(c);
+    }
+    if next_wave::is_psp_iso(path) {
+        return Some("psp");
+    }
     if is_ps2_iso(path) {
         return Some("ps2");
     }
@@ -957,6 +970,9 @@ fn lower_ext_of(path: &Path) -> String {
 
 /// A PlayStation 4/5 program: an eboot.bin, a SELF/ELF file, or a game folder holding an eboot.bin.
 fn is_ps5_file(path: &Path) -> bool {
+    if next_wave::elf_console_id(path).is_some() {
+        return false;
+    }
     let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     let ext = lower_ext_of(path);
     name == "eboot.bin" || ext == "self" || ext == "elf" || ext == "oelf" || (path.is_dir() && path.join("eboot.bin").is_file())
@@ -1260,6 +1276,9 @@ fn try_load_xboxone(path: &Path) -> Option<Result<Loaded, String>> {
 
 /// Loads a game file (or the first game inside a .zip) with the right core.
 pub fn load(path: &Path) -> Result<Loaded, String> {
+    if let Some(res) = next_wave::try_load(path) {
+        return res;
+    }
     if let Some(msg) = ps5_report(path) {
         return Err(msg);
     }
@@ -1416,8 +1435,7 @@ mod console_tests {
 
     #[test]
     fn real_disc_if_present() {
-        let Ok(raw) = std::env::var("HITBOY_GC_TEST_DISC") else { return };
-        let p = Path::new(&raw);
+        let p = Path::new(r"test_disc.iso");
         if p.exists() {
             assert_eq!(console_for_path(p), Some("gc"));
         }
@@ -1432,8 +1450,7 @@ mod real_disc {
     #[test]
     #[ignore]
     fn resident_evil_reaches_its_first_menu() {
-        let Ok(raw) = std::env::var("HITBOY_GC_TEST_DISC") else { return };
-        let p = Path::new(&raw);
+        let p = Path::new(r"test_disc.iso");
         if !p.exists() {
             return;
         }

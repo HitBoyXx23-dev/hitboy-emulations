@@ -1,0 +1,8 @@
+[package]
+name = "ps3"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room PlayStation 3 emulator core: Cell PPU PowerPC64 (cpuxenon), ELF/SELF loader, LV2 HLE syscalls, RSX 720p scanout, and DualShock 3 input"
+
+[dependencies]
+cpuxenon = { path = "../cpuxenon" }

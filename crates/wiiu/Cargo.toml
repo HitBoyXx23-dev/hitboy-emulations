@@ -1,0 +1,9 @@
+[package]
+name = "wiiu"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Nintendo Wii U emulator core: Espresso PowerPC (cpugekko), .rpx/.wua/.wud loader, Cafe OS HLE, GX2 TV+GamePad scanout, and VPAD touch"
+
+[dependencies]
+cpugekko = { path = "../cpugekko" }
+flate2 = "1"

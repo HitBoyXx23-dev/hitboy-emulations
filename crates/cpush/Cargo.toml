@@ -1,0 +1,5 @@
+[package]
+name = "cpush"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Hitachi SuperH (SH-2 & SH-4) CPU interpreter with FPU and matrix ops for Dreamcast and Saturn"

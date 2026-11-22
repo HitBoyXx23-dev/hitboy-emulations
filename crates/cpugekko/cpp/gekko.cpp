@@ -911,6 +911,7 @@ void gekko_reset(Gekko* c) {
     memset(c, 0, sizeof(Gekko));
     c->bus = bus;
     c->tb_div = 12;
+    c->tb_mul = 1;
     c->pc = 0xFFF00100;  // system reset vector
     c->msr = MSR_IP;
     c->spr[HID2] = 0xE0000000;  // paired singles + locked cache enabled

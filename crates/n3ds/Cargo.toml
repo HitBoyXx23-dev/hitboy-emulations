@@ -1,0 +1,8 @@
+[package]
+name = "n3ds"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Nintendo 3DS / 2DS emulator core: ARM11 MPCore CPU, dual-screen 400x480 framebuffer, touchscreen, .3dsx/.3ds/.cci/.cia loader, and Horizon-3DS HLE"
+
+[dependencies]
+cpuarm_v7 = { path = "../cpuarm_v7" }

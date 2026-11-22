@@ -1,0 +1,8 @@
+[package]
+name = "wii"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Nintendo Wii emulator core: Broadway PowerPC (cpugekko), MEM1+MEM2, .dol/.elf loader, VI scanout, and Wii Remote IR pointer"
+
+[dependencies]
+cpugekko = { path = "../cpugekko" }

@@ -1,0 +1,8 @@
+[package]
+name = "android"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Android VM & APK runtime: AXML manifest decoder, Dalvik DEX bytecode interpreter, JNI inspection, and interactive Android Phone/Tablet OS"
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -1,0 +1,8 @@
+[package]
+name = "dreamcast"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Sega Dreamcast emulator core: SH-4 CPU, PowerVR2 CLX2 scanout, GD-ROM/GDI/CDI/ELF loader, Maple Bus, AICA audio, and HLE BIOS"
+
+[dependencies]
+cpush = { path = "../cpush" }

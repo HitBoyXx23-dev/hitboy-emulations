@@ -34,17 +34,17 @@ pub const CONSOLES: &[Console] = &[
     console!("n64", "Nintendo 64", "N64", "Nintendo", false, Playable, ["n64", "z64", "v64", "ndd", "zip"], "Early: some 3D games run below full speed."),
     console!("gb", "Game Boy / Color", "GB", "Nintendo", true, Playable, ["gb", "gbc", "zip"], "Game Boy and Game Boy Color, with saves."),
     console!("gba", "Game Boy Advance", "GBA", "Nintendo", true, Playable, ["gba", "zip"], "No BIOS file needed."),
-    console!("nds", "Nintendo DS / DSi", "NDS", "Nintendo", true, Planned, ["nds", "dsi"], "Coming soon."),
-    console!("3ds", "Nintendo 3DS / 2DS", "3DS", "Nintendo", true, Planned, ["3ds", "cci", "cia"], "Coming soon."),
+    console!("nds", "Nintendo DS / DSi", "NDS", "Nintendo", true, Experimental, ["nds", "dsi"], "Experimental: runs ARM9 Nitro .nds/.dsi ROMs on our dual-screen 256×384 core with live bottom touchscreen pointer support."),
+    console!("3ds", "Nintendo 3DS / 2DS", "3DS", "Nintendo", true, Experimental, ["3dsx", "3ds", "cci", "cia"], "Experimental: loads .3dsx homebrew and decrypted .3ds/.cci/.cia packages on our ARM11 MPCore CPU with stacked 400×240 + 320×240 dual screens, live touchscreen input, and Horizon-3DS HLE."),
     console!("gc", "GameCube", "GC", "Nintendo", false, Playable, ["dol", "iso", "gcm"], "Early: homebrew runs. Store-bought games load but show a black screen until the graphics chip (GX) is built."),
-    console!("wii", "Wii", "WII", "Nintendo", false, Planned, ["iso", "wbfs"], "In progress: discs are read and decrypted with your common key; games can't run yet."),
-    console!("wiiu", "Wii U", "WIIU", "Nintendo", false, Planned, ["wud", "wux", "rpx", "wua"], "Coming soon. The GamePad screen will show beside the TV picture; motion can use your webcam."),
+    console!("wii", "Wii", "WII", "Nintendo", false, Experimental, ["iso", "wbfs", "dol", "elf"], "Experimental: decrypts Wii discs with your common key and runs Broadway PowerPC .dol/.elf executables with MEM1+MEM2, VI scanout, and Wii Remote IR pointer."),
+    console!("wiiu", "Wii U", "WIIU", "Nintendo", false, Experimental, ["rpx", "wua", "wud", "wux", "elf"], "Experimental: loads compressed .rpx executables and game folders on our Espresso PowerPC core with Cafe OS HLE, 1280×720 GX2 scanout, and GamePad touchscreen input."),
     console!("switch", "Switch", "SWITCH", "Nintendo", true, Experimental, ["nsp", "xci"], "Experimental: .nsp/.xci packages decrypt with your prod.keys and run live on our ARM64+NEON Switch core with RomFS, HID controller input, and Horizon IPC services (sm:, set, set:sys, lm, time:u, apm, appletOE, hid)."),
     console!("ps1", "PlayStation", "PS1", "Sony", false, Playable, ["cue", "bin", "iso", "exe"], "Needs a BIOS from your own console."),
     console!("ps2", "PlayStation 2", "PS2", "Sony", false, Experimental, ["iso", "chd", "7z"], "Experimental: boots your console's 4 MB PS2 BIOS live on our Emotion Engine + IOP + SIF dual-CPU core. Add your PS2 BIOS in Settings > BIOS files; Graphics Synthesizer 3D rendering is next."),
-    console!("psp", "PSP / PSP Go", "PSP", "Sony", true, Planned, ["iso", "cso", "pbp"], "Coming soon."),
-    console!("vita", "PlayStation Vita", "VITA", "Sony", true, Planned, ["vpk"], "Coming soon."),
-    console!("ps3", "PlayStation 3", "PS3", "Sony", false, Planned, ["iso", "pkg"], "Coming later."),
+    console!("psp", "PSP / PSP Go", "PSP", "Sony", true, Experimental, ["pbp", "iso", "cso", "elf"], "Experimental: loads EBOOT.PBP, UMD .iso, compressed .cso, and MIPS .elf programs on our MIPS32R2 Allegrex core with 480×272 display, GE rasterizer, audio, and HLE kernel."),
+    console!("vita", "PlayStation Vita", "VITA", "Sony", true, Experimental, ["vpk", "velf", "self", "elf"], "Experimental: unpacks .vpk packages and decrypted ARMv7 executables on our Cortex-A9 core with 960×544 OLED framebuffer, front touchscreen, and Vita HLE."),
+    console!("ps3", "PlayStation 3", "PS3", "Sony", false, Experimental, ["elf", "self", "iso", "pkg"], "Experimental: runs decrypted PowerPC64 Cell PPU .elf executables on our PowerPC64 core with LV2 syscalls, 720p RSX scanout, and DualShock 3 input."),
     console!("ps4", "PlayStation 4", "PS4", "Sony", false, Experimental, ["pkg", "bin", "elf", "oelf", "self"], "Experimental homebrew support: open a decrypted ELF/OELF or game folder containing eboot.bin. CPU, controller buttons and VideoOut are available. PKG installation, GPU commands, audio and many system services remain unsupported."),
     console!("ps5", "PlayStation 5", "PS5", "Sony", false, Experimental, ["bin", "elf", "self"], "Experimental: open a decrypted PS5 eboot.bin, ELF or SELF on our x86-64 core with VideoOut and controller input, or use the Remote Play tab to stream from your own PS5."),
     console!("xbox", "Xbox", "XBOX", "Microsoft", false, Experimental, ["iso", "xiso", "xbe"], "Experimental: boots your console's flash BIOS and MCPX boot ROM on our Pentium III core with NV2A scanout. Disc drive, HDD and 3D acceleration are still being built."),
@@ -56,14 +56,14 @@ pub const CONSOLES: &[Console] = &[
     console!("md", "Genesis / Mega Drive", "MD", "Sega", false, Playable, ["md", "gen", "smd", "bin", "zip"], "No BIOS needed. Buttons: B = A, A = B, Y = C, Start."),
     console!("segacd", "Sega CD / Mega-CD", "SCD", "Sega", false, Planned, ["cue", "chd"], "Coming soon."),
     console!("32x", "32X", "32X", "Sega", false, Planned, ["32x"], "Coming soon."),
-    console!("saturn", "Saturn", "SAT", "Sega", false, Planned, ["cue", "chd"], "Coming soon."),
-    console!("dc", "Dreamcast", "DC", "Sega", false, Planned, ["gdi", "cdi", "chd"], "Coming soon."),
+    console!("saturn", "Saturn", "SAT", "Sega", false, Experimental, ["cue", "bin", "chd"], "Experimental: runs Sega Saturn SH-2 binaries and discs on our SuperH core with VDP2 320×224 scanout and 6-button controller support."),
+    console!("dc", "Dreamcast", "DC", "Sega", false, Experimental, ["gdi", "cdi", "chd", "elf"], "Experimental: loads .gdi, .cdi, and SH-4 .elf games on our Hitachi SH-4 + FPU core with PowerVR2 640×480 scanout, Maple Bus controller, and built-in HLE BIOS."),
     console!("gg", "Game Gear", "GG", "Sega", true, Playable, ["gg", "zip"], "No BIOS needed. A and B are buttons 1 and 2."),
     console!("a2600", "Atari 2600", "2600", "Atari", false, Playable, ["a26", "bin", "zip"], "Joystick games with sound. Start = Reset, Select = Select."),
     console!("a7800", "Atari 7800", "7800", "Atari", false, Playable, ["a78", "zip"], "No BIOS needed. Start = Reset, Select = Select, X = Pause."),
     console!("lynx", "Atari Lynx", "LYNX", "Atari", true, Planned, ["lnx"], "Coming soon."),
     console!("pce", "TurboGrafx-16", "PCE", "NEC", false, Playable, ["pce", "zip"], "HuCard games, no BIOS needed. A/B = buttons I/II, Start = Run."),
-    console!("neogeo", "Neo Geo AES / MVS", "NEO", "SNK", false, Planned, ["zip"], "Coming soon."),
+    console!("neogeo", "Neo Geo AES / MVS", "NEO", "SNK", false, Experimental, ["neo", "zip"], "Experimental: runs .neo and MAME .zip Neo Geo games on our Motorola 68000 core with 320×224 Fix Layer + VRAM scanout and 4-button arcade controls."),
     console!("ngp", "Neo Geo Pocket / Color", "NGP", "SNK", true, Planned, ["ngp", "ngc"], "Coming soon."),
     console!("ws", "WonderSwan", "WS", "Bandai", true, Playable, ["ws", "wsc", "zip"], "Plays WonderSwan, WonderSwan Color and SwanCrystal games. No BIOS needed. X/Y/L/R are the Y buttons for games held upright."),
     console!("intv", "Intellivision", "INTV", "Mattel", false, Playable, ["int", "rom", "zip"], "Needs your console's EXEC (exec.bin, 8 KB) and GROM (grom.bin, 2 KB) in Settings > BIOS files."),
@@ -110,13 +110,15 @@ fn bin_fits(path: &Path, console: &str) -> bool {
         let xb = xbox::is_xbox_disc(path);
         let wii = crate::cores::is_wii_iso(path);
         let ps2 = crate::cores::is_ps2_iso(path);
+        let psp = crate::cores::is_psp_iso(path);
         match console {
             "gc" => return gc,
             "wii" => return wii,
             "xbox" => return xb,
             "ps2" => return ps2,
-            // Any other disc console: not a GameCube, Wii or Xbox disc.
-            _ => return !gc && !xb && !wii && !ps2,
+            "psp" => return psp,
+            // Any other disc console: not a GameCube, Wii, Xbox, PS2 or PSP disc.
+            _ => return !gc && !xb && !wii && !ps2 && !psp,
         }
     }
     if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bin")) {

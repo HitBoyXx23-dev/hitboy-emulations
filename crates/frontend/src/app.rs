@@ -1144,7 +1144,22 @@ impl App {
             let rect = Rect::from_center_size(avail.center(), Vec2::new(base_w * scale, base_h * scale));
             // Screen pixels per emulated pixel, for the sharp-pixel pre-scale.
             self.last_scale = (rect.width() / w as f32).max(rect.height() / h as f32) * ui.ctx().pixels_per_point();
-            let resp = ui.allocate_rect(avail, Sense::click());
+            let resp = ui.allocate_rect(avail, Sense::click_and_drag());
+            // Forward live pointer/touchscreen coordinates for dual-screen & touch consoles (3DS, NDS, Vita, Wii U, Wii).
+            if let Some(s) = self.session.as_mut() {
+                let (pressed, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
+                if let Some(p) = pos {
+                    if rect.contains(p) {
+                        let nx = ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                        let ny = ((p.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+                        s.core.set_touch(pressed, nx, ny);
+                    } else {
+                        s.core.set_touch(false, 0.0, 0.0);
+                    }
+                } else {
+                    s.core.set_touch(false, 0.0, 0.0);
+                }
+            }
             if let Some(tex) = &self.screen {
                 ui.painter().image(tex.id(), rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
             }
@@ -1213,22 +1228,42 @@ impl App {
                         }
                         ui.add_space(8.0);
                         let Some(s) = self.vm_session.as_mut() else { return };
+                        let engine_label = s.engine_label();
+                        let is_android = s.is_android();
                         ui.label(RichText::new(&s.name).size(15.0).family(egui::FontFamily::Name("heading".into())).color(t().text));
-                        pill(ui, &format!("{} x86", t().name), t().primary, t().surface);
+                        pill(ui, &engine_label, t().primary, t().surface);
+                        let mut install_apk_clicked = false;
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if icon_button(ui, Icon::Fullscreen, "Fullscreen", false).clicked() {
                                 toggle_fs = true;
                             }
-                            if icon_button(ui, Icon::Keyboard, "Ctrl+Alt+Del", false).on_hover_text("Restart the guest").clicked() {
-                                s.machine.reboot();
+                            if icon_button(ui, Icon::Keyboard, "Reboot", false).on_hover_text("Restart the guest").clicked() {
+                                s.reboot();
                             }
-                            let label = if s.paused { "Resume" } else { "Pause" };
-                            if primary_button(ui, label).clicked() {
-                                s.paused = !s.paused;
+                            if is_android {
+                                if ghost_button(ui, "Rotate").clicked() {
+                                    s.toggle_rotation();
+                                }
+                                if primary_button(ui, "Install APK").clicked() {
+                                    install_apk_clicked = true;
+                                }
+                            } else {
+                                let label = if s.paused { "Resume" } else { "Pause" };
+                                if primary_button(ui, label).clicked() {
+                                    s.paused = !s.paused;
+                                }
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(format!("{:.1} MIPS", s.mips())).monospace().size(12.0).color(t().muted));
                             }
-                            ui.add_space(6.0);
-                            ui.label(RichText::new(format!("{:.1} MIPS", s.mips())).monospace().size(12.0).color(t().muted));
                         });
+                        if install_apk_clicked {
+                            if let Some(path) = rfd::FileDialog::new().add_filter("Android Package", &["apk"]).pick_file() {
+                                match s.install_apk(&path) {
+                                    Ok(label) => self.notify(format!("Installed {label}")),
+                                    Err(e) => self.notify(e),
+                                }
+                            }
+                        }
                     });
                 });
             egui::TopBottomPanel::top("vm_rule").exact_height(2.0).frame(egui::Frame::NONE).show_separator_line(false).show(ctx, |ui| {
@@ -2465,14 +2500,23 @@ impl App {
                 }
             }
             if start {
-                let vm = &self.settings.vms[idx];
-                match VmSession::start(&vm.name, &vm.iso, &vm.disk, vm.ram_mb) {
-                    Ok(s) => {
-                        self.notify(format!("Started {}", vm.name));
-                        self.vm_session = Some(s);
-                    }
-                    Err(e) => {
-                        rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Couldn't start VM").set_description(e).show();
+                let vm = self.settings.vms[idx].clone();
+                let use_android_runner = vm.preset == "android-apk"
+                    || vm.preset == "android-tablet-apk"
+                    || (vm.iso.is_empty() && vm.kind() != DeviceKind::Computer);
+                if use_android_runner {
+                    let portrait = vm.kind() == DeviceKind::Phone;
+                    self.notify(format!("Started {}", vm.name));
+                    self.vm_session = Some(VmSession::start_android(&vm.name, portrait));
+                } else {
+                    match VmSession::start(&vm.name, &vm.iso, &vm.disk, vm.ram_mb) {
+                        Ok(s) => {
+                            self.notify(format!("Started {}", vm.name));
+                            self.vm_session = Some(s);
+                        }
+                        Err(e) => {
+                            rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Couldn't start VM").set_description(e).show();
+                        }
                     }
                 }
             }

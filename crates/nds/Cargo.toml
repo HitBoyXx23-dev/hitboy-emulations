@@ -1,0 +1,8 @@
+[package]
+name = "nds"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Nintendo DS / DSi emulator core: ARM946E-S CPU, Nitro ROM loader, dual 256x192 screens, touchscreen, and 2D VRAM scanout"
+
+[dependencies]
+cpuarm_v7 = { path = "../cpuarm_v7" }

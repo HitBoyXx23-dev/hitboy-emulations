@@ -29,6 +29,17 @@ intv = { path = "../intv" }
 ps5 = { path = "../ps5" }
 gamedump = { path = "../gamedump" }
 ps2 = { path = "../ps2" }
+psp = { path = "../psp" }
+vita = { path = "../vita" }
+n3ds = { path = "../n3ds" }
+nds = { path = "../nds" }
+wiiu = { path = "../wiiu" }
+wii = { path = "../wii" }
+dreamcast = { path = "../dreamcast" }
+saturn = { path = "../saturn" }
+neogeo = { path = "../neogeo" }
+ps3 = { path = "../ps3" }
+android = { path = "../android" }
 eframe = "0.31"
 gilrs = "0.11"
 rfd = "0.15"
