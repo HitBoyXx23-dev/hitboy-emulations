@@ -656,9 +656,11 @@ impl App {
         }
         let dir = PathBuf::from(&self.settings.vm_dir);
         let _ = std::fs::create_dir_all(&dir);
-        let iso = dir.join(p.iso_file);
-        if iso.exists() {
-            cfg.iso = iso.to_string_lossy().into_owned();
+        if !p.iso_file.is_empty() {
+            let iso = dir.join(p.iso_file);
+            if iso.exists() {
+                cfg.iso = iso.to_string_lossy().into_owned();
+            }
         }
         let disk = dir.join(format!("{}.img", cfg.name.replace(' ', "_")));
         if !disk.exists() {

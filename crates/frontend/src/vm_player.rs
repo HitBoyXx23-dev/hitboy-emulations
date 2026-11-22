@@ -186,8 +186,12 @@ impl VmSession {
                     Some(tex) => tex.set(image, TextureOptions::NEAREST),
                     None => self.gfx = Some(ui.ctx().load_texture("vm_screen", image, TextureOptions::NEAREST)),
                 }
-                // Stretch to 4:3 like a monitor would.
-                let (w, h) = (4.0, 3.0);
+                // Preserve native aspect ratio (supports 4:3 VGA, 16:9 desktop Linux/Windows, and portrait phone VMs).
+                let (w, h) = if width == 320 && height == 200 {
+                    (4.0, 3.0)
+                } else {
+                    (width.max(1) as f32, height.max(1) as f32)
+                };
                 let scale = (avail.width() / w).min(avail.height() / h);
                 let rect = Rect::from_center_size(avail.center(), Vec2::new(w * scale, h * scale));
                 if let Some(tex) = &self.gfx {

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 mod ios_core;
 mod playstation;
+mod ps2_core;
 mod switch_core;
 mod x360_core;
 mod xboxone_core;
@@ -1005,14 +1006,16 @@ fn ps5_native_report(path: &Path) -> String {
     });
     match rx.recv_timeout(std::time::Duration::from_secs(15)) {
         Ok(Ok(r)) => format!(
-            "The program ran natively on your PC and exited with code {}.
+            "The program ran natively on your PC and exited with code {} ({} TLS relink patches, {} VideoOut flips).
 
 It printed:
 {}
 
 {}
-Native mode runs the program's own code with our replacement system libraries. Graphics, audio and input libraries aren't built yet, so nothing is drawn.",
+Native mode runs the program's own x86-64 machine code directly on your PC's processor with our binary fs: TLS relinker and Rust PlayStation library replacements.",
             r.exit_code,
+            r.tls_patches,
+            r.video_flips,
             if r.output.is_empty() { "(nothing)".into() } else { r.output },
             if r.unimplemented.is_empty() { String::new() } else { format!("System functions it called that we don't provide yet: {}.
 ", r.unimplemented.join(", ")) }
@@ -1297,10 +1300,13 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     // the PlayStation core.)
     let is_other_disc = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")) && (is_gamecube_iso(path) || gc::wii::is_wii_disc(path) || is_ps2_iso(path));
     if is_ps2_iso(path) {
+        if let Some(bios) = bios_for("ps2") {
+            return ps2_core::load(path, &bios);
+        }
         return Err(format!(
             "{} is a PlayStation 2 disc.
 
-The PlayStation 2 core is in progress: the main processor (Emotion Engine) and memory map are built and tested, but the I/O processor, DMA, vector units and graphics chip are not yet, so no game can start. Add your PS2 BIOS under Settings > BIOS files when it's ready.",
+Add your PlayStation 2 BIOS (4 MB ROM dumped from your own console) under Settings > BIOS files > PlayStation 2 to boot the Emotion Engine + IOP core.",
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
     }

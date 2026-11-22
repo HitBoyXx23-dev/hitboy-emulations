@@ -41,7 +41,7 @@ pub const CONSOLES: &[Console] = &[
     console!("wiiu", "Wii U", "WIIU", "Nintendo", false, Planned, ["wud", "wux", "rpx", "wua"], "Coming soon. The GamePad screen will show beside the TV picture; motion can use your webcam."),
     console!("switch", "Switch", "SWITCH", "Nintendo", true, Experimental, ["nsp", "xci"], "Experimental: .nsp/.xci packages decrypt with your prod.keys and run live on our ARM64+NEON Switch core with RomFS, HID controller input, and Horizon IPC services (sm:, set, set:sys, lm, time:u, apm, appletOE, hid)."),
     console!("ps1", "PlayStation", "PS1", "Sony", false, Playable, ["cue", "bin", "iso", "exe"], "Needs a BIOS from your own console."),
-    console!("ps2", "PlayStation 2", "PS2", "Sony", false, Planned, ["iso", "chd", "7z"], "Early: the main processor (Emotion Engine) and memory map are built and tested. The I/O processor, DMA, vector units and graphics chip are next, so no game starts yet."),
+    console!("ps2", "PlayStation 2", "PS2", "Sony", false, Experimental, ["iso", "chd", "7z"], "Experimental: boots your console's 4 MB PS2 BIOS live on our Emotion Engine + IOP + SIF dual-CPU core. Add your PS2 BIOS in Settings > BIOS files; Graphics Synthesizer 3D rendering is next."),
     console!("psp", "PSP / PSP Go", "PSP", "Sony", true, Planned, ["iso", "cso", "pbp"], "Coming soon."),
     console!("vita", "PlayStation Vita", "VITA", "Sony", true, Planned, ["vpk"], "Coming soon."),
     console!("ps3", "PlayStation 3", "PS3", "Sony", false, Planned, ["iso", "pkg"], "Coming later."),

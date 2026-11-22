@@ -145,6 +145,70 @@ pub const PRESETS: &[Preset] = &[
         sha1: ANDROID_SHA1,
         iso_file: "android-x86_64-9.0-r2.iso",
     },
+    Preset {
+        id: "alpine",
+        name: "Alpine Linux",
+        description: "Ultra-fast lightweight 64-bit Linux (~60 MB ISO) ideal for instant booting on our built-in x86-64 PC engine.",
+        kind: DeviceKind::Computer,
+        disk_gb: 8,
+        ram_mb: 512,
+        cpus: 2,
+        uefi: false,
+        xres: 1024,
+        yres: 768,
+        iso_url: "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-standard-3.20.3-x86_64.iso",
+        checksum_url: "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-standard-3.20.3-x86_64.iso.sha256",
+        sha1: "",
+        iso_file: "alpine-standard-3.20.3-x86_64.iso",
+    },
+    Preset {
+        id: "freedos",
+        name: "FreeDOS",
+        description: "Classic MS-DOS compatible operating system running directly on our built-in x86 BIOS, VGA, keyboard and IDE engine.",
+        kind: DeviceKind::Computer,
+        disk_gb: 2,
+        ram_mb: 64,
+        cpus: 1,
+        uefi: false,
+        xres: 640,
+        yres: 480,
+        iso_url: "",
+        checksum_url: "",
+        sha1: "",
+        iso_file: "",
+    },
+    Preset {
+        id: "windows-iso",
+        name: "Windows (Custom ISO)",
+        description: "Attach your own Windows x86/x86-64 installation ISO or disk image. Configured with 4 GB RAM, 4 cores and 64 GB disk.",
+        kind: DeviceKind::Computer,
+        disk_gb: 64,
+        ram_mb: 2048,
+        cpus: 4,
+        uefi: true,
+        xres: 1280,
+        yres: 720,
+        iso_url: "",
+        checksum_url: "",
+        sha1: "",
+        iso_file: "",
+    },
+    Preset {
+        id: "custom-os",
+        name: "Linux / BSD / Custom OS",
+        description: "Attach any bootable x86/x86-64 ISO, floppy or raw disk image (Ubuntu, Debian, FreeBSD, Haiku, TempleOS, KolibriOS, etc.).",
+        kind: DeviceKind::Computer,
+        disk_gb: 32,
+        ram_mb: 1024,
+        cpus: 2,
+        uefi: false,
+        xres: 1024,
+        yres: 768,
+        iso_url: "",
+        checksum_url: "",
+        sha1: "",
+        iso_file: "",
+    },
 ];
 
 pub fn preset(id: &str) -> Option<&'static Preset> {
@@ -200,6 +264,9 @@ pub enum DownloadState {
 
 impl Download {
     pub fn start(p: &'static Preset, vm_name: &str, dir: &Path) -> Result<Self, String> {
+        if p.iso_url.is_empty() || p.iso_file.is_empty() {
+            return Err("This template uses a custom image. Pick your own .iso or .img file in the VM settings.".into());
+        }
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let dest = dir.join(p.iso_file);
         let part = dest.with_extension("iso.part");
@@ -279,11 +346,15 @@ fn verify(file: &Path, checksum_url: &str, name: &str, sha1: &str) -> Result<(),
         let _ = std::fs::remove_file(file);
         return Err("Checksum mismatch: the downloaded image was corrupted and has been deleted. Try again.".into());
     }
+    if checksum_url.is_empty() {
+        return Ok(());
+    }
     let out = crate::quiet(crate::platform::curl()).args(["-sL", "--fail", checksum_url]).output().map_err(|e| e.to_string())?;
     let sums = String::from_utf8_lossy(&out.stdout);
     let expected = sums
         .lines()
         .find(|l| l.split_whitespace().nth(1).is_some_and(|n| n.trim_start_matches('*') == name))
+        .or_else(|| sums.lines().find(|l| l.split_whitespace().next().is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))))
         .and_then(|l| l.split_whitespace().next())
         .ok_or("Couldn't fetch the official checksum to verify the ISO.")?
         .to_ascii_lowercase();
