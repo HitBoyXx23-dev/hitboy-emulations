@@ -415,8 +415,59 @@ impl Core for atari7800::Atari7800 {
     }
 }
 
+struct XboxOneWebCore {
+    exe: Vec<u8>,
+    emu: xboxone::x64_emu::XboxX64Emu,
+    frame: Vec<u32>,
+    size: (usize, usize),
+}
+
+impl XboxOneWebCore {
+    fn new(exe: &[u8]) -> Result<Self, String> {
+        let emu = xboxone::x64_emu::XboxX64Emu::load_pe(exe)?;
+        let size = (emu.framebuffer.width as usize, emu.framebuffer.height as usize);
+        let frame = emu.fb_pixels_0rgb();
+        Ok(Self { exe: exe.to_vec(), emu, frame, size })
+    }
+}
+
+impl Core for XboxOneWebCore {
+    fn run_frame(&mut self) {
+        let _ = self.emu.step_budget(120_000);
+        self.size = (self.emu.framebuffer.width as usize, self.emu.framebuffer.height as usize);
+        self.frame = self.emu.fb_pixels_0rgb();
+    }
+    fn frame(&self) -> &[u32] {
+        &self.frame
+    }
+    fn size(&self) -> (usize, usize) {
+        self.size
+    }
+    fn fps(&self) -> f64 {
+        60.0
+    }
+    fn set_buttons(&mut self, pad: usize, b: u16) {
+        self.emu.set_buttons(pad, b);
+    }
+    fn reset(&mut self) {
+        if let Ok(emu) = xboxone::x64_emu::XboxX64Emu::load_pe(&self.exe) {
+            self.size = (emu.framebuffer.width as usize, emu.framebuffer.height as usize);
+            self.frame = emu.fb_pixels_0rgb();
+            self.emu = emu;
+        }
+    }
+    fn take_audio(&mut self, out: &mut Vec<f32>) {
+        self.emu.take_audio(out);
+    }
+    fn save_ram(&self) -> Option<Vec<u8>> {
+        None
+    }
+    fn load_save_ram(&mut self, _data: &[u8]) {}
+    fn set_sample_rate(&mut self, _rate: u32) {}
+}
+
 /// Consoles the browser build can play: (file extension, console id, console name).
-const SUPPORTED: &[(&str, &str, &str)] = &[("sms", "sms", "Master System"), ("gg", "gg", "Game Gear"), ("pce", "pce", "TurboGrafx-16"), ("ws", "ws", "WonderSwan"), ("wsc", "ws", "WonderSwan Color"), ("vb", "vb", "Virtual Boy"), ("md", "md", "Genesis"), ("gen", "md", "Genesis"), ("smd", "md", "Genesis"), ("nes", "nes", "NES"), ("gb", "gb", "Game Boy"), ("gbc", "gb", "Game Boy Color"), ("gba", "gba", "Game Boy Advance"), ("sfc", "snes", "SNES"), ("smc", "snes", "SNES"), ("a26", "a2600", "Atari 2600"), ("a78", "a7800", "Atari 7800")];
+const SUPPORTED: &[(&str, &str, &str)] = &[("sms", "sms", "Master System"), ("gg", "gg", "Game Gear"), ("pce", "pce", "TurboGrafx-16"), ("ws", "ws", "WonderSwan"), ("wsc", "ws", "WonderSwan Color"), ("vb", "vb", "Virtual Boy"), ("md", "md", "Genesis"), ("gen", "md", "Genesis"), ("smd", "md", "Genesis"), ("nes", "nes", "NES"), ("gb", "gb", "Game Boy"), ("gbc", "gb", "Game Boy Color"), ("gba", "gba", "Game Boy Advance"), ("sfc", "snes", "SNES"), ("smc", "snes", "SNES"), ("a26", "a2600", "Atari 2600"), ("a78", "a7800", "Atari 7800"), ("exe", "xone", "Xbox One / Series X|S")];
 
 fn ext_of(name: &str) -> String {
     name.rsplit('.').next().unwrap_or("").to_ascii_lowercase()
@@ -473,6 +524,7 @@ impl Emulator {
             "snes" => Box::new(snes::Snes::from_rom(data.clone())?),
             "a2600" => Box::new(atari2600::Atari::new(&data)?),
             "a7800" => Box::new(atari7800::Atari7800::new(&data)?),
+            "xone" => Box::new(XboxOneWebCore::new(&data)?),
             _ => Box::new(sms::MasterSystem::new(&data, true)?),
         };
         core.set_sample_rate(sample_rate);
@@ -552,4 +604,128 @@ pub fn accept() -> String {
     let mut v: Vec<String> = SUPPORTED.iter().map(|(e, _, _)| format!(".{e}")).collect();
     v.push(".zip".into());
     v.join(",")
+}
+
+/// Real Rust WebAssembly ARM64e XNU kernel runner for `ios.html`:
+/// unwraps IM4P, decompresses LZFSE (`bvx2`) or `complzss`, sanitizes Apple DeviceTree,
+/// and boots XNU incrementally in the browser with live Apple S5L UART0 serial console output.
+#[wasm_bindgen]
+pub struct IosKernelWasm {
+    vm: ios::runtime::Arm64Machine,
+    arch: String,
+    segments: u32,
+    entry: u64,
+    banner: String,
+    kernel_size: usize,
+    dt_size: usize,
+}
+
+fn unwrap_im4p_payload(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let payload = if let Ok(im4p) = ios::im4p::parse_im4p(raw) {
+        im4p.payload
+    } else {
+        raw.to_vec()
+    };
+    if payload.starts_with(b"complzss") {
+        ios::im4p::decompress_complzss(&payload)
+    } else if payload.starts_with(b"bvx2")
+        || payload.starts_with(b"bvx1")
+        || payload.starts_with(b"bvxn")
+        || payload.starts_with(b"bvx-")
+    {
+        ios::im4p::decompress_lzfse(&payload)
+    } else {
+        Ok(payload)
+    }
+}
+
+#[wasm_bindgen]
+impl IosKernelWasm {
+    #[wasm_bindgen(constructor)]
+    pub fn new(kernel_raw: &[u8], device_tree_raw: Option<Vec<u8>>) -> Result<IosKernelWasm, JsValue> {
+        let kernel = unwrap_im4p_payload(kernel_raw).map_err(|e| JsValue::from_str(&e))?;
+        let dt = match device_tree_raw {
+            Some(raw) if !raw.is_empty() => {
+                let mut d = unwrap_im4p_payload(&raw).map_err(|e| JsValue::from_str(&e))?;
+                ios::ipsw::sanitize_apple_devicetree(&mut d);
+                Some(d)
+            }
+            _ => None,
+        };
+        let banner = ios::im4p::extract_xnu_banner(&kernel).unwrap_or_default();
+        let m = ios::macho::parse(&kernel).map_err(|e| JsValue::from_str(&e))?;
+        let sl = m
+            .slices
+            .iter()
+            .find(|s| s.arch == "arm64" || s.arch == "arm64e")
+            .ok_or_else(|| JsValue::from_str("No arm64/arm64e slice found in unpacked kernelcache."))?;
+        let arch = sl.arch.clone();
+        let segments = sl.segments.len() as u32;
+        let entry = sl.entry;
+        let dt_size = dt.as_ref().map(|d| d.len()).unwrap_or(0);
+        let vm = ios::runtime::Arm64Machine::load(&kernel, dt.as_deref()).map_err(|e| JsValue::from_str(&e))?;
+        Ok(IosKernelWasm {
+            vm,
+            arch,
+            segments,
+            entry,
+            banner,
+            kernel_size: kernel.len(),
+            dt_size,
+        })
+    }
+
+    pub fn step(&mut self, max_steps: u32) -> Option<String> {
+        self.vm.step_budget(max_steps as u64).map(str::to_string)
+    }
+
+    pub fn banner(&self) -> String {
+        self.banner.clone()
+    }
+
+    pub fn arch(&self) -> String {
+        self.arch.clone()
+    }
+
+    pub fn segments(&self) -> u32 {
+        self.segments
+    }
+
+    pub fn kernel_size(&self) -> u32 {
+        self.kernel_size as u32
+    }
+
+    pub fn dt_size(&self) -> u32 {
+        self.dt_size as u32
+    }
+
+    pub fn entry_hex(&self) -> String {
+        format!("{:#018x}", self.entry)
+    }
+
+    pub fn pc_hex(&self) -> String {
+        format!("{:#018x}", self.vm.pc())
+    }
+
+    pub fn instructions(&self) -> f64 {
+        self.vm.instructions() as f64
+    }
+
+    pub fn mmu_enabled(&self) -> bool {
+        self.vm.mmu_enabled()
+    }
+
+    pub fn uart_output(&self) -> String {
+        self.vm.uart_output().to_string()
+    }
+
+    pub fn mmio_summary(&self) -> String {
+        self.vm
+            .mmio_regions()
+            .iter()
+            .take(8)
+            .map(|a| format!("{a:#x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }

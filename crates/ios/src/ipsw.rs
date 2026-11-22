@@ -92,7 +92,7 @@ fn encode_adt_prop(name: &str, value: &[u8]) -> Vec<u8> {
 /// lengths, and fills key iBoot runtime properties (`cpu0/state = "running"`,
 /// `chip-revision = 0x10`, `/chosen/random-seed`, `/chosen/dram-base`, `/chosen/dram-size`,
 /// `/chosen/debug-enabled`) just as Apple's iBoot does before handing the DeviceTree to XNU.
-pub(crate) fn sanitize_apple_devicetree(dt: &mut Vec<u8>) {
+pub fn sanitize_apple_devicetree(dt: &mut Vec<u8>) {
     fn walk(dt: &mut Vec<u8>, pos: &mut usize, depth: usize, in_cpu0: bool) -> Option<()> {
         if depth > 32 || *pos + 8 > dt.len() {
             return None;
