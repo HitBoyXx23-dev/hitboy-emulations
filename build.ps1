@@ -1,7 +1,7 @@
-# Builds HitBoy's Emulations in release mode and packages it:
-#   dist\HitBoy's Emulations\HitBoy's Emulations.exe
-#   dist\HitBoys-Emulations-Windows.zip
-#   websites\hitboy\  (download site with the zip and WebAssembly player)
+# Builds the three apps in release mode and packages them:
+#   dist\<Brand> Emulations\<Brand> Emulations.exe
+#   dist\<Brand>-Emulations-Windows.zip
+#   websites\<brand>\  (download site with the zip inside)
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Set-Location $root
@@ -18,10 +18,11 @@ if ($LASTEXITCODE -ne 0) { throw "web build failed" }
 wasm-bindgen --target web --no-typescript --out-dir target\webpkg target\wasm32-unknown-unknown\release\web.wasm
 if ($LASTEXITCODE -ne 0) { throw "wasm-bindgen failed" }
 $playTemplate = Get-Content "websites\play.html" -Raw -Encoding utf8
+$iosTemplate  = Get-Content "websites\ios.html" -Raw -Encoding utf8
 
 $version = (Select-String -Path "crates\frontend\Cargo.toml" -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
 $brands = @(
-    @{ id = "hitboy";  name = "HitBoy's"; primary = "#7851A9"; secondary = "#4169E1"; publisher = "HitBoyXx23" }
+    @{ id = "hitboy";  name = "HitBoy's"; primary = "#7851A9"; secondary = "#4169E1"; publisher = "HitBoyXx23"; repo = "https://github.com/HitBoyXx23-dev/hitboy-emulations" }
 )
 $template = Get-Content "websites\template.html" -Raw -Encoding utf8
 New-Item -ItemType Directory -Force dist | Out-Null
@@ -55,7 +56,13 @@ foreach ($b in $brands) {
 
     $zip = "dist\$safe-Windows.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }
-    Compress-Archive -Path $appDir -DestinationPath $zip
+    $stage = Join-Path ([IO.Path]::GetTempPath()) ("stage-" + $b.id + "-" + $PID)
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    $stageInner = Join-Path $stage $full
+    New-Item -ItemType Directory -Force $stageInner | Out-Null
+    Copy-Item $exePath, $dumpPath, (Join-Path $appDir "Get Your Games.txt") $stageInner -Force
+    Compress-Archive -Path $stageInner -DestinationPath $zip
+    Remove-Item $stage -Recurse -Force
 
     $site = "websites\$($b.id)"
     New-Item -ItemType Directory -Force $site | Out-Null
@@ -65,8 +72,11 @@ foreach ($b in $brands) {
     Remove-Item (Join-Path $site "$($b.id)-icon.png") -ErrorAction SilentlyContinue
 
     $size = "{0:N1} MB" -f ((Get-Item $zip).Length / 1MB)
+    $releasesUrl = "$($b.repo)/releases"
+    $downloadUrl = "$($b.repo)/releases/latest/download/$safe-Windows.zip"
     $html = $template.Replace("{{FULL}}", $full).Replace("{{NAME}}", $b.name).Replace("{{PRIMARY}}", $b.primary).Replace("{{SECONDARY}}", $b.secondary)
-    $html = $html.Replace("{{ZIP}}", "$safe-Windows.zip").Replace("{{SIZE}}", $size).Replace("{{VERSION}}", $version).Replace("{{EXE}}", "$full.exe").Replace("{{YEAR}}", (Get-Date).Year)
+    $html = $html.Replace("{{ZIP}}", "$safe-Windows.zip").Replace("{{DOWNLOAD_URL}}", $downloadUrl).Replace("{{RELEASES_URL}}", $releasesUrl)
+    $html = $html.Replace("{{SIZE}}", $size).Replace("{{VERSION}}", $version).Replace("{{EXE}}", "$full.exe").Replace("{{YEAR}}", (Get-Date).Year)
     [IO.File]::WriteAllText((Join-Path $root "$site\index.html"), $html, (New-Object Text.UTF8Encoding $false))
 
     $play = Join-Path $site "play"
@@ -74,7 +84,8 @@ foreach ($b in $brands) {
     Copy-Item "target\webpkg\web.js", "target\webpkg\web_bg.wasm" $play -Force
     $phtml = $playTemplate.Replace("{{FULL}}", $full).Replace("{{NAME}}", $b.name).Replace("{{PRIMARY}}", $b.primary).Replace("{{SECONDARY}}", $b.secondary)
     [IO.File]::WriteAllText((Join-Path $root "$play\index.html"), $phtml, (New-Object Text.UTF8Encoding $false))
-    Copy-Item "websites\ios.html" (Join-Path $site "ios.html") -Force
-    Write-Host "$full -> $appDir, $zip, $site\index.html"
+    $ihtml = $iosTemplate.Replace("{{FULL}}", $full).Replace("{{NAME}}", $b.name).Replace("{{PRIMARY}}", $b.primary).Replace("{{SECONDARY}}", $b.secondary)
+    [IO.File]::WriteAllText((Join-Path $root "$site\ios.html"), $ihtml, (New-Object Text.UTF8Encoding $false))
+    Write-Host "$full -> $appDir, $zip ($size), $site\index.html"
 }
 
