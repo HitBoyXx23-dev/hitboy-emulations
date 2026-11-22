@@ -132,8 +132,9 @@ fn bin_fits(path: &Path, console: &str) -> bool {
     }
 }
 
-/// A readable title from a game's file name: drops dump-tool leftovers such as a numeric
-/// "1790675259906-" prefix and a ".nkit" tag, and turns underscores into spaces.
+/// A readable title from a game's file name: strips dump-tool leftovers (numeric prefixes,
+/// `.nkit`), bracketed tags (`[!]`, `[b1]`), and parenthesized region/revision tags
+/// (`(World)`, `(USA)`, `(Rev 1)`, `(En,Fr,De)`, `(v1.1)`), turning underscores into spaces.
 pub fn clean_title(stem: &str) -> String {
     let mut t = stem.to_string();
     for tag in [".nkit", ".NKit", ".NKIT"] {
@@ -146,11 +147,25 @@ pub fn clean_title(stem: &str) -> String {
     if digits >= 6 && t[digits..].starts_with('-') {
         t = t[digits + 1..].to_string();
     }
-    let t = t.replace('_', " ");
-    // Collapse the runs of spaces that "__" and "___" leave.
+    // Strip all `(...)` and `[...]` tags such as (World), (USA), (Rev 1), (En,Fr), [!].
+    let mut stripped = String::with_capacity(t.len());
+    let mut paren_depth = 0u32;
+    let mut bracket_depth = 0u32;
+    for c in t.chars() {
+        match c {
+            '(' => paren_depth += 1,
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            '[' => bracket_depth += 1,
+            ']' if bracket_depth > 0 => bracket_depth -= 1,
+            _ if paren_depth == 0 && bracket_depth == 0 => stripped.push(c),
+            _ => {}
+        }
+    }
+    let replaced = stripped.replace('_', " ");
+    // Collapse runs of spaces.
     let mut out = String::new();
     let mut prev_space = false;
-    for c in t.chars() {
+    for c in replaced.chars() {
         if c == ' ' {
             if !prev_space {
                 out.push(c);
@@ -161,7 +176,7 @@ pub fn clean_title(stem: &str) -> String {
             prev_space = false;
         }
     }
-    let out = out.trim().to_string();
+    let out = out.trim().trim_end_matches(&['-', '–', '—'][..]).trim().to_string();
     if out.is_empty() { stem.to_string() } else { out }
 }
 
@@ -253,8 +268,10 @@ mod title_tests {
     #[test]
     fn cleans_dump_tool_names() {
         assert_eq!(clean_title("1790675259906-Resident_Evil__USA___Disc_1_.nkit"), "Resident Evil USA Disc 1");
-        assert_eq!(clean_title("Grand Theft Auto (USA)"), "Grand Theft Auto (USA)");
-        assert_eq!(clean_title("Super Mario Bros. 3 (USA)"), "Super Mario Bros. 3 (USA)");
+        assert_eq!(clean_title("Grand Theft Auto (USA)"), "Grand Theft Auto");
+        assert_eq!(clean_title("Super Mario Bros. 3 (USA) (Rev 1) [!]"), "Super Mario Bros. 3");
+        assert_eq!(clean_title("Tetris (World) (Rev A)"), "Tetris");
+        assert_eq!(clean_title("Sonic the Hedgehog (USA, Europe) (En,Fr,De)"), "Sonic the Hedgehog");
         assert_eq!(clean_title("12345-x"), "12345-x", "short digit runs are left alone");
     }
 

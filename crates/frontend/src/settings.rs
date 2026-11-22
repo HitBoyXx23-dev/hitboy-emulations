@@ -348,6 +348,9 @@ impl Settings {
             k.fix_turbo_conflicts();
             k.pad.fix_conflicts();
         }
+        for r in &mut s.recent {
+            r.title = crate::library::clean_title(&r.title);
+        }
         s
     }
 

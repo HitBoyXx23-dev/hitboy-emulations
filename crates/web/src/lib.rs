@@ -494,6 +494,47 @@ extern "C" {
     fn js_now() -> f64;
 }
 
+fn clean_title(stem: &str) -> String {
+    let mut t = stem.to_string();
+    for tag in [".nkit", ".NKit", ".NKIT"] {
+        if let Some(i) = t.find(tag) {
+            t.truncate(i);
+        }
+    }
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits >= 6 && t[digits..].starts_with('-') {
+        t = t[digits + 1..].to_string();
+    }
+    let mut stripped = String::with_capacity(t.len());
+    let (mut p, mut b) = (0u32, 0u32);
+    for c in t.chars() {
+        match c {
+            '(' => p += 1,
+            ')' if p > 0 => p -= 1,
+            '[' => b += 1,
+            ']' if b > 0 => b -= 1,
+            _ if p == 0 && b == 0 => stripped.push(c),
+            _ => {}
+        }
+    }
+    let replaced = stripped.replace('_', " ");
+    let mut out = String::new();
+    let mut prev_space = false;
+    for c in replaced.chars() {
+        if c == ' ' {
+            if !prev_space {
+                out.push(c);
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    let out = out.trim().trim_end_matches(&['-', '–', '—'][..]).trim().to_string();
+    if out.is_empty() { stem.to_string() } else { out }
+}
+
 #[wasm_bindgen]
 pub struct Emulator {
     core: Box<dyn Core>,
@@ -528,7 +569,8 @@ impl Emulator {
             _ => Box::new(sms::MasterSystem::new(&data, true)?),
         };
         core.set_sample_rate(sample_rate);
-        let title = name.rsplit(['/', '\\']).next().unwrap_or(&name).rsplit_once('.').map(|(t, _)| t.to_string()).unwrap_or(name.clone());
+        let stem = name.rsplit(['/', '\\']).next().unwrap_or(&name).rsplit_once('.').map(|(t, _)| t).unwrap_or(&name);
+        let title = clean_title(stem);
         Ok(Emulator { core, console: cname.to_string(), title, audio: Vec::new(), rgba: Vec::new() })
     }
 

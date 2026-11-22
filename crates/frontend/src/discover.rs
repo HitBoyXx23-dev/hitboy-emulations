@@ -414,7 +414,7 @@ fn fetch_itch(tags: &[String]) -> Result<Vec<ItchEntry>, String> {
             let desc = tag_text(item, "description").unwrap_or("").trim_start_matches("<![CDATA[");
             let summary = desc.split('<').next().unwrap_or("").trim();
             out.push(ItchEntry {
-                title: unescape(tag_text(item, "plainTitle").or_else(|| tag_text(item, "title")).unwrap_or("Untitled")),
+                title: crate::library::clean_title(&unescape(tag_text(item, "plainTitle").or_else(|| tag_text(item, "title")).unwrap_or("Untitled"))),
                 link: link.to_string(),
                 image: tag_text(item, "imageurl").unwrap_or("").to_string(),
                 summary: unescape(summary),
@@ -514,7 +514,7 @@ fn parse_entry(e: &serde_json::Value, platform: &str) -> HubEntry {
         .unwrap_or_default();
     HubEntry {
         slug: e["slug"].as_str().unwrap_or_default().to_string(),
-        title: e["title"].as_str().unwrap_or("Untitled").trim().to_string(),
+        title: crate::library::clean_title(e["title"].as_str().unwrap_or("Untitled").trim()),
         developer: e["developer"].as_str().unwrap_or("Unknown developer").trim().to_string(),
         platform: e["platform"].as_str().unwrap_or(platform).to_string(),
         typetag: e["typetag"].as_str().unwrap_or("game").to_string(),

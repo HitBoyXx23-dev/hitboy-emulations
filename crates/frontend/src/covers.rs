@@ -109,7 +109,10 @@ fn candidates(title: &str) -> Vec<String> {
     }
     if !title.contains('(') {
         out.push(format!("{title} (USA)"));
+        out.push(format!("{title} (World)"));
         out.push(format!("{title} (USA, Europe)"));
+        out.push(format!("{title} (Europe)"));
+        out.push(format!("{title} (Japan)"));
     }
     out
 }
