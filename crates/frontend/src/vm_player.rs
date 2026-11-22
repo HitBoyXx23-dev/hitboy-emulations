@@ -312,7 +312,8 @@ fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice) 
     let p = ui.painter();
     p.rect_filled(bezel, CornerRadius::same(26), Color32::from_rgb(0x14, 0x16, 0x20));
     p.rect_stroke(bezel, CornerRadius::same(26), Stroke::new(2.0_f32, Color32::from_rgb(0x2E, 0x33, 0x48)), egui::StrokeKind::Inside);
-    p.rect_filled(screen, CornerRadius::same(18), Color32::from_rgb(0x0B, 0x0E, 0x18));
+    let bg_col = if dev.dark_wallpaper { Color32::from_rgb(0x0B, 0x0E, 0x18) } else { Color32::from_rgb(0x18, 0x22, 0x3B) };
+    p.rect_filled(screen, CornerRadius::same(18), bg_col);
 
     // Inner interactive UI inside the phone/tablet screen
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(screen.shrink(12.0)));
@@ -328,6 +329,7 @@ fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice) 
     let body_h = (screen.height() - 104.0).max(120.0);
     let mut launch_idx = None;
     let mut nav_pressed = None;
+    let mut uninstall_idx = None;
 
     egui::ScrollArea::vertical().max_height(body_h).show(&mut child, |ui| {
         if dev.recents_open {
@@ -345,7 +347,93 @@ fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice) 
                 }
             }
         } else if let Some(idx) = dev.active_app {
-            if let Some(app) = dev.apps.get(idx) {
+            let pkg = dev.apps.get(idx).map(|a| a.package.clone()).unwrap_or_default();
+            if pkg == "com.android.calculator2" {
+                ui.label(RichText::new("Calculator").strong().size(18.0).color(Color32::WHITE));
+                ui.add_space(8.0);
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(0x13, 0x18, 0x26))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(&dev.calc_display).monospace().strong().size(28.0).color(Color32::WHITE));
+                        });
+                    });
+                ui.add_space(10.0);
+                let rows = [
+                    ["7", "8", "9", "/"],
+                    ["4", "5", "6", "*"],
+                    ["1", "2", "3", "-"],
+                    ["C", "0", ".", "+"],
+                ];
+                let mut key_hit = None;
+                for row in rows {
+                    ui.horizontal(|ui| {
+                        for k in row {
+                            let is_op = matches!(k, "/" | "*" | "-" | "+" | "C");
+                            let fill = if is_op { t().primary } else { Color32::from_rgb(0x1B, 0x22, 0x36) };
+                            if ui.add(egui::Button::new(RichText::new(k).strong().size(16.0).color(Color32::WHITE)).fill(fill).min_size(Vec2::new(56.0, 44.0))).clicked() {
+                                key_hit = Some(k);
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+                if ui.add(egui::Button::new(RichText::new("=").strong().size(18.0).color(Color32::WHITE)).fill(t().primary).min_size(Vec2::new(242.0, 44.0))).clicked() {
+                    key_hit = Some("=");
+                }
+                if let Some(k) = key_hit {
+                    dev.calc_press(k);
+                }
+            } else if pkg == "com.android.terminal" {
+                ui.label(RichText::new("Android Shell").strong().size(16.0).color(Color32::WHITE));
+                ui.add_space(6.0);
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(0x06, 0x08, 0x0E))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        for line in &dev.term_lines {
+                            ui.label(RichText::new(line).monospace().size(11.5).color(Color32::from_rgb(0x9E, 0xE6, 0xB8)));
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let resp = ui.add(egui::TextEdit::singleline(&mut dev.term_input).hint_text("Enter command (help, pm list packages, getprop...)"));
+                    let submit = ui.button("Run").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
+                    if submit {
+                        let cmd = std::mem::take(&mut dev.term_input);
+                        dev.run_shell_command(&cmd);
+                    }
+                });
+            } else if pkg == "com.android.settings" {
+                ui.label(RichText::new("Settings").strong().size(18.0).color(Color32::WHITE));
+                ui.add_space(8.0);
+                ui.checkbox(&mut dev.dark_wallpaper, "Dark system wallpaper");
+                ui.horizontal(|ui| {
+                    ui.label("Display density:");
+                    for dpi in [320u32, 420, 480] {
+                        ui.selectable_value(&mut dev.screen_dpi, dpi, format!("{dpi} dpi"));
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("Android 14 · API 34 · ARM64 + Dalvik DEX VM").size(12.0).color(t().muted));
+                ui.add_space(10.0);
+                ui.label(RichText::new("Sideloaded APK Apps").strong().color(Color32::WHITE));
+                if dev.apps.len() <= 3 {
+                    ui.label(RichText::new("None yet — click Install APK in the top bar.").size(12.0).color(t().muted));
+                } else {
+                    for i in 3..dev.apps.len() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} ({})", dev.apps[i].label, dev.apps[i].package));
+                            if ui.button("Uninstall").clicked() {
+                                uninstall_idx = Some(i);
+                            }
+                        });
+                    }
+                }
+            } else if let Some(app) = dev.apps.get(idx) {
                 ui.label(RichText::new(&app.label).strong().size(20.0).color(Color32::WHITE));
                 ui.label(RichText::new(format!("{}  v{}", app.package, if app.version_name.is_empty() { "1.0" } else { &app.version_name })).size(12.5).color(t().muted));
                 ui.add_space(10.0);
@@ -361,6 +449,11 @@ fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice) 
                         ui.label(RichText::new(format!("DEX files: {} · Classes: {} · Methods: {}", app.dex_count, app.dex_classes, app.dex_methods)).size(12.0).color(t().muted));
                         let abis = if app.abis.is_empty() { "Universal (Dalvik/ART)".to_string() } else { app.abis.join(", ") };
                         ui.label(RichText::new(format!("Native ABIs: {abis}")).size(12.0).color(t().muted));
+                        if !app.dex_strings.is_empty() {
+                            ui.add_space(4.0);
+                            let sample = app.dex_strings.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+                            ui.label(RichText::new(format!("DEX symbols: {sample}")).size(11.0).color(t().muted));
+                        }
                     });
                 ui.add_space(10.0);
                 if !dev.log.is_empty() {
@@ -391,6 +484,10 @@ fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice) 
             });
         }
     });
+
+    if let Some(u) = uninstall_idx {
+        dev.uninstall_app(u);
+    }
 
     // Bottom Android navigation bar: Back / Home / Recents
     let nav_rect = Rect::from_min_max(egui::pos2(screen.left() + 12.0, screen.bottom() - 42.0), egui::pos2(screen.right() - 12.0, screen.bottom() - 8.0));

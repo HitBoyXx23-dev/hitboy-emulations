@@ -13,6 +13,7 @@ trait Core {
     fn size(&self) -> (usize, usize);
     fn fps(&self) -> f64;
     fn set_buttons(&mut self, pad: usize, b: u16);
+    fn set_touch(&mut self, _pressed: bool, _x: f32, _y: f32) {}
     fn reset(&mut self);
     fn take_audio(&mut self, out: &mut Vec<f32>);
     fn save_ram(&self) -> Option<Vec<u8>>;
@@ -466,8 +467,117 @@ impl Core for XboxOneWebCore {
     fn set_sample_rate(&mut self, _rate: u32) {}
 }
 
+impl Core for psp::Psp {
+    fn run_frame(&mut self) { psp::Psp::run_frame(self); }
+    fn frame(&self) -> &[u32] { psp::Psp::frame(self) }
+    fn size(&self) -> (usize, usize) { (psp::WIDTH, psp::HEIGHT) }
+    fn fps(&self) -> f64 { psp::FPS }
+    fn set_buttons(&mut self, pad: usize, b: u16) { if pad == 0 { psp::Psp::set_buttons(self, b); } }
+    fn reset(&mut self) { psp::Psp::reset(self); }
+    fn save_ram(&self) -> Option<Vec<u8>> { None }
+    fn load_save_ram(&mut self, _data: &[u8]) {}
+    fn take_audio(&mut self, out: &mut Vec<f32>) { psp::Psp::take_audio(self, out); }
+    fn set_sample_rate(&mut self, rate: u32) { psp::Psp::set_sample_rate(self, rate); }
+}
+
+impl Core for vita::PsVita {
+    fn run_frame(&mut self) { vita::PsVita::run_frame(self); }
+    fn frame(&self) -> &[u32] { vita::PsVita::frame(self) }
+    fn size(&self) -> (usize, usize) { (vita::WIDTH, vita::HEIGHT) }
+    fn fps(&self) -> f64 { vita::FPS }
+    fn set_buttons(&mut self, pad: usize, b: u16) { if pad == 0 { vita::PsVita::set_buttons(self, b); } }
+    fn set_touch(&mut self, pressed: bool, x: f32, y: f32) { vita::PsVita::set_touch(self, pressed, x, y); }
+    fn reset(&mut self) { vita::PsVita::reset(self); }
+    fn save_ram(&self) -> Option<Vec<u8>> { None }
+    fn load_save_ram(&mut self, _data: &[u8]) {}
+    fn take_audio(&mut self, out: &mut Vec<f32>) { vita::PsVita::take_audio(self, out); }
+    fn set_sample_rate(&mut self, _rate: u32) {}
+}
+
+impl Core for n3ds::Nintendo3ds {
+    fn run_frame(&mut self) { n3ds::Nintendo3ds::run_frame(self); }
+    fn frame(&self) -> &[u32] { n3ds::Nintendo3ds::frame(self) }
+    fn size(&self) -> (usize, usize) { (n3ds::WIDTH, n3ds::HEIGHT) }
+    fn fps(&self) -> f64 { n3ds::FPS }
+    fn set_buttons(&mut self, pad: usize, b: u16) { if pad == 0 { n3ds::Nintendo3ds::set_buttons(self, b); } }
+    fn set_touch(&mut self, pressed: bool, x: f32, y: f32) { n3ds::Nintendo3ds::set_touch(self, pressed, x, y); }
+    fn reset(&mut self) { n3ds::Nintendo3ds::reset(self); }
+    fn save_ram(&self) -> Option<Vec<u8>> { None }
+    fn load_save_ram(&mut self, _data: &[u8]) {}
+    fn take_audio(&mut self, out: &mut Vec<f32>) { n3ds::Nintendo3ds::take_audio(self, out); }
+    fn set_sample_rate(&mut self, _rate: u32) {}
+}
+
+impl Core for nds::NintendoDs {
+    fn run_frame(&mut self) { nds::NintendoDs::run_frame(self); }
+    fn frame(&self) -> &[u32] { nds::NintendoDs::frame(self) }
+    fn size(&self) -> (usize, usize) { (nds::WIDTH, nds::HEIGHT) }
+    fn fps(&self) -> f64 { nds::FPS }
+    fn set_buttons(&mut self, pad: usize, b: u16) { if pad == 0 { nds::NintendoDs::set_buttons(self, b); } }
+    fn set_touch(&mut self, pressed: bool, x: f32, y: f32) { nds::NintendoDs::set_touch(self, pressed, x, y); }
+    fn reset(&mut self) { nds::NintendoDs::reset(self); }
+    fn save_ram(&self) -> Option<Vec<u8>> { None }
+    fn load_save_ram(&mut self, _data: &[u8]) {}
+    fn take_audio(&mut self, out: &mut Vec<f32>) { nds::NintendoDs::take_audio(self, out); }
+    fn set_sample_rate(&mut self, _rate: u32) {}
+}
+
+impl Core for dreamcast::Dreamcast {
+    fn run_frame(&mut self) { dreamcast::Dreamcast::run_frame(self); }
+    fn frame(&self) -> &[u32] { dreamcast::Dreamcast::frame(self) }
+    fn size(&self) -> (usize, usize) { (dreamcast::WIDTH, dreamcast::HEIGHT) }
+    fn fps(&self) -> f64 { dreamcast::FPS }
+    fn set_buttons(&mut self, pad: usize, b: u16) { if pad == 0 { dreamcast::Dreamcast::set_buttons(self, b); } }
+    fn reset(&mut self) { dreamcast::Dreamcast::reset(self); }
+    fn save_ram(&self) -> Option<Vec<u8>> { None }
+    fn load_save_ram(&mut self, _data: &[u8]) {}
+    fn take_audio(&mut self, out: &mut Vec<f32>) { dreamcast::Dreamcast::take_audio(self, out); }
+    fn set_sample_rate(&mut self, rate: u32) { dreamcast::Dreamcast::set_sample_rate(self, rate); }
+}
+
+impl Core for neogeo::NeoGeo {
+    fn run_frame(&mut self) { neogeo::NeoGeo::run_frame(self); }
+    fn frame(&self) -> &[u32] { neogeo::NeoGeo::frame(self) }
+    fn size(&self) -> (usize, usize) { (neogeo::WIDTH, neogeo::HEIGHT) }
+    fn fps(&self) -> f64 { neogeo::FPS }
+    fn set_buttons(&mut self, pad: usize, b: u16) { if pad == 0 { neogeo::NeoGeo::set_buttons(self, b); } }
+    fn reset(&mut self) { neogeo::NeoGeo::reset(self); }
+    fn save_ram(&self) -> Option<Vec<u8>> { None }
+    fn load_save_ram(&mut self, _data: &[u8]) {}
+    fn take_audio(&mut self, out: &mut Vec<f32>) { neogeo::NeoGeo::take_audio(self, out); }
+    fn set_sample_rate(&mut self, _rate: u32) {}
+}
+
 /// Consoles the browser build can play: (file extension, console id, console name).
-const SUPPORTED: &[(&str, &str, &str)] = &[("sms", "sms", "Master System"), ("gg", "gg", "Game Gear"), ("pce", "pce", "TurboGrafx-16"), ("ws", "ws", "WonderSwan"), ("wsc", "ws", "WonderSwan Color"), ("vb", "vb", "Virtual Boy"), ("md", "md", "Genesis"), ("gen", "md", "Genesis"), ("smd", "md", "Genesis"), ("nes", "nes", "NES"), ("gb", "gb", "Game Boy"), ("gbc", "gb", "Game Boy Color"), ("gba", "gba", "Game Boy Advance"), ("sfc", "snes", "SNES"), ("smc", "snes", "SNES"), ("a26", "a2600", "Atari 2600"), ("a78", "a7800", "Atari 7800"), ("exe", "xone", "Xbox One / Series X|S")];
+const SUPPORTED: &[(&str, &str, &str)] = &[
+    ("sms", "sms", "Master System"),
+    ("gg", "gg", "Game Gear"),
+    ("pce", "pce", "TurboGrafx-16"),
+    ("ws", "ws", "WonderSwan"),
+    ("wsc", "ws", "WonderSwan Color"),
+    ("vb", "vb", "Virtual Boy"),
+    ("md", "md", "Genesis"),
+    ("gen", "md", "Genesis"),
+    ("smd", "md", "Genesis"),
+    ("nes", "nes", "NES"),
+    ("gb", "gb", "Game Boy"),
+    ("gbc", "gb", "Game Boy Color"),
+    ("gba", "gba", "Game Boy Advance"),
+    ("sfc", "snes", "SNES"),
+    ("smc", "snes", "SNES"),
+    ("a26", "a2600", "Atari 2600"),
+    ("a78", "a7800", "Atari 7800"),
+    ("nds", "nds", "Nintendo DS"),
+    ("dsi", "nds", "Nintendo DS"),
+    ("3dsx", "3ds", "Nintendo 3DS"),
+    ("3ds", "3ds", "Nintendo 3DS"),
+    ("pbp", "psp", "PSP"),
+    ("cso", "psp", "PSP"),
+    ("vpk", "vita", "PS Vita"),
+    ("cdi", "dc", "Dreamcast"),
+    ("neo", "neogeo", "Neo Geo"),
+    ("exe", "xone", "Xbox One / Series X|S"),
+];
 
 fn ext_of(name: &str) -> String {
     name.rsplit('.').next().unwrap_or("").to_ascii_lowercase()
@@ -565,6 +675,12 @@ impl Emulator {
             "snes" => Box::new(snes::Snes::from_rom(data.clone())?),
             "a2600" => Box::new(atari2600::Atari::new(&data)?),
             "a7800" => Box::new(atari7800::Atari7800::new(&data)?),
+            "nds" => Box::new(nds::NintendoDs::from_bytes(&data)?),
+            "3ds" => Box::new(n3ds::Nintendo3ds::from_bytes(&data)?),
+            "psp" => Box::new(psp::Psp::from_bytes(&data)?),
+            "vita" => Box::new(vita::PsVita::from_bytes(&data)?),
+            "dc" => Box::new(dreamcast::Dreamcast::from_bytes(&data, None)?),
+            "neogeo" => Box::new(neogeo::NeoGeo::from_bytes(&data)?),
             "xone" => Box::new(XboxOneWebCore::new(&data)?),
             _ => Box::new(sms::MasterSystem::new(&data, true)?),
         };
@@ -612,6 +728,11 @@ impl Emulator {
     /// Buttons bitmask: A, B, Select, Start, Up, Down, Left, Right, X, Y, L, R (bits 0-11).
     pub fn set_buttons(&mut self, pad: usize, buttons: u16) {
         self.core.set_buttons(pad, buttons);
+    }
+
+    /// Touchscreen / pointer input in normalized 0..1 coordinates (Nintendo 3DS, NDS, PS Vita).
+    pub fn set_touch(&mut self, pressed: bool, x: f32, y: f32) {
+        self.core.set_touch(pressed, x, y);
     }
 
     pub fn reset(&mut self) {

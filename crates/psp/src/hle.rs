@@ -323,14 +323,34 @@ impl PspMem {
             0x7374_86F2 => 0,
             0x2085_D15D => 100,
 
+            // sceRtcGetCurrentTick (64-bit microseconds at *a0)
+            0x3F7A_D767 => {
+                let ticks = 63_800_000_000_000_000u64 + (self.vcount as u64) * 16_683;
+                self.write32(a0, ticks as u32);
+                self.write32(a0.wrapping_add(4), (ticks >> 32) as u32);
+                0
+            }
+            // sceUtilityGetSystemParamInt (language = English, button = Cross)
+            0xA5DA_2406 => {
+                let val = match a0 {
+                    8 => 1, // English
+                    9 => 1, // Cross = confirm
+                    _ => 0,
+                };
+                if a1 != 0 {
+                    self.write32(a1, val);
+                }
+                0
+            }
+
             _ => 0,
         };
 
         cpu.r[2] = ret; // $v0
     }
 
-    /// Minimal GE (Graphics Engine) display-list interpreter supporting clears, framebuffer
-    /// setup, and 2D screen-space sprite/triangle fills.
+    /// GE (Graphics Engine) display-list interpreter supporting framebuffer setup,
+    /// 2D sprites, lines, and Gouraud-shaded triangles / strips / fans.
     fn run_ge_list(&mut self, list_addr: u32, stall_addr: u32) {
         let mut pc = list_addr;
         let mut base_addr: u32 = 0;
@@ -352,26 +372,66 @@ impl PspMem {
                 0x00 => {} // NOP
                 0x01 => vaddr = base_addr | arg,
                 0x04 => {
-                    // PRIM: draw 2D sprite (type 6) with through-mode vertices
+                    // PRIM: 0=points, 1=lines, 2=line_strip, 3=triangles, 4=tri_strip, 5=tri_fan, 6=sprites
                     let prim = (arg >> 16) & 7;
-                    let count = (arg & 0xFFFF) as usize;
-                    if prim == 6 && (vtype & (1 << 23)) != 0 && count >= 2 {
-                        let mut ptr = vaddr;
-                        let pos_fmt = (vtype >> 7) & 3;
-                        let col_fmt = (vtype >> 2) & 7;
-                        for _ in (0..count).step_by(2) {
-                            let (c0, x0, y0, step0) = self.read_ge_vertex(ptr, pos_fmt, col_fmt, color);
-                            ptr = ptr.wrapping_add(step0);
-                            let (c1, x1, y1, step1) = self.read_ge_vertex(ptr, pos_fmt, col_fmt, c0);
-                            ptr = ptr.wrapping_add(step1);
-                            let (lx, rx) = (x0.min(x1).max(0) as usize, x0.max(x1).min(WIDTH as i32) as usize);
-                            let (ty, by) = (y0.min(y1).max(0) as usize, y0.max(y1).min(HEIGHT as i32) as usize);
-                            for y in ty..by {
-                                for x in lx..rx {
-                                    self.write32(fb_ptr.wrapping_add(((y as u32) * fb_w + x as u32) * 4), c1);
+                    let count = ((arg & 0xFFFF) as usize).min(4096);
+                    let pos_fmt = (vtype >> 7) & 3;
+                    let col_fmt = (vtype >> 2) & 7;
+                    if count == 0 || pos_fmt == 0 {
+                        continue;
+                    }
+                    let mut verts = Vec::with_capacity(count);
+                    let mut ptr = vaddr;
+                    for _ in 0..count {
+                        let (c, x, y, step) = self.read_ge_vertex(ptr, pos_fmt, col_fmt, color);
+                        verts.push((c, x, y));
+                        ptr = ptr.wrapping_add(step);
+                    }
+                    match prim {
+                        0 => {
+                            for &(c, x, y) in &verts {
+                                self.put_ge_pixel(fb_ptr, fb_w, x, y, c);
+                            }
+                        }
+                        1 => {
+                            for pair in verts.chunks_exact(2) {
+                                self.draw_ge_line(fb_ptr, fb_w, pair[0], pair[1]);
+                            }
+                        }
+                        2 => {
+                            for w in verts.windows(2) {
+                                self.draw_ge_line(fb_ptr, fb_w, w[0], w[1]);
+                            }
+                        }
+                        3 => {
+                            for tri in verts.chunks_exact(3) {
+                                self.draw_ge_tri(fb_ptr, fb_w, tri[0], tri[1], tri[2]);
+                            }
+                        }
+                        4 => {
+                            for i in 0..verts.len().saturating_sub(2) {
+                                self.draw_ge_tri(fb_ptr, fb_w, verts[i], verts[i + 1], verts[i + 2]);
+                            }
+                        }
+                        5 => {
+                            for i in 1..verts.len().saturating_sub(1) {
+                                self.draw_ge_tri(fb_ptr, fb_w, verts[0], verts[i], verts[i + 1]);
+                            }
+                        }
+                        6 => {
+                            for pair in verts.chunks_exact(2) {
+                                let (_, x0, y0) = pair[0];
+                                let (c1, x1, y1) = pair[1];
+                                let (lx, rx) = (x0.min(x1).max(0) as usize, x0.max(x1).min(WIDTH as i32) as usize);
+                                let (ty, by) = (y0.min(y1).max(0) as usize, y0.max(y1).min(HEIGHT as i32) as usize);
+                                for y in ty..by {
+                                    for x in lx..rx {
+                                        self.write32(fb_ptr.wrapping_add(((y as u32) * fb_w + x as u32) * 4), c1);
+                                    }
                                 }
                             }
                         }
+                        _ => {}
                     }
                 }
                 0x0B | 0x0C => break, // RET / END
@@ -386,6 +446,63 @@ impl PspMem {
                     fb_w = (arg & 0xFFFF).max(64);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    #[inline]
+    fn put_ge_pixel(&mut self, fb_ptr: u32, fb_w: u32, x: i32, y: i32, c: u32) {
+        if x >= 0 && x < WIDTH as i32 && y >= 0 && y < HEIGHT as i32 {
+            self.write32(fb_ptr.wrapping_add(((y as u32) * fb_w + x as u32) * 4), c);
+        }
+    }
+
+    fn draw_ge_line(&mut self, fb_ptr: u32, fb_w: u32, v0: (u32, i32, i32), v1: (u32, i32, i32)) {
+        let (c0, mut x0, mut y0) = v0;
+        let (_, x1, y1) = v1;
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        for _ in 0..1024 {
+            self.put_ge_pixel(fb_ptr, fb_w, x0, y0, c0);
+            if x0 == x1 && y0 == y1 { break; }
+            let e2 = 2 * err;
+            if e2 >= dy { err += dy; x0 += sx; }
+            if e2 <= dx { err += dx; y0 += sy; }
+        }
+    }
+
+    /// Gouraud-shaded 2D/3D triangle rasterizer in ABGR8888.
+    fn draw_ge_tri(&mut self, fb_ptr: u32, fb_w: u32, v0: (u32, i32, i32), v1: (u32, i32, i32), v2: (u32, i32, i32)) {
+        let (c0, x0, y0) = v0;
+        let (c1, x1, y1) = v1;
+        let (c2, x2, y2) = v2;
+        let min_x = x0.min(x1).min(x2).max(0);
+        let max_x = x0.max(x1).max(x2).min(WIDTH as i32 - 1);
+        let min_y = y0.min(y1).min(y2).max(0);
+        let max_y = y0.max(y1).max(y2).min(HEIGHT as i32 - 1);
+        let area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+        if area == 0 {
+            return;
+        }
+        let inv = 1.0 / (area as f32);
+        let unpack = |c: u32| ((c & 0xFF) as f32, ((c >> 8) & 0xFF) as f32, ((c >> 16) & 0xFF) as f32);
+        let (r0, g0, b0) = unpack(c0);
+        let (r1, g1, b1) = unpack(c1);
+        let (r2, g2, b2) = unpack(c2);
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let w0 = ((x1 - x) * (y2 - y) - (y1 - y) * (x2 - x)) as f32 * inv;
+                let w1 = ((x2 - x) * (y0 - y) - (y2 - y) * (x0 - x)) as f32 * inv;
+                let w2 = 1.0 - w0 - w1;
+                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                    let r = (r0 * w0 + r1 * w1 + r2 * w2).clamp(0.0, 255.0) as u32;
+                    let g = (g0 * w0 + g1 * w1 + g2 * w2).clamp(0.0, 255.0) as u32;
+                    let b = (b0 * w0 + b1 * w1 + b2 * w2).clamp(0.0, 255.0) as u32;
+                    self.put_ge_pixel(fb_ptr, fb_w, x, y, 0xFF00_0000 | (b << 16) | (g << 8) | r);
+                }
             }
         }
     }

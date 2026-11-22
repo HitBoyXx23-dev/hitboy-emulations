@@ -359,6 +359,7 @@ impl Mem3ds {
     }
 
     /// Scans both 3DS screens into a 400×480 stacked 0RGB framebuffer.
+    /// Supports both linear RGBA8888 (0x00RRGGBB) and real 3DS column-major rotated BGR888.
     pub fn scanout(&self, out: &mut [u32]) {
         out.fill(0x000A_0B12);
         // Top screen: 400x240 at y = 0..240

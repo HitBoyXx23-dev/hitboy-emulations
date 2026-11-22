@@ -243,8 +243,88 @@ impl NintendoDs {
         for _ in 0..STEPS_PER_FRAME {
             match self.arm9.step(&mut self.mem) {
                 StepEvent::Continue => {}
-                StepEvent::Svc(0x05) => break, // VBlankIntrWait
-                StepEvent::Svc(_) | StepEvent::Bkpt(_) => {}
+                StepEvent::Svc(swi) => {
+                    let id = (swi >> 16).max(swi & 0xFF);
+                    match id {
+                        0x05 => break, // VBlankIntrWait
+                        0x09 => {
+                            // Div(num, denom) -> r0=quot, r1=rem, r3=|quot|
+                            let n = self.arm9.r[0] as i32;
+                            let d = self.arm9.r[1] as i32;
+                            if d != 0 {
+                                let q = n.wrapping_div(d);
+                                let r = n.wrapping_rem(d);
+                                self.arm9.r[0] = q as u32;
+                                self.arm9.r[1] = r as u32;
+                                self.arm9.r[3] = q.unsigned_abs();
+                            }
+                        }
+                        0x0B | 0x0C => {
+                            // CpuSet / CpuFastSet
+                            let src = self.arm9.r[0];
+                            let dst = self.arm9.r[1];
+                            let ctrl = self.arm9.r[2];
+                            let count = (ctrl & 0x1F_FFFF).min(0x40000);
+                            let fill = (ctrl & (1 << 24)) != 0;
+                            let word = id == 0x0C || (ctrl & (1 << 26)) != 0;
+                            if word {
+                                let fill_val = self.mem.read32(src);
+                                for i in 0..count {
+                                    let v = if fill { fill_val } else { self.mem.read32(src.wrapping_add(i * 4)) };
+                                    self.mem.write32(dst.wrapping_add(i * 4), v);
+                                }
+                            } else {
+                                let fill_val = self.mem.read16(src);
+                                for i in 0..count {
+                                    let v = if fill { fill_val } else { self.mem.read16(src.wrapping_add(i * 2)) };
+                                    self.mem.write16(dst.wrapping_add(i * 2), v);
+                                }
+                            }
+                        }
+                        0x0D => {
+                            // Sqrt
+                            self.arm9.r[0] = (self.arm9.r[0] as f64).sqrt() as u32;
+                        }
+                        0x11 => {
+                            // LZ77UnCompWram
+                            let mut s = self.arm9.r[0];
+                            let mut d = self.arm9.r[1];
+                            let hdr = self.mem.read32(s);
+                            s = s.wrapping_add(4);
+                            let total = (hdr >> 8).min(0x400000);
+                            let mut written = 0u32;
+                            while written < total {
+                                let flags = self.mem.read8(s);
+                                s = s.wrapping_add(1);
+                                for bit in (0..8).rev() {
+                                    if written >= total { break; }
+                                    if (flags & (1 << bit)) == 0 {
+                                        let b = self.mem.read8(s);
+                                        s = s.wrapping_add(1);
+                                        self.mem.write8(d, b);
+                                        d = d.wrapping_add(1);
+                                        written += 1;
+                                    } else {
+                                        let b1 = self.mem.read8(s) as u32;
+                                        let b2 = self.mem.read8(s.wrapping_add(1)) as u32;
+                                        s = s.wrapping_add(2);
+                                        let len = (b1 >> 4) + 3;
+                                        let disp = (((b1 & 0xF) << 8) | b2) + 1;
+                                        for _ in 0..len {
+                                            if written >= total { break; }
+                                            let b = self.mem.read8(d.wrapping_sub(disp));
+                                            self.mem.write8(d, b);
+                                            d = d.wrapping_add(1);
+                                            written += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                StepEvent::Bkpt(_) => {}
             }
         }
         self.mem.vcount = (self.mem.vcount + 1) % 263;

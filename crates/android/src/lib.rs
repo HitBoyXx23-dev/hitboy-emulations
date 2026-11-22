@@ -24,6 +24,7 @@ pub struct ApkInfo {
     pub dex_methods: u32,
     pub dex_classes: u32,
     pub first_dex: Vec<u8>,
+    pub icon_png: Vec<u8>,
 }
 
 /// Decodes an Android binary XML (`AndroidManifest.xml` AXML) string pool and extracts key attributes.
@@ -326,6 +327,15 @@ pub fn parse_apk(data: &[u8], fallback_name: &str) -> Result<ApkInfo, String> {
                     abis.insert(abi.to_string());
                 }
             }
+        } else if info.icon_png.is_empty()
+            && name.ends_with(".png")
+            && (name.contains("ic_launcher") || name.contains("icon"))
+            && f.size() <= 512 * 1024
+        {
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_ok() && buf.starts_with(b"\x89PNG") {
+                info.icon_png = buf;
+            }
         }
     }
 
@@ -358,7 +368,7 @@ pub enum NavKey {
     Recents,
 }
 
-/// Interactive Android Device VM state (Launcher + Sideloaded APKs + Orientation + Nav history).
+/// Interactive Android Device VM state (Launcher + Sideloaded APKs + Built-in Apps + Orientation + Nav history).
 pub struct AndroidDevice {
     pub name: String,
     pub portrait: bool,
@@ -367,6 +377,17 @@ pub struct AndroidDevice {
     pub recents_open: bool,
     pub recent_apps: Vec<usize>,
     pub log: Vec<String>,
+    // Built-in Calculator state
+    pub calc_display: String,
+    pub calc_acc: f64,
+    pub calc_op: Option<char>,
+    pub calc_clear_next: bool,
+    // Built-in Terminal state
+    pub term_input: String,
+    pub term_lines: Vec<String>,
+    // Built-in Settings state
+    pub dark_wallpaper: bool,
+    pub screen_dpi: u32,
 }
 
 impl AndroidDevice {
@@ -406,7 +427,102 @@ impl AndroidDevice {
             active_app: None,
             recents_open: false,
             recent_apps: Vec::new(),
-            log: vec!["Android VM ready — click 'Install APK' to sideload any .apk app or game.".into()],
+            log: vec!["Android 14 VM booted — click 'Install APK' to sideload any .apk app or game.".into()],
+            calc_display: "0".into(),
+            calc_acc: 0.0,
+            calc_op: None,
+            calc_clear_next: false,
+            term_input: String::new(),
+            term_lines: vec![
+                "Android 14 Clean-Room Shell (ARM64 + Dalvik DEX VM)".into(),
+                "Type 'help' for commands.".into(),
+            ],
+            dark_wallpaper: true,
+            screen_dpi: 420,
+        }
+    }
+
+    pub fn calc_press(&mut self, key: &str) {
+        match key {
+            "C" => {
+                self.calc_display = "0".into();
+                self.calc_acc = 0.0;
+                self.calc_op = None;
+                self.calc_clear_next = false;
+            }
+            "+" | "-" | "*" | "/" => {
+                self.calc_acc = self.calc_display.parse::<f64>().unwrap_or(0.0);
+                self.calc_op = key.chars().next();
+                self.calc_clear_next = true;
+            }
+            "=" => {
+                let rhs = self.calc_display.parse::<f64>().unwrap_or(0.0);
+                let res = match self.calc_op {
+                    Some('+') => self.calc_acc + rhs,
+                    Some('-') => self.calc_acc - rhs,
+                    Some('*') => self.calc_acc * rhs,
+                    Some('/') => if rhs.abs() > f64::EPSILON { self.calc_acc / rhs } else { 0.0 },
+                    _ => rhs,
+                };
+                self.calc_display = if res.fract().abs() < 1e-9 {
+                    format!("{}", res as i64)
+                } else {
+                    format!("{res:.6}").trim_end_matches('0').trim_end_matches('.').to_string()
+                };
+                self.calc_op = None;
+                self.calc_clear_next = true;
+            }
+            d => {
+                if self.calc_clear_next || (self.calc_display == "0" && d != ".") {
+                    self.calc_display = if d == "." { "0.".into() } else { d.into() };
+                    self.calc_clear_next = false;
+                } else if d != "." || !self.calc_display.contains('.') {
+                    self.calc_display.push_str(d);
+                }
+            }
+        }
+    }
+
+    pub fn run_shell_command(&mut self, raw: &str) {
+        let cmd = raw.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        self.term_lines.push(format!("u0_a123@android:/ $ {cmd}"));
+        match cmd {
+            "help" => self.term_lines.push("Commands: help, uname -a, pm list packages, getprop, dalvik-test, clear".into()),
+            "uname -a" => self.term_lines.push("Linux localhost 6.1.75-android14-cleanroom aarch64 Android".into()),
+            "pm list packages" => {
+                let pkgs: Vec<String> = self.apps.iter().map(|a| format!("package:{}", a.package)).collect();
+                self.term_lines.extend(pkgs);
+            }
+            "getprop" => {
+                self.term_lines.push("[ro.build.version.release]: [14]".into());
+                self.term_lines.push("[ro.build.version.sdk]: [34]".into());
+                self.term_lines.push("[ro.product.cpu.abilist]: [arm64-v8a,armeabi-v7a,x86_64,x86]".into());
+                self.term_lines.push(format!("[ro.sf.lcd_density]: [{}]", self.screen_dpi));
+            }
+            "dalvik-test" => {
+                let code: [u16; 5] = [0x6012, 0x7112, 0x0292, 0x0100, 0x020F];
+                let mut vm = DalvikVm::default();
+                let res = vm.run(&code, 100);
+                self.term_lines.push(format!("Dalvik VM test (6 * 7) => {res} [OK]"));
+            }
+            "clear" => self.term_lines.clear(),
+            other => self.term_lines.push(format!("sh: {other}: not found (try 'help')")),
+        }
+        if self.term_lines.len() > 80 {
+            let drop_n = self.term_lines.len() - 80;
+            self.term_lines.drain(..drop_n);
+        }
+    }
+
+    pub fn uninstall_app(&mut self, idx: usize) {
+        if idx >= 3 && idx < self.apps.len() {
+            let removed = self.apps.remove(idx);
+            self.log.push(format!("Uninstalled {}", removed.package));
+            self.active_app = None;
+            self.recent_apps.clear();
         }
     }
 

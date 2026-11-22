@@ -49,6 +49,7 @@ pub struct DcMem {
     pub fb_r_size: u32,
     pub spg_status: u32,
     pub vblank_line: u32,
+    pub maple_dma_addr: u32,
     pub maple_buttons: u16, // active-low Dreamcast Maple controller bits
     pub stick_x: u8,
     pub stick_y: u8,
@@ -78,6 +79,7 @@ impl DcMem {
             fb_r_size: ((HEIGHT as u32 - 1) << 10) | ((WIDTH as u32 / 2) - 1),
             spg_status: 0,
             vblank_line: 0,
+            maple_dma_addr: 0,
             maple_buttons: 0xFFFF,
             stick_x: 128,
             stick_y: 128,
@@ -123,6 +125,52 @@ impl DcMem {
                 cpu.r[0] = 0;
             }
             _ => {}
+        }
+    }
+
+    /// Processes a Dreamcast Maple Bus DMA descriptor chain (`DEVINFO` 0x01 & `GETCOND` 0x09)
+    /// so Dreamcast games & KallistiOS read live controller state directly from guest RAM.
+    fn run_maple_dma(&mut self) {
+        let mut ptr = self.maple_dma_addr;
+        for _ in 0..16 {
+            let hdr = self.read32(ptr);
+            let recv = self.read32(ptr.wrapping_add(4)) & 0x1FFF_FFE0;
+            let cmd_word = self.read32(ptr.wrapping_add(8));
+            let last = (hdr & 0x8000_0000) != 0;
+            let len_words = (hdr & 0xFF) as u32;
+            let port = (hdr >> 16) & 3;
+            let cmd = (cmd_word & 0xFF) as u8;
+            let dst_addr = ((cmd_word >> 8) & 0xFF) as u8;
+
+            if port == 0 && (dst_addr & 0x20) != 0 {
+                match cmd {
+                    // DEVINFO -> respond with Dreamcast Standard Controller (fn = 0x01000000)
+                    0x01 => {
+                        self.write32(recv, 0x0020_0005 | (28 << 24)); // DEVINFO reply, 28 words
+                        self.write32(recv + 4, 0x0100_0000);          // Controller function
+                        self.write32(recv + 8, 0x000F_FFFF);          // All standard buttons
+                        let name = b"Dreamcast Controller          ";
+                        self.write_slice(recv + 22, name);
+                    }
+                    // GETCOND -> respond with DATA_TRANSFER (0x08) containing live buttons + triggers + stick
+                    0x09 => {
+                        self.write32(recv, 0x0320_0008); // DATA_TRANSFER, 3 words
+                        self.write32(recv + 4, 0x0100_0000); // Controller function
+                        let b = self.maple_buttons as u32;
+                        let r_l = ((self.l_trig as u32) << 24) | ((self.r_trig as u32) << 16) | b;
+                        self.write32(recv + 8, r_l);
+                        let axes = 0x8080_0000 | ((self.stick_y as u32) << 8) | (self.stick_x as u32);
+                        self.write32(recv + 12, axes);
+                    }
+                    _ => self.write32(recv, 0xFFFF_FFFF),
+                }
+            } else {
+                self.write32(recv, 0xFFFF_FFFF); // No device on ports B-D
+            }
+            if last {
+                break;
+            }
+            ptr = ptr.wrapping_add((len_words + 2) * 4);
         }
     }
 
@@ -237,6 +285,13 @@ impl Bus for DcMem {
     fn write32(&mut self, addr: u32, val: u32) {
         let p = Self::phys(addr);
         match p {
+            // Maple Bus DMA: MDSTAR (0x5F6C04) sets descriptor list; MDST (0x5F6C18) executes controller poll
+            0x005F_6C04 => self.maple_dma_addr = val & 0x1FFF_FFE0,
+            0x005F_6C18 => {
+                if val & 1 != 0 {
+                    self.run_maple_dma();
+                }
+            }
             0x005F_8044 => self.fb_r_ctrl = val,
             0x005F_8050 => self.fb_r_sof1 = val & (VRAM_SIZE as u32 - 1),
             0x005F_805C => self.fb_r_size = val,

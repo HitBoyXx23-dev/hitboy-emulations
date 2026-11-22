@@ -22,6 +22,13 @@ atari2600 = { path = "../atari2600" }
 atari7800 = { path = "../atari7800" }
 ios = { path = "../ios" }
 xboxone = { path = "../xboxone" }
+psp = { path = "../psp" }
+vita = { path = "../vita" }
+n3ds = { path = "../n3ds" }
+nds = { path = "../nds" }
+dreamcast = { path = "../dreamcast" }
+saturn = { path = "../saturn" }
+neogeo = { path = "../neogeo" }
 wasmlibc = { path = "../wasmlibc" }
 state = { path = "../state" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
