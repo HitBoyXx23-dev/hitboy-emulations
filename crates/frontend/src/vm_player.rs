@@ -1,5 +1,6 @@
 //! In-app screen for VMs running on our built-in x86 PC core and Android Device / APK Runtime.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,11 @@ use crate::theme::t;
 
 enum Backend {
     Pc(Machine),
-    Android(AndroidDevice),
+    Android {
+        dev: AndroidDevice,
+        vm_index: Option<usize>,
+        icons: HashMap<String, TextureHandle>,
+    },
 }
 
 pub struct VmSession {
@@ -57,11 +62,18 @@ impl VmSession {
         })
     }
 
-    pub fn start_android(name: &str, portrait: bool) -> Self {
+    pub fn start_android(name: &str, portrait: bool, vm_index: Option<usize>, saved_apks: &[String]) -> Self {
         let now = Instant::now();
+        let mut dev = AndroidDevice::new(name, portrait);
+        for p in saved_apks {
+            let path = Path::new(p);
+            if path.is_file() {
+                let _ = dev.install_apk(path);
+            }
+        }
         Self {
             name: name.to_owned(),
-            backend: Backend::Android(AndroidDevice::new(name, portrait)),
+            backend: Backend::Android { dev, vm_index, icons: HashMap::new() },
             paused: false,
             last_tick: now,
             gfx: None,
@@ -76,7 +88,14 @@ impl VmSession {
     }
 
     pub fn is_android(&self) -> bool {
-        matches!(self.backend, Backend::Android(_))
+        matches!(self.backend, Backend::Android { .. })
+    }
+
+    pub fn vm_index(&self) -> Option<usize> {
+        match &self.backend {
+            Backend::Android { vm_index, .. } => *vm_index,
+            Backend::Pc(_) => None,
+        }
     }
 
     pub fn engine_label(&self) -> String {
@@ -90,7 +109,7 @@ impl VmSession {
     pub fn reboot(&mut self) {
         match &mut self.backend {
             Backend::Pc(m) => m.reboot(),
-            Backend::Android(dev) => {
+            Backend::Android { dev, .. } => {
                 dev.active_app = None;
                 dev.recents_open = false;
                 dev.log.push("Rebooted Android device.".into());
@@ -99,7 +118,7 @@ impl VmSession {
     }
 
     pub fn install_apk(&mut self, path: &Path) -> Result<String, String> {
-        if let Backend::Android(dev) = &mut self.backend {
+        if let Backend::Android { dev, .. } = &mut self.backend {
             let idx = dev.install_apk(path)?;
             let label = dev.apps[idx].label.clone();
             dev.launch_app(idx);
@@ -110,14 +129,14 @@ impl VmSession {
     }
 
     pub fn toggle_rotation(&mut self) {
-        if let Backend::Android(dev) = &mut self.backend {
+        if let Backend::Android { dev, .. } = &mut self.backend {
             dev.toggle_rotation();
         }
     }
 
     pub fn press_nav(&mut self, key: NavKey) {
         match &mut self.backend {
-            Backend::Android(dev) => dev.press_nav(key),
+            Backend::Android { dev, .. } => dev.press_nav(key),
             Backend::Pc(m) => match key {
                 NavKey::Back => {
                     m.key_down(keys::ESC, 0x1B);
@@ -147,7 +166,7 @@ impl VmSession {
         if self.paused {
             return;
         }
-        if matches!(self.backend, Backend::Android(_)) {
+        if matches!(self.backend, Backend::Android { .. }) {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.press_nav(NavKey::Back);
             }
@@ -219,8 +238,17 @@ impl VmSession {
 
     /// Draws the guest display into `rect`.
     pub fn draw(&mut self, ui: &mut egui::Ui, avail: Rect) -> egui::Response {
-        if let Backend::Android(dev) = &mut self.backend {
-            return draw_android_device(ui, avail, dev);
+        if let Backend::Android { dev, icons, .. } = &mut self.backend {
+            // Lazily decode any extracted APK PNG icons into egui textures.
+            for app in &dev.apps {
+                if !app.icon_png.is_empty() && !icons.contains_key(&app.package) {
+                    if let Some(img) = decode_png_rgba(&app.icon_png) {
+                        let tex = ui.ctx().load_texture(format!("apk_icon_{}", app.package), img, TextureOptions::LINEAR);
+                        icons.insert(app.package.clone(), tex);
+                    }
+                }
+            }
+            return draw_android_device(ui, avail, dev, icons);
         }
         let resp = ui.allocate_rect(avail, Sense::click());
         self.hovered = resp.hovered();
@@ -298,8 +326,31 @@ impl VmSession {
     }
 }
 
+/// Decodes an APK PNG icon into an egui `ColorImage`.
+fn decode_png_rgba(bytes: &[u8]) -> Option<ColorImage> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    let data = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgb => data.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => data.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0], c[1]]).collect(),
+        png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        _ => return None,
+    };
+    if rgba.len() >= w * h * 4 {
+        Some(ColorImage::from_rgba_unmultiplied([w, h], &rgba[..w * h * 4]))
+    } else {
+        None
+    }
+}
+
 /// Interactive Android Phone / Tablet screen with launcher, APK runtime, and Android nav bar.
-fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice) -> egui::Response {
+fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice, icons: &HashMap<String, TextureHandle>) -> egui::Response {
     let resp = ui.allocate_rect(avail, Sense::hover());
     let (aspect_w, aspect_h) = if dev.portrait { (9.0_f32, 16.0_f32) } else { (16.0_f32, 10.0_f32) };
     let pad = 20.0;
@@ -470,10 +521,20 @@ fn draw_android_device(ui: &mut egui::Ui, avail: Rect, dev: &mut AndroidDevice) 
             let cols = if dev.portrait { 3 } else { 5 };
             egui::Grid::new("android_apps_grid").spacing(Vec2::new(10.0, 12.0)).show(ui, |ui| {
                 for (i, app) in dev.apps.iter().enumerate() {
-                    let btn = egui::Button::new(RichText::new(&app.label).strong().size(12.5).color(Color32::WHITE))
-                        .fill(if i < 3 { Color32::from_rgb(0x1B, 0x22, 0x36) } else { t().primary })
+                    let btn = if let Some(tex) = icons.get(&app.package) {
+                        egui::Button::image_and_text(
+                            egui::Image::from_texture(egui::load::SizedTexture::new(tex.id(), Vec2::splat(28.0))),
+                            RichText::new(&app.label).strong().size(12.0).color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(0x1B, 0x22, 0x36))
                         .corner_radius(CornerRadius::same(14))
-                        .min_size(Vec2::new(82.0, 64.0));
+                        .min_size(Vec2::new(92.0, 64.0))
+                    } else {
+                        egui::Button::new(RichText::new(&app.label).strong().size(12.5).color(Color32::WHITE))
+                            .fill(if i < 3 { Color32::from_rgb(0x1B, 0x22, 0x36) } else { t().primary })
+                            .corner_radius(CornerRadius::same(14))
+                            .min_size(Vec2::new(92.0, 64.0))
+                    };
                     if ui.add(btn).on_hover_text(&app.package).clicked() {
                         launch_idx = Some(i);
                     }

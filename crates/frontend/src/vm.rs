@@ -36,6 +36,8 @@ pub struct VmConfig {
     /// Screen size the guest is offered (0 = QEMU's default). Phones use portrait sizes.
     pub xres: u32,
     pub yres: u32,
+    /// Persistent sideloaded `.apk` paths for Android VMs.
+    pub apks: Vec<String>,
 }
 
 /// What a machine represents, for grouping in the interface.
@@ -68,6 +70,7 @@ impl Default for VmConfig {
             virtio: false,
             xres: 0,
             yres: 0,
+            apks: Vec::new(),
         }
     }
 }

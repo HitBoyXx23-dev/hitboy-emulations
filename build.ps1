@@ -1,4 +1,4 @@
-# Builds the three apps in release mode and packages them:
+﻿# Builds the three apps in release mode and packages them:
 #   dist\<Brand> Emulations\<Brand> Emulations.exe
 #   dist\<Brand>-Emulations-Windows.zip
 #   websites\<brand>\  (download site with the zip inside)
@@ -19,10 +19,11 @@ wasm-bindgen --target web --no-typescript --out-dir target\webpkg target\wasm32-
 if ($LASTEXITCODE -ne 0) { throw "wasm-bindgen failed" }
 $playTemplate = Get-Content "websites\play.html" -Raw -Encoding utf8
 $iosTemplate  = Get-Content "websites\ios.html" -Raw -Encoding utf8
+$manifestTemplate = Get-Content "websites\manifest.json" -Raw -Encoding utf8
 
 $version = (Select-String -Path "crates\frontend\Cargo.toml" -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
 $brands = @(
-    @{ id = "hitboy";  name = "HitBoy's"; primary = "#7851A9"; secondary = "#4169E1"; publisher = "HitBoyXx23"; repo = "https://github.com/HitBoyXx23-dev/hitboy-emulations" }
+    @{ id = "hitboy";  name = "HitBoy's"; primary = "#4169E1"; secondary = "#7851A9"; publisher = "HitBoyXx23"; repo = "https://github.com/HitBoyXx23-dev/hitboy-emulations" }
 )
 $template = Get-Content "websites\template.html" -Raw -Encoding utf8
 New-Item -ItemType Directory -Force dist | Out-Null
@@ -86,6 +87,8 @@ foreach ($b in $brands) {
     [IO.File]::WriteAllText((Join-Path $root "$play\index.html"), $phtml, (New-Object Text.UTF8Encoding $false))
     $ihtml = $iosTemplate.Replace("{{FULL}}", $full).Replace("{{NAME}}", $b.name).Replace("{{PRIMARY}}", $b.primary).Replace("{{SECONDARY}}", $b.secondary)
     [IO.File]::WriteAllText((Join-Path $root "$site\ios.html"), $ihtml, (New-Object Text.UTF8Encoding $false))
+    $mjson = $manifestTemplate.Replace("{{FULL}}", $full).Replace("{{NAME}}", $b.name).Replace("{{PRIMARY}}", $b.primary)
+    [IO.File]::WriteAllText((Join-Path $root "$site\manifest.json"), $mjson, (New-Object Text.UTF8Encoding $false))
     Write-Host "$full -> $appDir, $zip ($size), $site\index.html"
 }
 

@@ -6,11 +6,17 @@
 //! reimplementation of the Xbox system libraries.
 
 pub mod era_mem;
+pub mod exe_convert;
+pub mod firmware;
 pub mod gpu_bridge;
 pub mod modules;
 pub mod native;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod native_pages;
 pub mod package;
 pub mod pe;
+mod rdna2;
+pub mod rdna2_disasm;
 pub mod shims;
 pub mod x64_emu;
 
@@ -156,15 +162,11 @@ pub fn read_game(path: &Path) -> Result<GameInfo, String> {
             return Err(ENCRYPTED_MESSAGE.into());
         }
     }
-    let gdk = dir.join("MicrosoftGame.config");
-    let xdk = dir.join("appxmanifest.xml");
-    let mut g = if let Ok(s) = std::fs::read_to_string(&gdk) {
-        parse_game_config(&s)
-    } else if let Ok(s) = std::fs::read_to_string(&xdk) {
-        parse_appx_manifest(&s)
-    } else {
+    let Some((manifest, is_gdk, _)) = package::find_manifest(&dir) else {
         return Err("This folder has no appxmanifest.xml or MicrosoftGame.config. Choose the folder of a game decrypted on your own Xbox, or a Developer Mode app.".into());
     };
+    let xml = std::fs::read_to_string(&manifest).map_err(|e| format!("Couldn't read the manifest: {e}"))?;
+    let mut g = if is_gdk { parse_game_config(&xml) } else { parse_appx_manifest(&xml) };
     if !g.executable.is_empty() {
         let exe = std::fs::read(dir.join(&g.executable)).map_err(|e| format!("{}: {e}", g.executable))?;
         let p = pe::parse(&exe)?;

@@ -317,6 +317,26 @@ pub fn try_load(path: &Path) -> Option<Result<Loaded, String>> {
     }
 }
 
+/// Instantiates a next-wave console `Core` directly from in-memory bytes (used for zipped/7z/rar archives).
+pub fn from_bytes_for(console: &str, data: &[u8]) -> Result<Box<dyn Core>, String> {
+    Ok(match console {
+        "psp" => Box::new(PspCore { emu: psp::Psp::from_bytes(data)?, status: None }),
+        "vita" => Box::new(VitaCore { emu: vita::PsVita::from_bytes(data)? }),
+        "3ds" => Box::new(N3dsCore { emu: n3ds::Nintendo3ds::from_bytes(data)? }),
+        "nds" => Box::new(NdsCore { emu: nds::NintendoDs::from_bytes(data)? }),
+        "wiiu" => Box::new(WiiUCore { emu: wiiu::WiiU::from_bytes(data)? }),
+        "wii" => Box::new(WiiCore { emu: wii::Wii::from_bytes(data)? }),
+        "dc" => {
+            let bios = bios_for("dc").and_then(|p| std::fs::read(p).ok());
+            Box::new(DreamcastCore { emu: dreamcast::Dreamcast::from_bytes(data, bios)? })
+        }
+        "saturn" => Box::new(SaturnCore { emu: saturn::Saturn::from_bytes(data)? }),
+        "neogeo" => Box::new(NeoGeoCore { emu: neogeo::NeoGeo::from_bytes(data)? }),
+        "ps3" => Box::new(Ps3Core { emu: ps3::Ps3::from_bytes(data)?, status: None }),
+        _ => return Err(format!("Unsupported console id: {console}")),
+    })
+}
+
 /// Boots a Wii `.dol` binary on our dedicated Broadway `WiiCore`.
 #[allow(dead_code)]
 pub fn load_wii_dol(path: &Path) -> Result<Loaded, String> {
@@ -329,4 +349,62 @@ pub fn load_wii_dol(path: &Path) -> Result<Loaded, String> {
         console: "wii",
         save_path: path.with_extension("sav"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_next_wave_cores_wire_buttons_touch_frames_and_reset() {
+        // 1. NDS via Core trait
+        let mut nds_rom = vec![0u8; 0x300];
+        nds_rom[0..8].copy_from_slice(b"NDSTEST\0");
+        nds_rom[0x20..0x24].copy_from_slice(&0x200u32.to_le_bytes());
+        nds_rom[0x24..0x28].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+        nds_rom[0x28..0x2C].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+        nds_rom[0x2C..0x30].copy_from_slice(&16u32.to_le_bytes());
+        let mut nds = from_bytes_for("nds", &nds_rom).unwrap();
+        assert_eq!(nds.size(), (256, 384));
+        nds.set_buttons(0, 1);
+        nds.set_touch(true, 0.5, 0.75);
+        nds.run_frame();
+        nds.reset();
+
+        // 2. 3DS via Core trait (.3dsx)
+        let mut t3ds = vec![0u8; 48];
+        t3ds[0..4].copy_from_slice(b"3DSX");
+        t3ds[4..6].copy_from_slice(&32u16.to_le_bytes());
+        t3ds[12..16].copy_from_slice(&16u32.to_le_bytes());
+        let mut n3 = from_bytes_for("3ds", &t3ds).unwrap();
+        assert_eq!(n3.size(), (400, 480));
+        n3.set_touch(true, 0.5, 0.75);
+        n3.run_frame();
+        n3.reset();
+
+        // 3. Dreamcast via Core trait
+        let dc_bin = vec![0x09, 0x00, 0xFE, 0xAF]; // NOP; BRA -2
+        let mut dc = from_bytes_for("dc", &dc_bin).unwrap();
+        assert_eq!(dc.size(), (640, 480));
+        dc.set_buttons(0, 1);
+        dc.run_frame();
+        dc.reset();
+
+        // 4. Saturn via Core trait
+        let sat_bin = vec![0x00, 0x09, 0xAF, 0xFE]; // BE NOP; BRA -2
+        let mut sat = from_bytes_for("saturn", &sat_bin).unwrap();
+        assert_eq!(sat.size(), (320, 224));
+        sat.run_frame();
+        sat.reset();
+
+        // 5. Neo Geo via Core trait
+        let mut ng_bin = vec![0u8; 0x120];
+        ng_bin[0..4].copy_from_slice(&0x0010_F000u32.to_be_bytes());
+        ng_bin[4..8].copy_from_slice(&0x0000_0100u32.to_be_bytes());
+        ng_bin[0x100..0x102].copy_from_slice(&0x60FEu16.to_be_bytes());
+        let mut ng = from_bytes_for("neogeo", &ng_bin).unwrap();
+        assert_eq!(ng.size(), (320, 224));
+        ng.run_frame();
+        ng.reset();
+    }
 }

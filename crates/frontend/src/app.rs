@@ -1258,8 +1258,19 @@ impl App {
                         });
                         if install_apk_clicked {
                             if let Some(path) = rfd::FileDialog::new().add_filter("Android Package", &["apk"]).pick_file() {
+                                let vm_idx = s.vm_index();
                                 match s.install_apk(&path) {
-                                    Ok(label) => self.notify(format!("Installed {label}")),
+                                    Ok(label) => {
+                                        if let Some(vi) = vm_idx {
+                                            if let Some(vm) = self.settings.vms.get_mut(vi) {
+                                                let ps = path.to_string_lossy().into_owned();
+                                                if !vm.apks.contains(&ps) {
+                                                    vm.apks.push(ps);
+                                                }
+                                            }
+                                        }
+                                        self.notify(format!("Installed {label}"));
+                                    }
                                     Err(e) => self.notify(e),
                                 }
                             }
@@ -2507,7 +2518,7 @@ impl App {
                 if use_android_runner {
                     let portrait = vm.kind() == DeviceKind::Phone;
                     self.notify(format!("Started {}", vm.name));
-                    self.vm_session = Some(VmSession::start_android(&vm.name, portrait));
+                    self.vm_session = Some(VmSession::start_android(&vm.name, portrait, Some(idx), &vm.apks));
                 } else {
                     match VmSession::start(&vm.name, &vm.iso, &vm.disk, vm.ram_mb) {
                         Ok(s) => {
@@ -3159,10 +3170,111 @@ impl App {
                     }
                 });
 
-                section(ui, "PS4, PS5 and Xbox One/Series", "How programs from these consoles run once the pieces are finished.", |ui| {
+                section(ui, "PS4, PS5 and Xbox One/Series", "Run decrypted programs on our CPU core, convert them into native Windows .exe binaries, or inspect console firmware.", |ui| {
                     ui.radio_value(&mut self.settings.next_gen_mode, "emulate".to_string(), "Emulator: run on our own CPU core (works on every platform)");
                     ui.radio_value(&mut self.settings.next_gen_mode, "native".to_string(), "Native: convert the program to run on this PC's processor (faster, desktop only)");
                     crate::cores::set_native_next_gen(self.settings.next_gen_mode == "native");
+                    ui.add_space(10.0);
+                    let mut notice: Option<String> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        if primary_button(ui, "Convert Xbox .exe -> Windows .exe").clicked() {
+                            if let Some(src) = rfd::FileDialog::new().add_filter("Xbox Executable", &["exe"]).pick_file() {
+                                let res = std::fs::read(&src)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|b| xboxone::exe_convert::convert_xbox_pe_to_windows(&b));
+                                match res {
+                                    Ok(conv) => {
+                                        let out = src.with_file_name(format!("{}_windows.exe", src.file_stem().unwrap_or_default().to_string_lossy()));
+                                        if let Err(e) = std::fs::write(&out, &conv.windows_pe) {
+                                            notice = Some(format!("Failed to write {}: {e}", out.display()));
+                                        } else {
+                                            let dlls = if conv.rewritten_dlls.is_empty() {
+                                                "none needed".to_string()
+                                            } else {
+                                                conv.rewritten_dlls.iter().map(|(a, b)| format!("{a}->{b}")).collect::<Vec<_>>().join(", ")
+                                            };
+                                            rfd::MessageDialog::new()
+                                                .set_level(rfd::MessageLevel::Info)
+                                                .set_title("Xbox -> Windows .exe Ready")
+                                                .set_description(format!(
+                                                    "Saved: {}\n\nRewritten Xbox DLLs: {}\nTotal imports: {} (Forwarded: {}, Shimmed: {}, Stubbed: {}, Missing: {})",
+                                                    out.display(),
+                                                    dlls,
+                                                    conv.coverage.total_imports,
+                                                    conv.coverage.forwarded,
+                                                    conv.coverage.implemented,
+                                                    conv.coverage.stubbed,
+                                                    conv.coverage.missing
+                                                ))
+                                                .show();
+                                            notice = Some(format!("Converted {}", out.file_name().unwrap_or_default().to_string_lossy()));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Xbox conversion failed").set_description(e).show();
+                                    }
+                                }
+                            }
+                        }
+                        if ghost_button(ui, "Convert PS5/PS4 ELF -> Windows .exe").clicked() {
+                            if let Some(src) = rfd::FileDialog::new().add_filter("PlayStation ELF / eboot.bin", &["bin", "elf", "oelf"]).pick_file() {
+                                let res = std::fs::read(&src)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|b| ps5::exe_convert::convert_ps5_elf_to_windows_exe(&b));
+                                match res {
+                                    Ok(conv) => {
+                                        let out = src.with_file_name(format!("{}_windows.exe", src.file_stem().unwrap_or_default().to_string_lossy()));
+                                        if let Err(e) = std::fs::write(&out, &conv.windows_pe) {
+                                            notice = Some(format!("Failed to write {}: {e}", out.display()));
+                                        } else {
+                                            rfd::MessageDialog::new()
+                                                .set_level(rfd::MessageLevel::Info)
+                                                .set_title("PS5/PS4 -> Windows .exe Ready")
+                                                .set_description(format!(
+                                                    "Saved: {}\n\nRelinked fs: TLS/canary sites: {}\nImported PlayStation libraries: {} ({} NIDs)",
+                                                    out.display(),
+                                                    conv.relinked_fs_sites,
+                                                    conv.imported_libs.len(),
+                                                    conv.imported_nids
+                                                ))
+                                                .show();
+                                            notice = Some(format!("Converted {}", out.file_name().unwrap_or_default().to_string_lossy()));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("PS5 conversion failed").set_description(e).show();
+                                    }
+                                }
+                            }
+                        }
+                        if ghost_button(ui, "Inspect / Boot Firmware (Xbox / PS5)").clicked() {
+                            if let Some(src) = rfd::FileDialog::new().add_filter("Console Firmware", &["xvd", "bin", "pup", "rom"]).pick_file() {
+                                match std::fs::read(&src) {
+                                    Ok(bytes) => {
+                                        let report = xboxone::firmware::inspect_firmware(&bytes)
+                                            .map(|f| f.summary)
+                                            .or_else(|_| ps5::firmware::inspect_pup(&bytes).map(|p| p.summary));
+                                        match report {
+                                            Ok(summary) => {
+                                                rfd::MessageDialog::new()
+                                                    .set_level(rfd::MessageLevel::Info)
+                                                    .set_title("Console Firmware Verified")
+                                                    .set_description(summary)
+                                                    .show();
+                                            }
+                                            Err(e) => {
+                                                rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Unknown firmware").set_description(e).show();
+                                            }
+                                        }
+                                    }
+                                    Err(e) => notice = Some(format!("Couldn't read firmware: {e}")),
+                                }
+                            }
+                        }
+                    });
+                    if let Some(msg) = notice {
+                        self.notify(msg);
+                    }
                 });
 
                 section(ui, "Audio", "Sound from the console's audio chip, played through your default output device.", |ui| {

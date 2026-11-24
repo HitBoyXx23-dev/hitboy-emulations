@@ -1,0 +1,89 @@
+===============================================================================
+  SOURCES & TECHNICAL REFERENCES
+  HitBoy's Emulations & Navuryx Emulations
+===============================================================================
+
+IMPORTANT CLEAN-ROOM STATEMENT
+------------------------------
+100% of the emulator cores, CPU interpreters/JITs, shader decoders/translators,
+binary relinkers, virtual machine engines, and system shims in this project are
+custom clean-room implementations written from scratch in Rust and C++.
+
+NO source code, binaries, copyrighted keys, or game assets are copied from any
+third-party emulator or external repository. The projects and specifications
+listed below are referenced solely for public architectural research, hardware
+documentation, ABI behavior, and compatibility benchmarking.
+
+-------------------------------------------------------------------------------
+1. PUBLIC HARDWARE, ISA & OS SPECIFICATIONS
+-------------------------------------------------------------------------------
+- AMD RDNA 2 Instruction Set Architecture (GFX10.3) Reference Guide
+  https://www.amd.com/en/support/tech-docs
+- AMD64 Architecture Programmer's Manual (Volumes 1-5)
+- Intel 64 and IA-32 Architectures Software Developer's Manual
+- ARM Architecture Reference Manual (ARMv5TE, ARMv6K, ARMv7-A, ARMv8-A / ARM64e)
+- PowerPC User Instruction Set Architecture (Gekko / Broadway / Espresso / Xenon / Cell PPU)
+- MIPS32 Release 2 Architecture Specification (Allegrex / R3000 / VR4300 / R5900)
+- Hitachi / Renesas SuperH SH-2 & SH-4 Programming Manuals
+- Motorola M68000 Programmer's Reference Manual & Zilog Z80 User Manual
+- Microsoft DirectX 12, Win32, PE/COFF, and Public GDK Documentation
+  https://learn.microsoft.com/en-us/gaming/gdk/
+- Open-Source XNU Kernel & Mach-O Specification (Apple Open Source)
+  https://github.com/apple-oss-distributions/xnu
+- Android Open Source Project (AOSP) Dalvik DEX & AXML Format Docs
+  https://source.android.com/docs/core/runtime/dex-format
+
+-------------------------------------------------------------------------------
+2. REFERENCE & INSPIRATION PROJECTS (ARCHITECTURAL STUDY ONLY — NO CODE COPIED)
+-------------------------------------------------------------------------------
+Xbox One / Xbox Series X|S & Xbox-to-Windows Translation:
+- xbox2windows (Win32/GDK/D3D12.X native translation research)
+- TomBox (github.com/drycheetah84/TomBox — Xbox Series X|S API shimming & RDNA2 research)
+- xbox-emulator (github.com/omonkeyz/xbox-emulator — Xbox Series X|S library map,
+  RDNA2 shader translation, occlusion-query un-nesting, and offline service notes)
+- XWine1 / Era OS architecture notes
+
+Original Xbox & Xbox 360:
+- xemu (github.com/xemu-project/xemu — NV2A / MCPX / Xbox hardware reference)
+- Xenia (github.com/xenia-project/xenia — Xbox 360 Xenon / XEX / Xenos reference)
+
+PlayStation 4 & PlayStation 5 (Emulation & PS5-to-Windows Relinking):
+- AnyPS5 (PS5-to-Windows native binary translation & relinking research)
+- shadPS4 (github.com/shadps4-emu/shadPS4 — Orbis / libkernel / NID reference)
+- fpPS4 / kyty / OffAct (PS4/PS5 ELF/OELF & syscall documentation)
+- chiaki-ng (PlayStation 4 / PlayStation 5 Remote Play DDP protocol reference)
+
+PlayStation 1, 2, 3, PSP & PS Vita:
+- DuckStation / PSX-SPX (Nocash PSX hardware docs)
+- PCSX2 (Emotion Engine / IOP / SIF / GS documentation)
+- RPCS3 (Cell PPU / LV2 / RSX documentation)
+- PPSSPP (Allegrex MIPS / GE / PSP NID documentation)
+- Vita3K (ARMv7 / VPK / Vita NID documentation)
+
+Nintendo Consoles & Handhelds:
+- NesDev Wiki, Fullsnes (Nocash), Pan Docs (Game Boy), GBATEK (GBA & Nintendo DS)
+- 3dbrew.org (Nintendo 3DS ARM11 / 3DSX / NCCH / Horizon-3DS documentation)
+- N64brew, Dolphin (GameCube / Wii Gekko/Broadway / GX / IOS docs)
+- Cemu & WiiUBrew (Wii U Espresso / RPL / Cafe OS documentation)
+- Switchbrew.org (Nintendo Switch ARM64 / NCA / NSO / Horizon IPC docs)
+
+Sega, SNK, Atari, NEC, Bandai & Mattel:
+- Sega Retro, Flycast / Dreamcast Wiki (SH-4 / PowerVR2 / Maple Bus / GD-ROM)
+- Yabause / Saturn Tech Docs (SH-2 / VDP1 / VDP2)
+- NeoGeoDev Wiki (M68K / Fix Layer / NEO format)
+- Stella, AtariAge, Mednafen, PC Engine / WonderSwan / Intellivision tech docs
+
+Mobile & Multi-OS Virtual Machines:
+- QEMU / SeaBIOS / OSDev Wiki (IBM PC/AT, VGA, VESA VBE, IDE/ATAPI, PCI, ACPI)
+- Android-x86 / Bliss OS / LineageOS (x86 Android guest OS presets)
+- Apple iOS IPSW / IM4P / LZFSE / DeviceTree public format documentation
+
+-------------------------------------------------------------------------------
+3. LICENSE & CLEAN-ROOM GUARANTEE
+-------------------------------------------------------------------------------
+- HitBoy's Emulations (Black, Royal Blue #4169E1, Royal Purple #7851A9):
+  Open-source repository containing only our own custom clean-room codebase.
+- Navuryx Emulations (Black, Royal Purple #7851A9, Royal Blue #4169E1):
+  Closed-source binary edition built from the same clean-room engine.
+- Neither edition includes copyrighted game dumps, BIOS ROMs, or decryption keys.
+===============================================================================

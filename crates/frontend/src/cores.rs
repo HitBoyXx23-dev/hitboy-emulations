@@ -14,10 +14,6 @@ pub fn is_psp_iso(path: &Path) -> bool {
     next_wave::is_psp_iso(path)
 }
 
-pub(crate) fn ps_console_id(path: &Path) -> &'static str {
-    playstation::console_id(path)
-}
-
 pub trait Core {
     fn run_frame(&mut self);
     fn run_frame_blocking(&mut self) {
@@ -802,13 +798,13 @@ pub const BIOS_DEFS: &[BiosDef] = &[
     BiosDef { id: "xbox_eeprom", name: "Xbox (EEPROM)", sizes: &[256], hint: "256-byte eeprom.bin from your own Xbox: its serial, region and video settings", used: true },
     BiosDef { id: "intv_exec", name: "Intellivision (EXEC)", sizes: &[8 * 1024], hint: "8 KB exec.bin dumped from your own Intellivision", used: true },
     BiosDef { id: "intv_grom", name: "Intellivision (GROM)", sizes: &[2 * 1024], hint: "2 KB grom.bin dumped from your own Intellivision", used: true },
-    BiosDef { id: "ps2", name: "PlayStation 2", sizes: &[4 * 1024 * 1024], hint: "4 MB, e.g. SCPH-39001.bin", used: false },
+    BiosDef { id: "ps2", name: "PlayStation 2", sizes: &[4 * 1024 * 1024], hint: "4 MB, e.g. SCPH-39001.bin", used: true },
     BiosDef { id: "segacd", name: "Sega CD / Mega-CD", sizes: &[128 * 1024], hint: "128 KB, e.g. bios_CD_U.bin", used: false },
-    BiosDef { id: "saturn", name: "Saturn", sizes: &[512 * 1024], hint: "512 KB, e.g. sega_101.bin", used: false },
-    BiosDef { id: "dc", name: "Dreamcast", sizes: &[2 * 1024 * 1024], hint: "2 MB dc_boot.bin", used: false },
+    BiosDef { id: "saturn", name: "Saturn", sizes: &[512 * 1024], hint: "512 KB, e.g. sega_101.bin", used: true },
+    BiosDef { id: "dc", name: "Dreamcast", sizes: &[2 * 1024 * 1024], hint: "2 MB dc_boot.bin (optional; HLE BIOS is built in)", used: true },
     BiosDef { id: "3do", name: "3DO", sizes: &[1024 * 1024], hint: "1 MB, e.g. panafz10.bin", used: false },
     BiosDef { id: "lynx", name: "Atari Lynx", sizes: &[512], hint: "512 bytes lynxboot.img", used: false },
-    BiosDef { id: "neogeo", name: "Neo Geo", sizes: &[], hint: "neogeo.zip (AES/MVS system ROMs)", used: false },
+    BiosDef { id: "neogeo", name: "Neo Geo", sizes: &[], hint: "neogeo.zip (AES/MVS system ROMs)", used: true },
 ];
 
 fn active_file(id: &str) -> PathBuf {
@@ -945,6 +941,9 @@ pub fn console_for_path(path: &Path) -> Option<&'static str> {
     if is_ps5_file(path) {
         return Some(playstation::console_id(path));
     }
+    if is_xboxone_path(path) {
+        return Some("xone");
+    }
     if is_genesis_bin(path) {
         return Some("md");
     }
@@ -966,6 +965,15 @@ pub fn console_for_path(path: &Path) -> Option<&'static str> {
 
 fn lower_ext_of(path: &Path) -> String {
     path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
+}
+
+/// Xbox One / Series package, manifest, or a folder containing a manifest.
+pub(crate) fn is_xboxone_path(path: &Path) -> bool {
+    matches!(lower_ext_of(path).as_str(), "xvc" | "msixvc" | "msix" | "appx" | "msixbundle" | "appxbundle")
+        || path.file_name().is_some_and(|name| {
+            name.eq_ignore_ascii_case("MicrosoftGame.config") || name.eq_ignore_ascii_case("AppxManifest.xml")
+        })
+        || path.is_dir() && xboxone::package::find_manifest(path).is_some()
 }
 
 /// A PlayStation 4/5 program: an eboot.bin, a SELF/ELF file, or a game folder holding an eboot.bin.
@@ -1184,13 +1192,12 @@ fn unpack_msix(path: &Path) -> Result<PathBuf, String> {
 
 /// Xbox family files: read and described. Returns None when the file isn't one.
 fn xbox_report(path: &Path) -> Option<String> {
-    let mut ext = lower_ext_of(path);
+    let ext = lower_ext_of(path);
     let unpacked;
     let path = if matches!(ext.as_str(), "msix" | "appx" | "msixbundle" | "appxbundle") {
         match unpack_msix(path) {
             Ok(dir) => {
                 unpacked = dir;
-                ext.clear();
                 unpacked.as_path()
             }
             Err(e) => return Some(e),
@@ -1198,9 +1205,8 @@ fn xbox_report(path: &Path) -> Option<String> {
     } else {
         path
     };
-    let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     // Xbox One / Series: encrypted packages, or a decrypted game folder's manifest.
-    if ext == "xvc" || ext == "msixvc" || name == "microsoftgame.config" || name == "appxmanifest.xml" || path.is_dir() {
+    if is_xboxone_path(path) {
         if NATIVE_NEXT_GEN.load(std::sync::atomic::Ordering::Relaxed) {
             return Some(xbox_native_report(path));
         }
@@ -1250,16 +1256,15 @@ pub fn is_genesis_bin(path: &Path) -> bool {
 /// If `path` is an Xbox One / Series X|S package or decrypted game folder and we are in
 /// Emulator mode, loads it into the live `XboxOneCore` player.
 fn try_load_xboxone(path: &Path) -> Option<Result<Loaded, String>> {
-    if NATIVE_NEXT_GEN.load(std::sync::atomic::Ordering::Relaxed) {
+    if NATIVE_NEXT_GEN.load(std::sync::atomic::Ordering::Relaxed) || !is_xboxone_path(path) {
         return None;
     }
-    let mut ext = lower_ext_of(path);
+    let ext = lower_ext_of(path);
     let unpacked;
     let target = if matches!(ext.as_str(), "msix" | "appx" | "msixbundle" | "appxbundle") {
         match unpack_msix(path) {
             Ok(dir) => {
                 unpacked = dir;
-                ext.clear();
                 unpacked.as_path()
             }
             Err(e) => return Some(Err(e)),
@@ -1267,11 +1272,7 @@ fn try_load_xboxone(path: &Path) -> Option<Result<Loaded, String>> {
     } else {
         path
     };
-    let name = target.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    if ext == "xvc" || ext == "msixvc" || name == "microsoftgame.config" || name == "appxmanifest.xml" || target.is_dir() {
-        return Some(xboxone_core::load(target));
-    }
-    None
+    Some(xboxone_core::load(target))
 }
 
 /// Loads a game file (or the first game inside a .zip) with the right core.
@@ -1286,7 +1287,7 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         return playstation::load(path);
     }
     if lower_ext_of(path) == "pkg" {
-        return Err("PlayStation PKG installation is not supported yet. Open a decrypted ELF/OELF executable or a game folder containing eboot.bin with the experimental PS4 core.".into());
+        return Err("Open the decrypted PS4 or PS5 ELF/OELF, or its game folder containing eboot.bin. PKG installation is still in development.".into());
     }
     if lower_ext_of(path) == "xex" {
         return x360_core::load(path);
@@ -1408,6 +1409,9 @@ Add your PlayStation 2 BIOS (4 MB ROM dumped from your own console) under Settin
         "md" => Box::new(md::Genesis::new(&rom)?),
         "gg" => Box::new(sms::MasterSystem::new(&rom, true)?),
         "n64" => Box::new(n64::N64::from_rom(rom)?),
+        "psp" | "vita" | "3ds" | "nds" | "wiiu" | "wii" | "dc" | "saturn" | "neogeo" | "ps3" => {
+            next_wave::from_bytes_for(console, &rom)?
+        }
         _ => Box::new(gb::GameBoy::from_rom(rom)?),
     };
     let save_path = path.with_extension("sav");

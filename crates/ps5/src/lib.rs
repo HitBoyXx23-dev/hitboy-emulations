@@ -9,6 +9,8 @@
 //! libraries. Running the program is the next stage and builds on this loader.
 
 pub mod elf;
+pub mod exe_convert;
+pub mod firmware;
 pub mod image;
 pub mod metadata;
 pub mod machine;
