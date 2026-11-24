@@ -15,6 +15,19 @@
 
 #![allow(non_snake_case)]
 
+pub(crate) const XGAME_RUNTIME_DLL: &str = "xgameruntime.dll";
+pub(crate) const XGAME_RUNTIME_EXPORTS: &[&str] = &[
+    "XErrorReport",
+    "XGameRuntimeInitialize",
+    "XGameRuntimeUninitialize",
+    "XGameRuntimePrint",
+    "XGameRuntimeGetXboxLiveSandboxId",
+];
+
+pub(crate) fn error_report_line(error: u32, message: &str) -> String {
+    format!("XErrorReport(0x{error:08x}): {message}\n")
+}
+
 #[cfg(not(all(windows, target_arch = "x86_64")))]
 mod stub {
     use std::ffi::c_void;
@@ -59,7 +72,7 @@ mod win {
             return String::new();
         }
         let mut len = 0;
-        while *((p as *const u8).add(len)) != 0 && len < 1 << 16 {
+        while len < 1 << 16 && *((p as *const u8).add(len)) != 0 {
             len += 1;
         }
         String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, len)).into_owned()
@@ -73,6 +86,152 @@ mod win {
 
     pub extern "system" fn XGameRuntimeUninitialize() -> i32 {
         S_OK
+    }
+
+    pub extern "system" fn XErrorReport(error: u32, message: u64) -> i32 {
+        let message = unsafe { text(message) };
+        crate::native::print_on_this_thread(&super::error_report_line(error, &message));
+        S_OK
+    }
+
+    pub extern "system" fn XMemVirtualAlloc(
+        address: usize,
+        size: usize,
+        flags: u32,
+        _attributes: u64,
+        protection: u32,
+    ) -> *mut c_void {
+        xmem_virtual_alloc(address, size, flags, protection, false)
+    }
+
+    extern "system" fn guest_xmem_virtual_alloc(
+        address: usize,
+        size: usize,
+        flags: u32,
+        _attributes: u64,
+        protection: u32,
+    ) -> *mut c_void {
+        xmem_virtual_alloc(address, size, flags, protection, true)
+    }
+
+    fn xmem_virtual_alloc(
+        address: usize,
+        size: usize,
+        flags: u32,
+        protection: u32,
+        track_placeholders: bool,
+    ) -> *mut c_void {
+        #[repr(C)]
+        struct AddressRequirements {
+            lowest: usize,
+            highest: usize,
+            alignment: usize,
+        }
+
+        #[repr(C, align(8))]
+        struct ExtendedParameter {
+            kind: u64,
+            value: *const AddressRequirements,
+        }
+
+        type VirtualAlloc2 = unsafe extern "system" fn(
+            *mut c_void, *mut c_void, usize, u32, u32, *mut ExtendedParameter, u32,
+        ) -> *mut c_void;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+            fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protection: u32) -> *mut c_void;
+        }
+
+        const COMMIT: u32 = 0x1000;
+        const RESERVE: u32 = 0x2000;
+        const RESERVE_PLACEHOLDER: u32 = 0x40000;
+        const RESERVE_AND_COMMIT: u32 = RESERVE | COMMIT;
+        const PLACEHOLDER: u32 = RESERVE | RESERVE_PLACEHOLDER;
+        const PAGE_MODE: u32 = 0x2040_0000;
+        const ADDRESS_REQUIREMENTS: u64 = 1;
+        const NOACCESS: u32 = 1;
+
+        let null = std::ptr::null_mut();
+        if flags == 0x2040_6000 {
+            let page_bytes = crate::era_mem::PAGE_SIZE_64K as usize;
+            if address == 0 || size == 0 || address % page_bytes != 0 || size % page_bytes != 0 {
+                return null;
+            }
+            return if track_placeholders && crate::native::with_physical_pages(|pages| pages.carve_window(address, size)) == Some(true) {
+                address as *mut c_void
+            } else {
+                null
+            };
+        }
+        let page_mode = flags & PAGE_MODE;
+        let kind = match flags & !PAGE_MODE {
+            0 if address == 0 => RESERVE_AND_COMMIT,
+            0 => COMMIT,
+            kind @ (RESERVE | RESERVE_AND_COMMIT | PLACEHOLDER) => kind,
+            _ => return null,
+        };
+        let page_size: usize = match page_mode {
+            0 => 4096,
+            0x2040_0000 => 65536,
+            0x2000_0000 => 2 * 1024 * 1024,
+            _ => return null,
+        };
+        let protection = protection & 0xff;
+        if size == 0 || !matches!(protection, 1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x80) {
+            return null;
+        }
+
+        let placeholder = kind & RESERVE_PLACEHOLDER != 0 || (kind == RESERVE && page_mode != 0);
+        if kind & RESERVE_PLACEHOLDER != 0 && protection != NOACCESS {
+            return null;
+        }
+        let (kind, protection) = if placeholder {
+            (PLACEHOLDER, NOACCESS)
+        } else {
+            (kind, protection)
+        };
+        let alignment = page_size.max(65536);
+        let address_alignment = if kind & RESERVE != 0 { alignment } else { page_size };
+        let base = address & !(address_alignment - 1);
+        let Some(size) = size.checked_add(address - base)
+            .and_then(|size| size.checked_add(page_size - 1))
+            .map(|size| size & !(page_size - 1))
+        else {
+            return null;
+        };
+        if (address != 0 && base == 0) || base.checked_add(size).is_none() {
+            return null;
+        }
+        if !placeholder && alignment <= 65536 {
+            return unsafe { VirtualAlloc(base as *mut c_void, size, kind, protection) };
+        }
+
+        static ALLOCATOR: std::sync::OnceLock<Option<VirtualAlloc2>> = std::sync::OnceLock::new();
+        let Some(allocate) = ALLOCATOR.get_or_init(|| unsafe {
+            let kernel = GetModuleHandleA(b"kernelbase.dll\0".as_ptr());
+            if kernel.is_null() {
+                return None;
+            }
+            let symbol = GetProcAddress(kernel, b"VirtualAlloc2\0".as_ptr());
+            (!symbol.is_null()).then(|| std::mem::transmute::<*mut c_void, VirtualAlloc2>(symbol))
+        }) else {
+            return null;
+        };
+        let requirements = AddressRequirements { lowest: 0, highest: 0, alignment };
+        let mut parameter = ExtendedParameter { kind: ADDRESS_REQUIREMENTS, value: &requirements };
+        let (parameters, count) = if address == 0 && alignment > 65536 {
+            (&mut parameter as *mut ExtendedParameter, 1)
+        } else {
+            (std::ptr::null_mut(), 0)
+        };
+        let result = unsafe { allocate(null, base as *mut c_void, size, kind, protection, parameters, count) };
+        if track_placeholders && placeholder && !result.is_null() {
+            crate::native::with_physical_pages(|pages| pages.register_window(result as usize, size));
+        }
+        result
     }
 
     /// Xbox's debug output. A game's `OutputDebugStringA` reaches here and is captured for the
@@ -616,6 +775,66 @@ mod win {
         true
     }
 
+    // ---- Xbox Series X|S DirectStorage, Frame Pacing, APU Audio, XCurl & Bink2 Shims ----
+
+    pub extern "system" fn DStorageGetFactory(_riid: u64, out_factory: u64) -> i32 {
+        if out_factory != 0 {
+            unsafe { *(out_factory as *mut u64) = 0 };
+        }
+        S_OK
+    }
+
+    pub extern "system" fn DStorageSetConfiguration(_config: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn SetFrameIntervalX(_device: u64, _interval: u32, _period: u32, _flags: u32) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn ScheduleFrameEventX(_device: u64, _event: u32, _offset: u32, _handle: u64, _flags: u32) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn WaitFrameEventX(_device: u64, _timeout_ms: u32, _out_token: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn ApuAlloc(out_va: u64, _out_pa: u64, size: u32, _align: u32) -> i32 {
+        let ptr = XMemAlloc(size as usize, 0);
+        if out_va != 0 {
+            unsafe { *(out_va as *mut u64) = ptr as u64 };
+        }
+        if ptr.is_null() { E_FAIL } else { S_OK }
+    }
+
+    pub extern "system" fn ApuFree(va: u64) -> i32 {
+        XMemFree(va as *mut c_void, 0);
+        S_OK
+    }
+
+    pub extern "system" fn AcpHalCreate(_out_hal: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn XcurlInitialize() -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn XcurlUninitialize() -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn BinkOpen(_name: u64, _flags: u32) -> u64 {
+        0
+    }
+
+    pub extern "system" fn BinkDoFrame(_bink: u64) -> i32 {
+        0
+    }
+
+    pub extern "system" fn BinkClose(_bink: u64) {}
+
     // ---- XDK Memory Allocator (XMemAlloc / XMemFree / XMemSize / TitleMemoryStatus) ----
 
     static XMEM_ALLOCS: Mutex<Option<std::collections::HashMap<usize, (usize, usize)>>> = Mutex::new(None);
@@ -887,6 +1106,12 @@ mod win {
         let p: *mut c_void = match name {
             _ if name.eq_ignore_ascii_case("XGameRuntimeInitialize") => XGameRuntimeInitialize as *mut c_void,
             _ if name.eq_ignore_ascii_case("XGameRuntimeUninitialize") => XGameRuntimeUninitialize as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XErrorReport") => XErrorReport as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XMemVirtualAlloc") => guest_xmem_virtual_alloc as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XMemAllocatePhysicalPages") => crate::native_pages::allocate_pages as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XMemFreePhysicalPages") => crate::native_pages::free_pages as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XMemMapPhysicalPages") => crate::native_pages::map_pages as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XMemMapPhysicalPagesScatter") => crate::native_pages::map_pages_scatter as *mut c_void,
             _ if name.eq_ignore_ascii_case("XGameRuntimePrint") => XGameRuntimePrint as *mut c_void,
             _ if name.eq_ignore_ascii_case("XGameRuntimeSleep") => XGameRuntimeSleep as *mut c_void,
             _ if name.eq_ignore_ascii_case("XSystemGetXboxLiveSandboxId") => XSystemGetXboxLiveSandboxId as *mut c_void,
@@ -961,6 +1186,19 @@ mod win {
             _ if name.eq_ignore_ascii_case("XNetworkingGetConnectivityHint") => XNetworkingGetConnectivityHint as *mut c_void,
             _ if name.eq_ignore_ascii_case("XNetworkingRegisterConnectivityHintChanged") => XNetworkingRegisterConnectivityHintChanged as *mut c_void,
             _ if name.eq_ignore_ascii_case("XNetworkingUnregisterConnectivityHintChanged") => XNetworkingUnregisterConnectivityHintChanged as *mut c_void,
+            _ if name.eq_ignore_ascii_case("DStorageGetFactory") => DStorageGetFactory as *mut c_void,
+            _ if name.eq_ignore_ascii_case("DStorageSetConfiguration") => DStorageSetConfiguration as *mut c_void,
+            _ if name.eq_ignore_ascii_case("SetFrameIntervalX") => SetFrameIntervalX as *mut c_void,
+            _ if name.eq_ignore_ascii_case("ScheduleFrameEventX") => ScheduleFrameEventX as *mut c_void,
+            _ if name.eq_ignore_ascii_case("WaitFrameEventX") => WaitFrameEventX as *mut c_void,
+            _ if name.eq_ignore_ascii_case("ApuAlloc") => ApuAlloc as *mut c_void,
+            _ if name.eq_ignore_ascii_case("ApuFree") => ApuFree as *mut c_void,
+            _ if name.eq_ignore_ascii_case("AcpHalCreate") => AcpHalCreate as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XcurlInitialize") => XcurlInitialize as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XcurlUninitialize") => XcurlUninitialize as *mut c_void,
+            _ if name.eq_ignore_ascii_case("BinkOpen") => BinkOpen as *mut c_void,
+            _ if name.eq_ignore_ascii_case("BinkDoFrame") => BinkDoFrame as *mut c_void,
+            _ if name.eq_ignore_ascii_case("BinkClose") => BinkClose as *mut c_void,
             _ => return None,
         };
         BOUND.lock().unwrap_or_else(|e| e.into_inner()).push(name.to_string());
@@ -980,12 +1218,49 @@ mod tests {
     fn resolves_the_startup_calls() {
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
-            reset();
             assert!(resolve("XGameRuntimeInitialize").is_some());
             assert!(resolve("xgameRuntimeinitialize").is_some());
+            assert!(resolve("XMemVirtualAlloc").is_some());
+            assert!(resolve("XErrorReport").is_some());
             assert!(resolve("NoSuchXboxCall").is_none());
-            assert!(bound().contains(&"XGameRuntimeInitialize".to_string()));
         }
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn native_xmem_allocates_committed_memory_and_placeholders() {
+        use std::ffi::c_void;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
+        }
+
+        let large_page = 2 * 1024 * 1024;
+        let memory = XMemVirtualAlloc(0, 4097, 0x2000_3000, 7, 0x804);
+        assert!(!memory.is_null());
+        assert_eq!(memory as usize % large_page, 0);
+        unsafe {
+            let last_byte = memory.cast::<u8>().add(large_page - 1);
+            assert_eq!(last_byte.read(), 0);
+            last_byte.write(42);
+            assert_eq!(last_byte.read(), 42);
+            assert_ne!(VirtualFree(memory, 0, 0x8000), 0);
+        }
+
+        for flags in [0x42000, 0x2040_2000] {
+            let placeholder = XMemVirtualAlloc(0, 65536, flags, 7, 1);
+            assert!(!placeholder.is_null());
+            assert_eq!(placeholder as usize % 65536, 0);
+            assert_ne!(unsafe { VirtualFree(placeholder, 0, 0x8000) }, 0);
+        }
+        let reserved = XMemVirtualAlloc(0, 8192, 0x2000, 0, 1);
+        assert!(!reserved.is_null());
+        let second_page = reserved as usize + 4096;
+        assert_eq!(XMemVirtualAlloc(second_page, 4096, 0, 0, 4) as usize, second_page);
+        assert_ne!(unsafe { VirtualFree(reserved, 0, 0x8000) }, 0);
+        assert!(XMemVirtualAlloc(0, usize::MAX, 0x2000_3000, 7, 4).is_null());
+        assert!(XMemVirtualAlloc(0, 65536, 0x42000, 7, 4).is_null());
     }
 
     #[test]

@@ -47,7 +47,9 @@ pub fn provider(dll: &str) -> Option<Provider> {
     let hit = |f: &'static str, need: Need| -> Provider { Provider::Shim { func: f, need } };
     Some(match n.as_str() {
         // The Xbox kernel: the Windows 32-bit API surface, renamed.
-        "kernelx.dll" | "kernelbase.dll" | "kernel32.dll" | "ntdll.dll" => Provider::Windows("kernel32.dll"),
+        "kernelx.dll" | "kernelbase.dll" | "kernel32.dll" => Provider::Windows("kernel32.dll"),
+        "ntdll.dll" => Provider::Windows("ntdll.dll"),
+        "api-ms-win-core-synch-l1-2-0.dll" => Provider::Windows("kernelbase.dll"),
         // Direct3D, Xbox-flavoured. The X build adds console and shader-model features we don't
         // provide, but the D3D11/D3D12 entry points themselves are the Windows ones.
         "d3d11.dll" | "d3d11_x.dll" | "d3d11_xs.dll" | "d3d11core.dll" => Provider::Windows("d3d11.dll"),
@@ -55,16 +57,23 @@ pub fn provider(dll: &str) -> Option<Provider> {
         "dxgi.dll" => Provider::Windows("dxgi.dll"),
         "dxcore.dll" => Provider::Windows("dxcore.dll"),
         "d3d12.dll" | "d3d12_x.dll" | "d3d12_xs.dll" | "d3d12core.dll" => Provider::Windows("d3d12.dll"),
+        "dstorage_xs.dll" | "dstorage.dll" => hit("DirectStorage async streaming", Need::Medium),
+        "xapu.dll" | "acphal.dll" | "chad.dll" => hit("Xbox APU / DSP audio", Need::Medium),
+        "xcurl.dll" => hit("Xbox HTTP / offline service", Need::Easy),
+        "xcrdapi.dll" => hit("Xbox credential & profile API", Need::Easy),
+        "bink2scarlett.dll" | "bink2w64.dll" => hit("Bink2 video playback", Need::Easy),
         // The C runtime is the real one; only the UCRT the game was compiled against is missing.
         // `api-ms-win-crt-*.dll` are the forwarder shims over ucrtbase, so they all land there.
         "ucrtbase.dll" | "msvcrt.dll" | "vcruntime140.dll" | "vcruntime140_1.dll" => Provider::Windows("ucrtbase.dll"),
-        "ole32.dll" | "oleaut32.dll" | "combase.dll" | "shell32.dll" | "shcore.dll" => Provider::Windows("ole32.dll"),
+        "ole32.dll" | "combase.dll" | "shell32.dll" | "shcore.dll" => Provider::Windows("ole32.dll"),
+        "oleaut32.dll" => Provider::Windows("oleaut32.dll"),
         "ws2_32.dll" | "iphlpapi.dll" | "dnsapi.dll" | "winhttp.dll" => Provider::Windows("ws2_32.dll"),
         "userenv.dll" | "powrprof.dll" => Provider::Windows("userenv.dll"),
 
         // Xbox-only libraries.
         "xgameruntime.dll" => hit("XGameRuntimeInitialize", Need::Medium),
         "xgameplatform.dll" => hit("XGameRuntimeInitialize", Need::Medium),
+        "xmem.dll" => hit("XMemVirtualAlloc", Need::Medium),
         "xgamefeature.lib" | "xgamefeature.dll" => hit("XGameFeatureInitialize", Need::Hard),
         "xboxone.dll" | "xboxone_x64.dll" => hit("XSystemGetXboxLiveSandboxId", Need::Hard),
         "xboxservices.lib" | "xboxservices.dll" => Provider::Unavailable,
@@ -88,6 +97,8 @@ pub fn provider(dll: &str) -> Option<Provider> {
         "user32.dll" => Provider::Windows("user32.dll"),
         "gdi32.dll" => Provider::Windows("gdi32.dll"),
         "winmm.dll" => Provider::Windows("winmm.dll"),
+        "mfplat.dll" => Provider::Windows("mfplat.dll"),
+        "dwmapi.dll" => Provider::Windows("dwmapi.dll"),
         // The UCRT & Core API-set forwarder shims.
         _ if n.starts_with("api-ms-win-crt-") => Provider::Windows("ucrtbase.dll"),
         _ if n.starts_with("api-ms-win-core-") => Provider::Windows("kernel32.dll"),
@@ -113,7 +124,7 @@ mod tests {
         assert_eq!(provider("kernelx.dll"), Some(Provider::Windows("kernel32.dll")));
         assert_eq!(provider("D3D12_X.DLL"), Some(Provider::Windows("d3d12.dll")));
         assert_eq!(provider("d3d11_x.dll"), Some(Provider::Windows("d3d11.dll")));
-        assert_eq!(provider("api-ms-win-core-synch-l1-2-0.dll"), Some(Provider::Windows("kernel32.dll")));
+        assert_eq!(provider("api-ms-win-core-synch-l1-2-0.dll"), Some(Provider::Windows("kernelbase.dll")));
         assert_eq!(provider("api-ms-win-crt-runtime-l1-1-0.dll"), Some(Provider::Windows("ucrtbase.dll")));
     }
 

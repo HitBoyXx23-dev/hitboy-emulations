@@ -1407,11 +1407,15 @@ impl App {
             for c in CONSOLES {
                 if c.maker != last_maker {
                     last_maker = c.maker;
-                    ui.add_space(14.0);
-                    ui.label(RichText::new(c.maker).size(12.5).color(t().muted));
+                    ui.add_space(16.0);
+                    ui.label(RichText::new(c.maker.to_uppercase()).strong().size(11.0).color(t().muted));
                     ui.add_space(4.0);
                 }
-                let dot = self.can_play(c.id).then_some(t().ok);
+                let dot = match c.status {
+                    Status::Playable => Some(t().ok),
+                    Status::Experimental => Some(t().primary),
+                    Status::Planned => None,
+                };
                 let icon = if c.handheld { Icon::Handheld } else { Icon::Console };
                 if side_row(ui, self.console == c.id, icon, c.name, dot).clicked() && self.console != c.id {
                     self.console = c.id;
@@ -1424,9 +1428,79 @@ impl App {
         content(ctx, |ui| {
             let home = self.console == HOME;
             let c = library::console(if home { "nes" } else { self.console });
+            if home {
+                // Sleek Home Hero Launchpad card with brand gradient accent
+                let mut open_console_mode = false;
+                let mut open_android_vm = false;
+                let mut open_native_tools = false;
+                let mut resume_first: Option<(PathBuf, &'static str)> = None;
+                let first_recent = self.games.first().map(|g| (g.title.clone(), g.path.clone(), g.console));
+                let active_cores = CONSOLES.iter().filter(|k| k.status != Status::Planned).count();
+
+                let hero_frame = egui::Frame::NONE
+                    .fill(t().panel)
+                    .stroke(Stroke::new(1.0_f32, t().primary.gamma_multiply(0.45)))
+                    .corner_radius(CornerRadius::same(16))
+                    .inner_margin(Margin::symmetric(24, 20));
+                let hero_resp = hero_frame.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        pill(ui, &format!("{active_cores} Custom Cores Ready"), t().ok, t().surface);
+                        pill(ui, "Xbox & PS5 Native + Emu", t().primary, t().surface);
+                        pill(ui, "Android 14 & Multi-OS VMs", t().secondary, t().surface);
+                    });
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!("Welcome to {}", t().full_name()))
+                            .size(26.0)
+                            .family(egui::FontFamily::Name("heading".into()))
+                            .color(t().text),
+                    );
+                    ui.label(
+                        RichText::new("Play classic, handheld, and next-gen consoles on our clean-room cores, convert Xbox/PS5 binaries, or boot Android & desktop VMs.")
+                            .size(13.5)
+                            .color(t().muted),
+                    );
+                    ui.add_space(14.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some((title, path, cid)) = first_recent {
+                            if icon_button(ui, Icon::Play, &format!("Resume {title}"), true).clicked() {
+                                resume_first = Some((path, cid));
+                            }
+                        }
+                        if icon_button(ui, Icon::Power, "Console Mode", false).clicked() {
+                            open_console_mode = true;
+                        }
+                        if icon_button(ui, Icon::Phone, "Android 14 Phone", false).clicked() {
+                            open_android_vm = true;
+                        }
+                        if icon_button(ui, Icon::Gear, "Xbox / PS5 Native Tools", false).clicked() {
+                            open_native_tools = true;
+                        }
+                    });
+                });
+                // Paint subtle top Royal Blue <-> Royal Purple gradient stripe along hero card top edge
+                let hr = hero_resp.response.rect;
+                gradient_rule(ui, Rect::from_min_max(egui::pos2(hr.left() + 14.0, hr.top()), egui::pos2(hr.right() - 14.0, hr.top() + 3.0)));
+                ui.add_space(18.0);
+
+                if let Some((p, cid)) = resume_first {
+                    self.launch_any(&p, cid);
+                } else if open_console_mode {
+                    self.shell.restart(ctx.input(|i| i.time));
+                    self.shell_games_for = None;
+                    self.tab = Tab::Console;
+                } else if open_android_vm {
+                    self.notify("Started Android 14 Phone");
+                    self.vm_session = Some(VmSession::start_android("Android 14 Phone", true, None, &[]));
+                } else if open_native_tools {
+                    self.tab = Tab::Settings;
+                }
+            }
+
             ui.horizontal(|ui| {
                 let title = if home { "Recently played" } else { c.name };
-                ui.label(RichText::new(title).size(28.0).family(egui::FontFamily::Name("heading".into())).color(t().text));
+                ui.label(RichText::new(title).size(if home { 22.0 } else { 28.0 }).family(egui::FontFamily::Name("heading".into())).color(t().text));
                 if !home {
                     ui.add_space(6.0);
                     match c.status {
@@ -3842,11 +3916,26 @@ fn section(ui: &mut Ui, title: &str, subtitle: &str, body: impl FnOnce(&mut Ui))
 }
 
 fn empty_state(ui: &mut Ui, title: &str, subtitle: &str) {
-    ui.add_space(80.0);
+    ui.add_space(48.0);
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new(title).size(20.0).color(t().text));
-        ui.add_space(4.0);
-        ui.label(RichText::new(subtitle).color(t().muted));
+        egui::Frame::NONE
+            .fill(t().panel)
+            .stroke(Stroke::new(1.0_f32, t().border))
+            .corner_radius(CornerRadius::same(16))
+            .inner_margin(Margin::symmetric(36, 28))
+            .show(ui, |ui| {
+                ui.set_max_width(480.0);
+                ui.vertical_centered(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 24.0, t().primary.gamma_multiply(0.18));
+                    ui.painter().circle_stroke(r.center(), 24.0, Stroke::new(1.2_f32, t().primary.gamma_multiply(0.55)));
+                    icons::paint(ui.painter(), r.shrink(12.0), Icon::Gamepad, t().primary);
+                    ui.add_space(12.0);
+                    ui.label(RichText::new(title).size(20.0).family(egui::FontFamily::Name("heading".into())).color(t().text));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(subtitle).size(13.5).color(t().muted));
+                });
+            });
     });
 }
 
@@ -3899,16 +3988,25 @@ fn wordmark(ui: &mut Ui) {
 
 fn nav_tab(ui: &mut Ui, selected: bool, icon: Icon, label: &str) -> Response {
     let tw = text_width(ui, label);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(tw + 28.0 + 24.0, 60.0), Sense::click());
-    let color = if selected || resp.hovered() { t().text } else { t().muted };
-    let icon_color = if selected { t().primary } else { color };
-    let left = rect.center().x - (tw + 24.0) / 2.0;
-    icons::paint(ui.painter(), Rect::from_center_size(egui::pos2(left + 8.0, rect.center().y), Vec2::splat(17.0)), icon, icon_color);
-    ui.painter().text(egui::pos2(left + 24.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(15.0), color);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(tw + 26.0 + 24.0, 40.0), Sense::click());
+    let hovered = resp.hovered();
+    let p = ui.painter();
     if selected {
-        let bar = Rect::from_min_max(egui::pos2(rect.left() + 10.0, rect.bottom() - 3.0), egui::pos2(rect.right() - 10.0, rect.bottom()));
-        ui.painter().rect_filled(bar, CornerRadius::same(1), t().primary);
+        p.rect(
+            rect,
+            CornerRadius::same(10),
+            t().primary.gamma_multiply(0.18),
+            Stroke::new(1.0_f32, t().primary.gamma_multiply(0.55)),
+            egui::StrokeKind::Inside,
+        );
+    } else if hovered {
+        p.rect_filled(rect, CornerRadius::same(10), t().surface);
     }
+    let color = if selected || hovered { t().text } else { t().muted };
+    let icon_color = if selected { t().primary } else { color };
+    let left = rect.center().x - (tw + 22.0) / 2.0;
+    icons::paint(p, Rect::from_center_size(egui::pos2(left + 8.0, rect.center().y), Vec2::splat(16.0)), icon, icon_color);
+    p.text(egui::pos2(left + 22.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(14.5), color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -3921,11 +4019,17 @@ fn side_row(ui: &mut Ui, selected: bool, icon: Icon, label: &str, dot: Option<Co
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
     let p = ui.painter();
     if selected {
-        p.rect_filled(rect, CornerRadius::same(8), t().surface_hover);
-        let bar = Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 9.0), Vec2::new(3.0, rect.height() - 18.0));
-        p.rect_filled(bar, CornerRadius::same(1), t().primary);
+        p.rect(
+            rect,
+            CornerRadius::same(9),
+            t().primary.gamma_multiply(0.16),
+            Stroke::new(1.0_f32, t().primary.gamma_multiply(0.45)),
+            egui::StrokeKind::Inside,
+        );
+        let bar = Rect::from_min_size(rect.left_top() + Vec2::new(2.0, 8.0), Vec2::new(3.0, rect.height() - 16.0));
+        p.rect_filled(bar, CornerRadius::same(2), t().primary);
     } else if resp.hovered() {
-        p.rect_filled(rect, CornerRadius::same(8), t().surface);
+        p.rect_filled(rect, CornerRadius::same(9), t().surface);
     }
     let fg = if selected || resp.hovered() { t().text } else { t().muted };
     icons::paint(p, Rect::from_center_size(egui::pos2(rect.left() + 22.0, rect.center().y), Vec2::splat(16.0)), icon, if selected { t().primary } else { fg });
@@ -4063,23 +4167,25 @@ fn game_tile(ui: &mut Ui, g: &GameEntry, console: &library::Console, playable: b
         }
     }
     let p = ui.painter();
-    // Console badge.
+    // Console badge pill with subtle brand accent border.
     let badge_font = FontId::proportional(11.0);
     let bw = p.layout_no_wrap(console.short.to_owned(), badge_font.clone(), Color32::WHITE).size().x + 14.0;
-    let badge = Rect::from_min_size(cover.min + Vec2::new(8.0, 8.0), Vec2::new(bw, 19.0));
-    p.rect_filled(badge, CornerRadius::same(5), Color32::from_black_alpha(170));
+    let badge = Rect::from_min_size(cover.min + Vec2::new(8.0, 8.0), Vec2::new(bw, 20.0));
+    p.rect(badge, CornerRadius::same(6), Color32::from_black_alpha(195), Stroke::new(1.0_f32, t().primary.gamma_multiply(0.55)), egui::StrokeKind::Inside);
     p.text(badge.center(), Align2::CENTER_CENTER, console.short, badge_font, Color32::WHITE);
     if hovered {
-        p.rect_filled(cover, CornerRadius::same(10), Color32::from_black_alpha(if playable { 110 } else { 160 }));
+        p.rect_filled(cover, CornerRadius::same(12), Color32::from_black_alpha(if playable { 115 } else { 165 }));
         if playable {
             let c = cover.center();
+            p.circle_filled(c, 31.0, t().secondary.gamma_multiply(0.32));
             p.circle_filled(c, 26.0, t().primary);
             icons::paint(p, Rect::from_center_size(c + Vec2::new(2.0, 0.0), Vec2::splat(22.0)), Icon::Play, t().on_primary);
         } else {
             p.text(cover.center(), Align2::CENTER_CENTER, "Coming soon", FontId::proportional(12.5), Color32::WHITE);
         }
-        p.rect_stroke(cover, CornerRadius::same(10), Stroke::new(2.0_f32, t().primary), egui::StrokeKind::Outside);
-        p.rect_filled(trash_rect, CornerRadius::same(7), if over_trash { t().danger } else { Color32::from_black_alpha(190) });
+        p.rect_stroke(cover.expand(2.0), CornerRadius::same(13), Stroke::new(3.0_f32, t().secondary.gamma_multiply(0.35)), egui::StrokeKind::Outside);
+        p.rect_stroke(cover, CornerRadius::same(12), Stroke::new(2.0_f32, t().primary), egui::StrokeKind::Outside);
+        p.rect_filled(trash_rect, CornerRadius::same(7), if over_trash { t().danger } else { Color32::from_black_alpha(195) });
         icons::paint(p, trash_rect.shrink(7.0), Icon::Trash, Color32::WHITE);
     }
     // Name (ellipsized) and file size.
@@ -4100,9 +4206,20 @@ fn game_tile(ui: &mut Ui, g: &GameEntry, console: &library::Console, playable: b
 }
 
 
-/// Hairline separator under top bars.
+/// Smooth Royal Blue <-> Royal Purple brand gradient ribbon under top bars & hero cards.
 fn gradient_rule(ui: &mut Ui, rect: Rect) {
-    ui.painter().rect_filled(Rect::from_min_size(rect.min, Vec2::new(rect.width(), 1.0)), 0.0, t().border);
+    let steps = 24usize;
+    let sw = rect.width() / steps as f32;
+    let p = ui.painter();
+    for i in 0..steps {
+        let f = i as f32 / (steps - 1) as f32;
+        let col = lerp(t().primary, t().secondary, f);
+        let seg = Rect::from_min_max(
+            egui::pos2(rect.left() + i as f32 * sw, rect.top()),
+            egui::pos2(rect.left() + (i + 1) as f32 * sw + 0.5, rect.bottom()),
+        );
+        p.rect_filled(seg, 0.0, col);
+    }
 }
 
 fn lerp(a: Color32, b: Color32, x: f32) -> Color32 {

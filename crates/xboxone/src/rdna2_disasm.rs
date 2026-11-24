@@ -36,17 +36,43 @@ pub struct DecodedInst {
     pub raw: u32,
 }
 
+/// Detected RDNA2 shader stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShaderStage {
+    #[default]
+    Unknown,
+    Pixel,
+    Vertex,
+    Compute,
+    Mesh,
+    Amplification,
+}
+
+/// Automatically synthesized D3D12 Root Signature for Xbox shaders that omit an embedded root signature.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SynthesizedRootSignature {
+    pub root_constants_dwords: u32,
+    pub cbv_slots: u32,
+    pub srv_uav_slots: u32,
+    pub uses_mesh_dispatch: bool,
+}
+
 /// Summary report from analyzing a compiled Xbox Series X|S RDNA2 shader blob.
 #[derive(Debug, Clone, Default)]
 pub struct ShaderAnalysis {
     pub total_dwords: usize,
     pub instructions: Vec<DecodedInst>,
     pub unknown_count: usize,
+    pub stage: ShaderStage,
     pub uses_exports: bool,
+    pub uses_prim_export: bool,
+    pub uses_pos_export: bool,
+    pub uses_sendmsg_mesh: bool,
     pub uses_smem: bool,
     pub uses_vmem: bool,
     pub uses_exec_mask: bool,
     pub ended_cleanly: bool,
+    pub root_sig: SynthesizedRootSignature,
     pub hlsl: String,
 }
 
@@ -123,6 +149,11 @@ pub fn analyze_rdna2(code: &[u8]) -> Result<ShaderAnalysis, String> {
                 0x09 => ("s_cbranch_execnz", format!("{simm16:+}")),
                 0x0A => ("s_barrier", String::new()),
                 0x0C => ("s_waitcnt", format!("{:#06x}", w0 & 0xFFFF)),
+                0x10 => {
+                    // s_sendmsg: GS_ALLOC_REQ (msg 3) / GS_DONE (msg 2) used by RDNA2 Mesh & Amplification shaders
+                    out.uses_sendmsg_mesh = true;
+                    ("s_sendmsg", format!("{:#06x}", w0 & 0xFFFF))
+                }
                 0x13 => ("s_waitcnt_depctr", format!("{:#06x}", w0 & 0xFFFF)),
                 _ => ("s_sopp", format!("op={op:#x} imm={simm16}")),
             };
@@ -215,6 +246,11 @@ pub fn analyze_rdna2(code: &[u8]) -> Result<ShaderAnalysis, String> {
             let en = w0 & 0xF;
             let [v0, v1, v2, v3] = w1.to_le_bytes();
             out.uses_exports = true;
+            if target == 20 {
+                out.uses_prim_export = true; // EXP_PRIM -> RDNA2 Mesh Shader primitive export
+            } else if (12..=15).contains(&target) {
+                out.uses_pos_export = true;  // EXP_POS0..3 -> Vertex / Mesh position export
+            }
             if in_exec_block {
                 hlsl_lines.push("    }".into());
                 in_exec_block = false;
@@ -492,6 +528,25 @@ pub fn analyze_rdna2(code: &[u8]) -> Result<ShaderAnalysis, String> {
     }
     hlsl_lines.push("}".into());
     out.hlsl = hlsl_lines.join("\n");
+
+    // Infer shader stage (Pixel, Vertex, Mesh, Amplification, Compute) & synthesize Root Signature
+    out.stage = if out.uses_prim_export || (out.uses_sendmsg_mesh && out.uses_pos_export) {
+        ShaderStage::Mesh
+    } else if out.uses_sendmsg_mesh && !out.uses_exports {
+        ShaderStage::Amplification
+    } else if out.uses_pos_export {
+        ShaderStage::Vertex
+    } else if out.uses_exports {
+        ShaderStage::Pixel
+    } else {
+        ShaderStage::Compute
+    };
+    out.root_sig = SynthesizedRootSignature {
+        root_constants_dwords: 16,
+        cbv_slots: if out.uses_smem { 8 } else { 2 },
+        srv_uav_slots: if out.uses_vmem { 16 } else { 4 },
+        uses_mesh_dispatch: matches!(out.stage, ShaderStage::Mesh | ShaderStage::Amplification),
+    };
     Ok(out)
 }
 
