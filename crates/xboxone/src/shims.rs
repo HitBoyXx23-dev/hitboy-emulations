@@ -779,7 +779,8 @@ mod win {
 
     pub extern "system" fn DStorageGetFactory(_riid: u64, out_factory: u64) -> i32 {
         if out_factory != 0 {
-            unsafe { *(out_factory as *mut u64) = 0 };
+            let fac = crate::dstorage::create_factory();
+            unsafe { *(out_factory as *mut u64) = fac as u64 };
         }
         S_OK
     }
@@ -1052,7 +1053,8 @@ mod win {
         if out_device == 0 {
             return E_FAIL;
         }
-        unsafe { std::ptr::write_unaligned(out_device as *mut u64, 0xD3D1_2001) };
+        let dev = crate::d3d12x_com::create_device();
+        unsafe { std::ptr::write_unaligned(out_device as *mut u64, dev as u64) };
         S_OK
     }
 
@@ -1067,8 +1069,9 @@ mod win {
         crate::gpu_bridge::XgTileMode::Thin2D as u32
     }
 
-    /// Minimal D3D12XBOX_CreateDevice bridge: forwards to desktop `d3d12.dll!D3D12CreateDevice`
-    /// with default adapter and D3D_FEATURE_LEVEL_12_0 when available.
+    /// D3D12XBOX_CreateDevice bridge: tries desktop `d3d12.dll!D3D12CreateDevice` first for
+    /// standard PC `ID3D12Device` IIDs, and falls back to our clean-room `ID3D12DeviceX` COM
+    /// vtable proxy when an Xbox-specific IID is requested or desktop D3D12 rejects the call.
     pub extern "system" fn D3D12XBOX_CreateDevice(_params: u64, riid: u64, pp_device: u64) -> i32 {
         if pp_device == 0 {
             return E_FAIL;
@@ -1079,16 +1082,20 @@ mod win {
             fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
         }
         let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
-        if d3d12.is_null() {
-            return E_FAIL;
+        if !d3d12.is_null() {
+            let sym = unsafe { GetProcAddress(d3d12, b"D3D12CreateDevice\0".as_ptr()) };
+            if !sym.is_null() && riid != 0 {
+                let create: extern "system" fn(*mut c_void, u32, u64, u64) -> i32 = unsafe { std::mem::transmute(sym) };
+                // D3D_FEATURE_LEVEL_12_0 = 0xC000
+                let hr = create(std::ptr::null_mut(), 0xC000, riid, pp_device);
+                if hr == S_OK {
+                    return S_OK;
+                }
+            }
         }
-        let sym = unsafe { GetProcAddress(d3d12, b"D3D12CreateDevice\0".as_ptr()) };
-        if sym.is_null() {
-            return E_FAIL;
-        }
-        let create: extern "system" fn(*mut c_void, u32, u64, u64) -> i32 = unsafe { std::mem::transmute(sym) };
-        // D3D_FEATURE_LEVEL_12_0 = 0xC000
-        create(std::ptr::null_mut(), 0xC000, riid, pp_device)
+        let dev = crate::d3d12x_com::create_device();
+        unsafe { std::ptr::write_unaligned(pp_device as *mut u64, dev as u64) };
+        S_OK
     }
 
     pub extern "system" fn D3D11XCreateDeviceX(_params: u64, pp_device: u64, pp_context: u64) -> i32 {

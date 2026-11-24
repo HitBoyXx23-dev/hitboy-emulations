@@ -5,6 +5,8 @@
 //! x86-64 executable, so the app can say exactly what the game needs from our own
 //! reimplementation of the Xbox system libraries.
 
+pub mod d3d12x_com;
+pub mod dstorage;
 pub mod era_mem;
 pub mod exe_convert;
 pub mod firmware;
