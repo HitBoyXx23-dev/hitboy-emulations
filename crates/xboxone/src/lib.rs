@@ -5,6 +5,7 @@
 //! x86-64 executable, so the app can say exactly what the game needs from our own
 //! reimplementation of the Xbox system libraries.
 
+pub mod apu_audio;
 pub mod d3d12x_com;
 pub mod dstorage;
 pub mod era_mem;
@@ -14,7 +15,7 @@ pub mod gpu_bridge;
 pub mod modules;
 pub mod native;
 #[cfg(all(windows, target_arch = "x86_64"))]
-mod native_pages;
+pub mod native_pages;
 pub mod package;
 pub mod pe;
 mod rdna2;

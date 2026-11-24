@@ -69,18 +69,23 @@ pub fn is_standard_windows_dll(dll: &str) -> bool {
     ) || dll.to_ascii_lowercase().starts_with("api-ms-win-")
 }
 
-/// Maps an Xbox console-only DLL name to its same-length-or-shorter Windows / compat shim DLL name
-/// for in-place PE Import Directory rewriting.
+/// Maps an Xbox console-only DLL name to its same-length-or-shorter Windows / `x2w.dll`
+/// companion runtime DLL name for in-place PE Import Directory rewriting.
+///
+/// `x2w.dll` (7 bytes) is shorter than every Xbox console DLL so every console-only import
+/// table entry can be patched cleanly in-place and resolved by the Windows PE loader once
+/// `x2w.dll` is placed next to the converted `.exe`.
 pub fn mapped_windows_dll(xbox_dll: &str) -> Option<&'static str> {
     match xbox_dll.to_ascii_lowercase().as_str() {
-        "d3d12_xs.dll" | "d3d12_x.dll" => Some("d3d12.dll"),
+        "d3d12_xs.dll" | "d3d12_x.dll" => Some("x2w.dll"),
+        "dstorage_xs.dll" | "dstorage.dll" => Some("x2w.dll"),
+        "xg_xs.dll" | "xg_x.dll" => Some("x2w.dll"),
+        "xmem.dll" => Some("x2w.dll"),
+        "xgameplatform.dll" | "xgameruntime.dll" => Some("x2w.dll"),
+        "xapu.dll" | "acphal.dll" | "chad.dll" => Some("x2w.dll"),
+        "xcurl.dll" => Some("x2w.dll"),
         "d3d11_x.dll" => Some("d3d11.dll"),
         "kernelx.dll" => Some("kernel32.dll"),
-        "xg_xs.dll" | "xg_x.dll" => Some("xg_pc.dll"),
-        "xmem.dll" => Some("xmem.dll"),
-        "xgameplatform.dll" | "xgameruntime.dll" => Some("xgame_pc.dll"),
-        "xapu.dll" | "acphal.dll" | "chad.dll" => Some("xaudio2.dll"),
-        "xcurl.dll" => Some("winhttp.dll"),
         "xcrdapi.dll" => Some("advapi32.dll"),
         _ => None,
     }
@@ -393,7 +398,7 @@ mod tests {
 
         let converted = convert_xbox_pe_to_windows(&pe).unwrap();
         assert_eq!(u16::from_le_bytes([converted.windows_pe[opt + 68], converted.windows_pe[opt + 69]]), 2);
-        assert_eq!(converted.rewritten_dlls, vec![("d3d12_xs.dll".into(), "d3d12.dll".into())]);
-        assert!(converted.windows_pe[0x280..0x28A] == *b"d3d12.dll\0");
+        assert_eq!(converted.rewritten_dlls, vec![("d3d12_xs.dll".into(), "x2w.dll".into())]);
+        assert!(converted.windows_pe[0x280..0x288] == *b"x2w.dll\0");
     }
 }

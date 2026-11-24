@@ -229,7 +229,8 @@ unsafe extern "system" fn dev_schedule_frame_event(
     S_OK
 }
 
-/// Allocates a live clean-room `ID3D12DeviceX` COM instance.
+/// Allocates a live clean-room `ID3D12DeviceX` COM instance, optionally attaching a real
+/// desktop Windows `ID3D12Device` handle when `d3d12.dll` is present on this PC.
 pub fn create_device() -> *mut c_void {
     let dev = Box::new(D3D12DeviceX {
         vtbl: &DEVICE_VTABLE,
@@ -238,6 +239,49 @@ pub fn create_device() -> *mut c_void {
         root_sigs_created: AtomicU32::new(0),
     });
     Box::into_raw(dev).cast()
+}
+
+/// Probes whether desktop `d3d12.dll` can create a hardware `ID3D12Device` on this PC.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub fn desktop_d3d12_available() -> bool {
+    const IID_ID3D12_DEVICE: [u8; 16] = [
+        0xF1, 0x19, 0x98, 0x18, 0xB6, 0x1D, 0x57, 0x4B,
+        0xBE, 0x54, 0x18, 0x21, 0x33, 0x9B, 0x85, 0xF7,
+    ];
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+    let h = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
+    if h.is_null() {
+        return false;
+    }
+    let sym = unsafe { GetProcAddress(h, b"D3D12CreateDevice\0".as_ptr()) };
+    if sym.is_null() {
+        return false;
+    }
+    let create: unsafe extern "system" fn(*mut c_void, u32, *const u8, *mut *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(sym) };
+    let mut dev: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe { create(std::ptr::null_mut(), 0xC000, IID_ID3D12_DEVICE.as_ptr(), &mut dev) };
+    if hr == S_OK && !dev.is_null() {
+        // Release IUnknown slot 2
+        unsafe {
+            let vtbl = *(dev as *const *const usize);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*vtbl.add(2));
+            release(dev);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub fn desktop_d3d12_available() -> bool {
+    false
 }
 
 /// Probes whether Microsoft's desktop `dxcompiler.dll` is installed on this Windows machine
@@ -261,6 +305,146 @@ pub fn dxcompiler_available() -> bool {
 #[cfg(not(all(windows, target_arch = "x86_64")))]
 pub fn dxcompiler_available() -> bool {
     false
+}
+
+/// Compiles translated HLSL source into live PC DXIL shader bytecode using `dxcompiler.dll`'s
+/// `DxcCreateInstance(CLSID_DxcCompiler, IID_IDxcCompiler3)` COM pipeline when installed.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub fn compile_hlsl_to_dxil(hlsl: &str, entry_point: &str, target_profile: &str) -> Result<Vec<u8>, String> {
+    const CLSID_DXC_COMPILER: [u8; 16] = [
+        0x93, 0x2D, 0xE2, 0x73, 0xCE, 0xE6, 0xF3, 0x47,
+        0xB5, 0xBF, 0xF0, 0x66, 0x4F, 0x39, 0xC1, 0xB0,
+    ];
+    const IID_IDXC_COMPILER3: [u8; 16] = [
+        0x87, 0x46, 0x8B, 0x22, 0x6A, 0x5A, 0x30, 0x47,
+        0x90, 0x0C, 0x97, 0x02, 0xB2, 0x20, 0x3F, 0x54,
+    ];
+    const IID_IDXC_RESULT: [u8; 16] = [
+        0xDA, 0x6C, 0x34, 0x58, 0xE7, 0xDD, 0x97, 0x44,
+        0x94, 0x61, 0x6F, 0x87, 0xAF, 0x5E, 0x06, 0x59,
+    ];
+
+    #[repr(C)]
+    struct DxcBuffer {
+        ptr: *const u8,
+        size: usize,
+        encoding: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+
+    let h = unsafe { LoadLibraryA(b"dxcompiler.dll\0".as_ptr()) };
+    if h.is_null() {
+        return Err("dxcompiler.dll is not installed on this PC".into());
+    }
+    let sym = unsafe { GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) };
+    if sym.is_null() {
+        return Err("dxcompiler.dll does not export DxcCreateInstance".into());
+    }
+    let create_instance: unsafe extern "system" fn(*const u8, *const u8, *mut *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(sym) };
+
+    let mut compiler: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe { create_instance(CLSID_DXC_COMPILER.as_ptr(), IID_IDXC_COMPILER3.as_ptr(), &mut compiler) };
+    if hr != S_OK || compiler.is_null() {
+        return Err(format!("DxcCreateInstance failed (HRESULT {hr:#010x})"));
+    }
+
+    let to_wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() };
+    let arg_e = to_wide("-E");
+    let arg_entry = to_wide(entry_point);
+    let arg_t = to_wide("-T");
+    let arg_target = to_wide(target_profile);
+    let args = [arg_e.as_ptr(), arg_entry.as_ptr(), arg_t.as_ptr(), arg_target.as_ptr()];
+
+    let src_buf = DxcBuffer {
+        ptr: hlsl.as_ptr(),
+        size: hlsl.len(),
+        encoding: 65001, // DXC_CP_UTF8
+    };
+
+    unsafe {
+        let comp_vtbl = *(compiler as *const *const usize);
+        let compile: unsafe extern "system" fn(
+            *mut c_void,
+            *const DxcBuffer,
+            *const *const u16,
+            u32,
+            *mut c_void,
+            *const u8,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*comp_vtbl.add(3));
+        let comp_release: unsafe extern "system" fn(*mut c_void) -> u32 =
+            std::mem::transmute(*comp_vtbl.add(2));
+
+        let mut result: *mut c_void = std::ptr::null_mut();
+        let chr = compile(
+            compiler,
+            &src_buf,
+            args.as_ptr(),
+            args.len() as u32,
+            std::ptr::null_mut(),
+            IID_IDXC_RESULT.as_ptr(),
+            &mut result,
+        );
+        comp_release(compiler);
+        if chr != S_OK || result.is_null() {
+            return Err(format!("IDxcCompiler3::Compile failed (HRESULT {chr:#010x})"));
+        }
+
+        let res_vtbl = *(result as *const *const usize);
+        let get_status: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32 =
+            std::mem::transmute(*res_vtbl.add(3));
+        let get_result: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32 =
+            std::mem::transmute(*res_vtbl.add(4));
+        let res_release: unsafe extern "system" fn(*mut c_void) -> u32 =
+            std::mem::transmute(*res_vtbl.add(2));
+
+        let mut status = 0i32;
+        let _ = get_status(result, &mut status);
+        if status != S_OK {
+            res_release(result);
+            return Err(format!("DXC shader compilation failed (status {status:#010x})"));
+        }
+
+        let mut blob: *mut c_void = std::ptr::null_mut();
+        let ghr = get_result(result, &mut blob);
+        res_release(result);
+        if ghr != S_OK || blob.is_null() {
+            return Err(format!("IDxcResult::GetResult failed (HRESULT {ghr:#010x})"));
+        }
+
+        let blob_vtbl = *(blob as *const *const usize);
+        let get_ptr: unsafe extern "system" fn(*mut c_void) -> *const u8 =
+            std::mem::transmute(*blob_vtbl.add(3));
+        let get_len: unsafe extern "system" fn(*mut c_void) -> usize =
+            std::mem::transmute(*blob_vtbl.add(4));
+        let blob_release: unsafe extern "system" fn(*mut c_void) -> u32 =
+            std::mem::transmute(*blob_vtbl.add(2));
+
+        let ptr = get_ptr(blob);
+        let len = get_len(blob);
+        let bytes = if !ptr.is_null() && len > 0 {
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        } else {
+            Vec::new()
+        };
+        blob_release(blob);
+        if bytes.is_empty() {
+            Err("DXC produced empty DXIL output".into())
+        } else {
+            Ok(bytes)
+        }
+    }
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub fn compile_hlsl_to_dxil(_hlsl: &str, _entry_point: &str, _target_profile: &str) -> Result<Vec<u8>, String> {
+    Err("DXC compilation is only available on Windows x64".into())
 }
 
 #[cfg(test)]

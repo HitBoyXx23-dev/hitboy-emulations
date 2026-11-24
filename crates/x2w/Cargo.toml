@@ -1,0 +1,12 @@
+[package]
+name = "x2w"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room Xbox One / Series X|S native Windows runtime DLL (x2w.dll) for converted .exe titles"
+
+[lib]
+name = "x2w"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+xboxone = { path = "../xboxone" }

@@ -1,4 +1,4 @@
-﻿# Builds the three apps in release mode and packages them:
+# Builds the three apps in release mode and packages them:
 #   dist\<Brand> Emulations\<Brand> Emulations.exe
 #   dist\<Brand>-Emulations-Windows.zip
 #   websites\<brand>\  (download site with the zip inside)
@@ -55,13 +55,19 @@ foreach ($b in $brands) {
     if ($null -eq $dsig.SignerCertificate) { throw "signing $dumpPath failed: $($dsig.StatusMessage)" }
     Copy-Item "crates\gamedump\src\guide.txt" (Join-Path $appDir "Get Your Games.txt") -Force
 
+    # Native Xbox-to-Windows companion runtime DLL (x2w.dll) placed beside converted .exe files
+    $x2wPath = Join-Path $appDir "x2w.dll"
+    Copy-Item "target\release\x2w.dll" $x2wPath -Force
+    $xsig = Set-AuthenticodeSignature -FilePath $x2wPath -Certificate (Get-SigningCert $b.publisher) -HashAlgorithm SHA256
+    if ($null -eq $xsig.SignerCertificate) { throw "signing $x2wPath failed: $($xsig.StatusMessage)" }
+
     $zip = "dist\$safe-Windows.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }
     $stage = Join-Path ([IO.Path]::GetTempPath()) ("stage-" + $b.id + "-" + $PID)
     if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
     $stageInner = Join-Path $stage $full
     New-Item -ItemType Directory -Force $stageInner | Out-Null
-    Copy-Item $exePath, $dumpPath, (Join-Path $appDir "Get Your Games.txt") $stageInner -Force
+    Copy-Item $exePath, $dumpPath, $x2wPath, (Join-Path $appDir "Get Your Games.txt") $stageInner -Force
     Compress-Archive -Path $stageInner -DestinationPath $zip
     Remove-Item $stage -Recurse -Force
 

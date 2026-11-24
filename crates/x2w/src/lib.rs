@@ -1,0 +1,620 @@
+//! Clean-room Xbox-to-Windows Native Runtime Companion DLL (`x2w.dll`).
+//!
+//! When an Xbox One / Series X|S PE64 executable is statically converted into a native Windows
+//! `.exe` by `xboxone::exe_convert`, console-only DLL imports (`d3d12_xs.dll`, `dstorage_xs.dll`,
+//! `xgameruntime.dll`, `xgameplatform.dll`, `xg_xs.dll`, `xmem.dll`, `acphal.dll`, `xapu.dll`,
+//! `xcurl.dll`) are rewritten in-place to `x2w.dll`.
+//!
+//! Dropping `x2w.dll` beside the converted `.exe` allows the Windows PE loader to resolve those
+//! Xbox console exports directly to our clean-room implementations without missing-DLL errors.
+
+#![allow(non_snake_case)]
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod exports {
+    use std::ffi::c_void;
+    use xboxone::shims;
+
+    // ---- Runtime & Diagnostics ----
+
+    #[no_mangle]
+    pub extern "system" fn XGameRuntimeInitialize(package: u64, features: u64) -> i32 {
+        shims::XGameRuntimeInitialize(package, features)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameRuntimeUninitialize() -> i32 {
+        shims::XGameRuntimeUninitialize()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XErrorReport(error: u32, message: u64) -> i32 {
+        shims::XErrorReport(error, message)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameRuntimePrint(mask: u64, format: u64, args: u64) -> u32 {
+        shims::XGameRuntimePrint(mask, format, args)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameRuntimeSleep(ticks: u64) {
+        shims::XGameRuntimeSleep(ticks)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameFeatureInitialize() -> i32 {
+        shims::XGameFeatureInitialize()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameRuntimeIsFeatureAvailable(feature: u32) -> bool {
+        shims::XGameRuntimeIsFeatureAvailable(feature)
+    }
+
+    // ---- Memory (XDK / GDK / Era Virtual & Physical Allocators) ----
+
+    #[no_mangle]
+    pub extern "system" fn XMemVirtualAlloc(
+        address: usize,
+        size: usize,
+        flags: u32,
+        attributes: u64,
+        protection: u32,
+    ) -> *mut c_void {
+        shims::XMemVirtualAlloc(address, size, flags, attributes, protection)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
+        shims::XMemAlloc(size, attributes)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+        shims::XMemAllocDefault(size, attributes)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemFree(ptr: *mut c_void, attributes: u64) {
+        shims::XMemFree(ptr, attributes)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemFreeDefault(ptr: *mut c_void, attributes: u64) {
+        shims::XMemFreeDefault(ptr, attributes)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemSize(ptr: *mut c_void, attributes: u64) -> usize {
+        shims::XMemSize(ptr, attributes)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemSizeDefault(ptr: *mut c_void, attributes: u64) -> usize {
+        shims::XMemSizeDefault(ptr, attributes)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn TitleMemoryStatus(out: u64) -> i32 {
+        shims::TitleMemoryStatus(out)
+    }
+
+    // ---- Direct3D 12.X / 12.XS & XG Graphics Bridge ----
+
+    #[no_mangle]
+    pub extern "system" fn D3D12XBOX_CreateDevice(params: u64, riid: u64, pp_device: u64) -> i32 {
+        shims::D3D12XBOX_CreateDevice(params, riid, pp_device)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn D3D12CreateDevice(
+        adapter: *mut c_void,
+        min_feature_level: u32,
+        riid: u64,
+        pp_device: u64,
+    ) -> i32 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
+        if !d3d12.is_null() {
+            let sym = unsafe { GetProcAddress(d3d12, b"D3D12CreateDevice\0".as_ptr()) };
+            if !sym.is_null() {
+                let func: extern "system" fn(*mut c_void, u32, u64, u64) -> i32 =
+                    unsafe { std::mem::transmute(sym) };
+                let hr = func(adapter, min_feature_level, riid, pp_device);
+                if hr == shims::S_OK {
+                    return hr;
+                }
+            }
+        }
+        shims::D3D12XBOX_CreateDevice(0, riid, pp_device)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn D3D12SerializeRootSignature(
+        desc: u64,
+        version: u32,
+        out_blob: u64,
+        out_err: u64,
+    ) -> i32 {
+        shims::D3D12SerializeRootSignatureX(desc, version, out_blob, out_err)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn D3D12GetDebugInterface(riid: u64, out_debug: u64) -> i32 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
+        if !d3d12.is_null() {
+            let sym = unsafe { GetProcAddress(d3d12, b"D3D12GetDebugInterface\0".as_ptr()) };
+            if !sym.is_null() {
+                let func: extern "system" fn(u64, u64) -> i32 = unsafe { std::mem::transmute(sym) };
+                return func(riid, out_debug);
+            }
+        }
+        shims::E_FAIL
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDeviceCreate(params: u64, out_device: u64) -> i32 {
+        shims::XDeviceCreate(params, out_device)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGComputeOptimalTileMode(
+        dim: u32,
+        fmt: u32,
+        w: u32,
+        h: u32,
+        d: u32,
+        bind: u32,
+    ) -> u32 {
+        shims::XGComputeOptimalTileMode(dim, fmt, w, h, d, bind)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn SetFrameIntervalX(device: u64, interval: u32, period: u32, flags: u32) -> i32 {
+        shims::SetFrameIntervalX(device, interval, period, flags)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn ScheduleFrameEventX(device: u64, event: u32, offset: u32, handle: u64, flags: u32) -> i32 {
+        shims::ScheduleFrameEventX(device, event, offset, handle, flags)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn WaitFrameEventX(device: u64, timeout_ms: u32, out_token: u64) -> i32 {
+        shims::WaitFrameEventX(device, timeout_ms, out_token)
+    }
+
+    // ---- DirectStorage (dstorage_xs.dll) ----
+
+    #[no_mangle]
+    pub extern "system" fn DStorageGetFactory(riid: u64, out_factory: u64) -> i32 {
+        shims::DStorageGetFactory(riid, out_factory)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn DStorageSetConfiguration(config: u64) -> i32 {
+        shims::DStorageSetConfiguration(config)
+    }
+
+    // ---- APU / ACP Hardware Audio & XAudio2 ----
+
+    #[no_mangle]
+    pub extern "system" fn ApuAlloc(out_va: u64, out_pa: u64, size: u32, align: u32) -> i32 {
+        shims::ApuAlloc(out_va, out_pa, size, align)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn ApuFree(va: u64) -> i32 {
+        shims::ApuFree(va)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn AcpHalCreate(out_hal: u64) -> i32 {
+        shims::AcpHalCreate(out_hal)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn AcpHalAllocateShapeContexts(ctx: u64) -> i32 {
+        shims::AcpHalAllocateShapeContexts(ctx)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn AcpHalReleaseShapeContexts() -> i32 {
+        shims::AcpHalReleaseShapeContexts()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XAudio2Create(out_xa2: u64, flags: u32, processor: u32) -> i32 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let xa = unsafe { LoadLibraryA(b"xaudio2_9.dll\0".as_ptr()) };
+        if !xa.is_null() {
+            let sym = unsafe { GetProcAddress(xa, b"XAudio2Create\0".as_ptr()) };
+            if !sym.is_null() {
+                let func: extern "system" fn(u64, u32, u32) -> i32 = unsafe { std::mem::transmute(sym) };
+                return func(out_xa2, flags, processor);
+            }
+        }
+        shims::E_FAIL
+    }
+
+    // ---- XSystem / XUser / XTaskQueue / XAsync / XGameSave / XStore / XNetworking ----
+
+    #[no_mangle]
+    pub extern "system" fn XSystemGetXboxLiveSandboxId(out: u64) -> i32 {
+        shims::XSystemGetXboxLiveSandboxId(out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameRuntimeGetXboxLiveSandboxId(out: u64) -> i32 {
+        shims::XGameRuntimeGetXboxLiveSandboxId(out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XSystemGetDeviceType() -> u32 {
+        shims::XSystemGetDeviceType()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XSystemGetConsoleId(cap: usize, buf: u64, used: u64) -> i32 {
+        shims::XSystemGetConsoleId(cap, buf, used)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XSystemGetAppSpecificDeviceId(cap: usize, buf: u64, used: u64) -> i32 {
+        shims::XSystemGetAppSpecificDeviceId(cap, buf, used)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XSystemIsHandleValid(handle: u64) -> bool {
+        shims::XSystemIsHandleValid(handle)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameGetXboxTitleId(out: u64) -> i32 {
+        shims::XGameGetXboxTitleId(out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XPackageGetCurrentProcessPackageIdentifier(cap: usize, buf: u64) -> i32 {
+        shims::XPackageGetCurrentProcessPackageIdentifier(cap, buf)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDisplayTryAcquireTimeoutStatus() -> u32 {
+        shims::XDisplayTryAcquireTimeoutStatus()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDisplayAcquireTimeoutDeferral(out: u64) -> i32 {
+        shims::XDisplayAcquireTimeoutDeferral(out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDisplayCloseTimeoutDeferralHandle(handle: u64) {
+        shims::XDisplayCloseTimeoutDeferralHandle(handle)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDisplayGetHdrMode() -> u32 {
+        shims::XDisplayGetHdrMode()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XThreadAssertNotTimeSensitive() {
+        shims::XThreadAssertNotTimeSensitive()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XThreadIsTimeSensitive() -> bool {
+        shims::XThreadIsTimeSensitive()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XThreadSetTimeSensitive(ts: bool) -> i32 {
+        shims::XThreadSetTimeSensitive(ts)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserGetGamertag(handle: u64, buffer: u64, cap: u32) -> i32 {
+        shims::XUserGetGamertag(handle, buffer, cap)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserGetId(user: u64, out: u64) -> i32 {
+        shims::XUserGetId(user, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserGetState(user: u64, out: u64) -> i32 {
+        shims::XUserGetState(user, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserGetAgeGroup(user: u64, out: u64) -> i32 {
+        shims::XUserGetAgeGroup(user, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserCheckPrivilege(user: u64, options: u32, privilege: u32, has: u64, reason: u64) -> i32 {
+        shims::XUserCheckPrivilege(user, options, privilege, has, reason)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserCloseHandle(user: u64) {
+        shims::XUserCloseHandle(user)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserAddAsync(options: u32, async_block: u64) -> i32 {
+        shims::XUserAddAsync(options, async_block)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserAddResult(async_block: u64, out_user: u64) -> i32 {
+        shims::XUserAddResult(async_block, out_user)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserGetLocale(cap: usize, buf: u64, used: u64) -> i32 {
+        shims::XUserGetLocale(cap, buf, used)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserRegisterForChangeEvent(queue: u64, ctx: u64, cb: u64, out_token: u64) -> i32 {
+        shims::XUserRegisterForChangeEvent(queue, ctx, cb, out_token)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserUnregisterForChangeEvent(token: u64, wait: bool) -> bool {
+        shims::XUserUnregisterForChangeEvent(token, wait)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserDuplicateHandle(handle: u64, out: u64) -> i32 {
+        shims::XUserDuplicateHandle(handle, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XUserGetLocalId(user: u64, out: u64) -> i32 {
+        shims::XUserGetLocalId(user, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XAsyncGetStatus(async_block: u64, wait: bool) -> i32 {
+        shims::XAsyncGetStatus(async_block, wait)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XAsyncGetResultSize(async_block: u64, out_size: u64) -> i32 {
+        shims::XAsyncGetResultSize(async_block, out_size)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XAsyncCancel(async_block: u64) {
+        shims::XAsyncCancel(async_block)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XTaskQueueCreate(work: u32, comp: u32, out: u64) -> i32 {
+        shims::XTaskQueueCreate(work, comp, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XTaskQueueCloseHandle(queue: u64) {
+        shims::XTaskQueueCloseHandle(queue)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XTaskQueueGetCurrentProcessTaskQueue(out: u64) -> bool {
+        shims::XTaskQueueGetCurrentProcessTaskQueue(out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XTaskQueueSubmitCallback(queue: u64, port: u32, ctx: u64, cb: u64) -> i32 {
+        shims::XTaskQueueSubmitCallback(queue, port, ctx, cb)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XTaskQueueDispatch(queue: u64, port: u32, timeout_ms: u32) -> bool {
+        shims::XTaskQueueDispatch(queue, port, timeout_ms)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XStorageCreateHandle(user: u64, name: u64, options: u64, out: u64) -> i32 {
+        shims::XStorageCreateHandle(user, name, options, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveInitializeProvider(user: u64, scid: u64, sync: bool, out: u64) -> i32 {
+        shims::XGameSaveInitializeProvider(user, scid, sync, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveCloseProvider(provider: u64) {
+        shims::XGameSaveCloseProvider(provider)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveGetRemainingQuota(provider: u64, out_quota: u64) -> i32 {
+        shims::XGameSaveGetRemainingQuota(provider, out_quota)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveCreateContainer(provider: u64, name: u64, out: u64) -> i32 {
+        shims::XGameSaveCreateContainer(provider, name, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveCloseContainer(container: u64) {
+        shims::XGameSaveCloseContainer(container)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveCreateUpdate(container: u64, display: u64, out: u64) -> i32 {
+        shims::XGameSaveCreateUpdate(container, display, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveSubmitBlobWrite(update: u64, name: u64, data: u64, size: usize) -> i32 {
+        shims::XGameSaveSubmitBlobWrite(update, name, data, size)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveSubmitUpdate(update: u64) -> i32 {
+        shims::XGameSaveSubmitUpdate(update)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveCloseUpdate(update: u64) {
+        shims::XGameSaveCloseUpdate(update)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveReadBlobData(
+        container: u64,
+        name: u64,
+        buf: u64,
+        size: usize,
+        written: u64,
+    ) -> i32 {
+        shims::XGameSaveReadBlobData(container, name, buf, size, written)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveSubmitBlobDelete(update: u64, name: u64) -> i32 {
+        shims::XGameSaveSubmitBlobDelete(update, name)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameSaveDeleteContainer(provider: u64, name: u64) -> i32 {
+        shims::XGameSaveDeleteContainer(provider, name)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XStoreCreateContext(user: u64, out: u64) -> i32 {
+        shims::XStoreCreateContext(user, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XStoreCloseContextHandle(ctx: u64) {
+        shims::XStoreCloseContextHandle(ctx)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XStoreIsAvailabilityPurchasable(availability: u64) -> bool {
+        shims::XStoreIsAvailabilityPurchasable(availability)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XStoreAcquireLicenseForPackageSync(ctx: u64, pkg: u64, out: u64) -> i32 {
+        shims::XStoreAcquireLicenseForPackageSync(ctx, pkg, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameUiShowMessageDialogAsync(
+        async_block: u64,
+        title: u64,
+        content: u64,
+        b1: u64,
+        b2: u64,
+        b3: u64,
+        def_b: u32,
+        cancel_b: u32,
+    ) -> i32 {
+        shims::XGameUiShowMessageDialogAsync(async_block, title, content, b1, b2, b3, def_b, cancel_b)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGameUiShowMessageDialogResult(async_block: u64, out_btn: u64) -> i32 {
+        shims::XGameUiShowMessageDialogResult(async_block, out_btn)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XLaunchNewGame(exe: u64, args: u64, user: u64) {
+        shims::XLaunchNewGame(exe, args, user)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XNetworkingGetConnectivityHint(out: u64) -> i32 {
+        shims::XNetworkingGetConnectivityHint(out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XNetworkingRegisterConnectivityHintChanged(
+        queue: u64,
+        ctx: u64,
+        cb: u64,
+        out_token: u64,
+    ) -> i32 {
+        shims::XNetworkingRegisterConnectivityHintChanged(queue, ctx, cb, out_token)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XNetworkingUnregisterConnectivityHintChanged(token: u64, wait: bool) -> bool {
+        shims::XNetworkingUnregisterConnectivityHintChanged(token, wait)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XcurlInitialize() -> i32 {
+        shims::XcurlInitialize()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XcurlUninitialize() -> i32 {
+        shims::XcurlUninitialize()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn BinkOpen(name: u64, flags: u32) -> u64 {
+        shims::BinkOpen(name, flags)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn BinkDoFrame(bink: u64) -> i32 {
+        shims::BinkDoFrame(bink)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn BinkClose(bink: u64) {
+        shims::BinkClose(bink)
+    }
+}
+
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod tests {
+    use super::exports::*;
+
+    #[test]
+    fn x2w_exports_initialize_directstorage_d3d12x_and_acp() {
+        assert_eq!(XGameRuntimeInitialize(0, 0), 0);
+        assert_eq!(XSystemGetDeviceType(), 7);
+
+        let mut fac = 0u64;
+        assert_eq!(DStorageGetFactory(0, &mut fac as *mut u64 as u64), 0);
+        assert_ne!(fac, 0);
+
+        let mut dev = 0u64;
+        assert_eq!(D3D12XBOX_CreateDevice(0, 0, &mut dev as *mut u64 as u64), 0);
+        assert_ne!(dev, 0);
+
+        let mut hal = 0u64;
+        assert_eq!(AcpHalCreate(&mut hal as *mut u64 as u64), 0);
+        assert_ne!(hal, 0);
+
+        assert_eq!(XGameRuntimeUninitialize(), 0);
+    }
+}

@@ -1,4 +1,4 @@
-﻿//! Main window: Games, Virtual Machines and Settings, plus the game player.
+//! Main window: Games, Virtual Machines and Settings, plus the game player.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -521,7 +521,7 @@ impl App {
                     let diagram_rect = ui.allocate_exact_size(Vec2::new(ui.available_width(), controls::diagram_height(&layout, ui.available_width())), Sense::hover()).0;
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Press any bound key or controller button to test it â€” it lights up above.").size(12.0).color(t().muted));
+                        ui.label(RichText::new("Press any bound key or controller button to test it — it lights up above.").size(12.0).color(t().muted));
                         if !layout.note.is_empty() {
                             ui.label(RichText::new(layout.note).size(12.0).color(t().muted));
                         }
@@ -1064,7 +1064,7 @@ impl App {
                                 open_controls = Some((s.path.clone(), s.title.clone()));
                             }
                             // Save states: nine slots per game.
-                            let states = icon_button(ui, Icon::Disk, "States", false).on_hover_text(format!("Save {} Â· Load {} Â· Next slot {} Â· Rewind (hold) {}", self.settings.keys.save_state, self.settings.keys.load_state, self.settings.keys.next_slot, self.settings.keys.rewind));
+                            let states = icon_button(ui, Icon::Disk, "States", false).on_hover_text(format!("Save {} · Load {} · Next slot {} · Rewind (hold) {}", self.settings.keys.save_state, self.settings.keys.load_state, self.settings.keys.next_slot, self.settings.keys.rewind));
                             let pop = ui.make_persistent_id("states_menu");
                             if states.clicked() {
                                 ui.memory_mut(|m| m.toggle_popup(pop));
@@ -1537,7 +1537,7 @@ impl App {
                     if icon_button(ui, Icon::Reset, "Refresh", false).clicked() {
                         self.rescan();
                     }
-                    if ["ps1", "gc", "wii", "ps2"].contains(&c.id) && icon_button(ui, Icon::Disk, "Convert discâ€¦", false).on_hover_text("ZIP/7Z with BIN/CUE â†’ ISO, BIN/CUE â†” ISO, merge multi-file CUE sheets").clicked() {
+                    if ["ps1", "gc", "wii", "ps2"].contains(&c.id) && icon_button(ui, Icon::Disk, "Convert disc…", false).on_hover_text("ZIP/7Z with BIN/CUE → ISO, BIN/CUE ↔ ISO, merge multi-file CUE sheets").clicked() {
                         if let Some(f) = rfd::FileDialog::new().set_title("Disc image to convert").add_filter("Disc images and archives", &["zip", "7z", "rar", "cue", "iso"]).pick_file() {
                             let options = crate::tools::Conversion::for_input(&f);
                             if !options.is_empty() {
@@ -1602,7 +1602,7 @@ impl App {
                                 to_launch = Some((g.path.clone(), gc.id));
                                 ui.close_menu();
                             }
-                            if matches!(gc.status, Status::Playable | Status::Experimental) && ui.button("Controlsâ€¦").clicked() {
+                            if matches!(gc.status, Status::Playable | Status::Experimental) && ui.button("Controls…").clicked() {
                                 open_controls = Some((g.path.clone(), g.title.clone(), g.console));
                                 ui.close_menu();
                             }
@@ -2044,7 +2044,7 @@ impl App {
             ui.horizontal(|ui| {
                 if loading {
                     ui.spinner();
-                    ui.label(RichText::new("Loading free games from itch.ioâ€¦").color(t().muted));
+                    ui.label(RichText::new("Loading free games from itch.io…").color(t().muted));
                 } else {
                     ui.label(RichText::new("No console homebrew listed right now. Try again later.").color(t().muted));
                 }
@@ -2230,8 +2230,8 @@ impl App {
                 child.add_space(2.0);
                 child.add(egui::Label::new(RichText::new(&f.title).size(24.0).family(egui::FontFamily::Name("heading".into())).color(t().text)).truncate());
                 let meta = match f.year {
-                    Some(y) => format!("{}  Â·  {}  Â·  {y}", f.developer, f.platform_name()),
-                    None => format!("{}  Â·  {}", f.developer, f.platform_name()),
+                    Some(y) => format!("{}  ·  {}  ·  {y}", f.developer, f.platform_name()),
+                    None => format!("{}  ·  {}", f.developer, f.platform_name()),
                 };
                 child.label(RichText::new(meta).color(t().muted));
                 child.add_space(8.0);
@@ -2305,7 +2305,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.add(egui::Label::new(RichText::new(&e.title).size(14.0).color(t().text)).truncate()).on_hover_text(&e.title);
                     let meta = match e.year {
-                        Some(y) => format!("{}  Â·  {y}", e.developer),
+                        Some(y) => format!("{}  ·  {y}", e.developer),
                         None => e.developer.clone(),
                     };
                     ui.add(egui::Label::new(RichText::new(meta).size(11.5).color(t().muted)).truncate());
@@ -2451,7 +2451,7 @@ impl App {
                                         match run_res {
                                             Ok(rep) => {
                                                 body.push_str(&format!(
-                                                    "\n\nARM core execution ({}, entry {:#010X}): ran {} instructions â€” {}.",
+                                                    "\n\nARM core execution ({}, entry {:#010X}): ran {} instructions — {}.",
                                                     rep.arch, rep.entry, rep.instructions, rep.stop_reason
                                                 ));
                                                 if !rep.stdout.is_empty() {
@@ -2736,7 +2736,7 @@ impl App {
                                                         meta.push(format!("ID {}", c.host_id));
                                                     }
                                                     if !meta.is_empty() {
-                                                        ui.label(RichText::new(meta.join("  â€¢  ")).size(12.0).color(t().muted));
+                                                        ui.label(RichText::new(meta.join("  •  ")).size(12.0).color(t().muted));
                                                     }
                                                 });
                                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3040,7 +3040,7 @@ impl App {
                             .gamepads()
                             .filter(|(_, p)| p.is_connected())
                             .enumerate()
-                            .map(|(i, (_, p))| format!("Player {} â€” {} ({} layout)", i + 1, p.name(), controls::detect(p.name(), p.vendor_id()).name()))
+                            .map(|(i, (_, p))| format!("Player {} — {} ({} layout)", i + 1, p.name(), controls::detect(p.name(), p.vendor_id()).name()))
                             .collect();
                         if pads.is_empty() {
                             ui.label(RichText::new("None detected. Plug in a controller or pair it over Bluetooth.").color(t().muted));
@@ -3122,7 +3122,7 @@ impl App {
                     ui.label(RichText::new("Draws fewer frames on slow PCs; the game itself still runs at full speed.").size(12.0).color(t().muted));
                     ui.checkbox(&mut self.settings.vsync, "VSync: match your monitor's refresh, no tearing (applies after restart)");
                     ui.checkbox(&mut self.settings.pause_unfocused, "Pause games when the window is in the background");
-                    ui.add(egui::Slider::new(&mut self.settings.fast_forward_speed, 2..=10).text("Fast-forward speed").suffix("Ã—"));
+                    ui.add(egui::Slider::new(&mut self.settings.fast_forward_speed, 2..=10).text("Fast-forward speed").suffix("×"));
                 });
 
                 section(ui, "BIOS files", "Some consoles start from their own BIOS or firmware. Add the files dumped from your consoles here; each console can have several (for example different regions) and you choose which one it uses.", |ui| {
@@ -3262,6 +3262,19 @@ impl App {
                                         if let Err(e) = std::fs::write(&out, &conv.windows_pe) {
                                             notice = Some(format!("Failed to write {}: {e}", out.display()));
                                         } else {
+                                            // Copy companion x2w.dll runtime beside the converted .exe when available
+                                            let mut runtime_note = "Companion x2w.dll not found beside emulator.".to_string();
+                                            if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().map(|d| d.to_path_buf())) {
+                                                if let Some(dir) = exe_dir {
+                                                    let dll_src = dir.join("x2w.dll");
+                                                    if dll_src.is_file() {
+                                                        let dll_dst = out.with_file_name("x2w.dll");
+                                                        if std::fs::copy(&dll_src, &dll_dst).is_ok() {
+                                                            runtime_note = format!("Copied runtime DLL: {}", dll_dst.display());
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let dlls = if conv.rewritten_dlls.is_empty() {
                                                 "none needed".to_string()
                                             } else {
@@ -3271,8 +3284,9 @@ impl App {
                                                 .set_level(rfd::MessageLevel::Info)
                                                 .set_title("Xbox -> Windows .exe Ready")
                                                 .set_description(format!(
-                                                    "Saved: {}\n\nRewritten Xbox DLLs: {}\nTotal imports: {} (Forwarded: {}, Shimmed: {}, Stubbed: {}, Missing: {})",
+                                                    "Saved: {}\n{}\n\nRewritten Xbox DLLs: {}\nTotal imports: {} (Forwarded: {}, Shimmed: {}, Stubbed: {}, Missing: {})",
                                                     out.display(),
+                                                    runtime_note,
                                                     dlls,
                                                     conv.coverage.total_imports,
                                                     conv.coverage.forwarded,
@@ -3451,7 +3465,7 @@ fn setup_card(
                     (true, _) => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(RichText::new("Verifying the download against the official checksumâ€¦").size(12.0).color(t().muted));
+                            ui.label(RichText::new("Verifying the download against the official checksum…").size(12.0).color(t().muted));
                         });
                     }
                     (false, DownloadView::Failed(e)) => {
@@ -3537,7 +3551,7 @@ fn setup_card(
                     });
                 });
                 ui.label(
-                    RichText::new("Guided installer. Choose the virtio disk (/dev/vda), a bootloader (systemd-boot works with UEFI), a profile (e.g. Desktop â€º KDE Plasma or GNOME) and NetworkManager.")
+                    RichText::new("Guided installer. Choose the virtio disk (/dev/vda), a bootloader (systemd-boot works with UEFI), a profile (e.g. Desktop › KDE Plasma or GNOME) and NetworkManager.")
                         .size(12.0)
                         .color(t().muted),
                 );
@@ -3637,7 +3651,7 @@ fn devices_hero(ui: &mut Ui, open_ios: &mut bool) -> Option<&'static vm::Preset>
                     egui::UiBuilder::new().max_rect(Rect::from_min_max(card.min + Vec2::new(20.0, 222.0), card.max - Vec2::new(20.0, 16.0))).layout(Layout::top_down(Align::Min)),
                 );
                 child.label(RichText::new(p.name).size(18.0).family(egui::FontFamily::Name("heading".into())).color(t().text));
-                child.label(RichText::new(format!("{} Ã— {} screen Â· {} GB RAM Â· {} GB storage", p.xres, p.yres, p.ram_mb / 1024, p.disk_gb)).size(12.0).color(t().muted));
+                child.label(RichText::new(format!("{} × {} screen · {} GB RAM · {} GB storage", p.xres, p.yres, p.ram_mb / 1024, p.disk_gb)).size(12.0).color(t().muted));
                 child.add_space(10.0);
                 let label = if landscape { "Create tablet" } else { "Create phone" };
                 if child.add_enabled(false, primary(egui::Button::new(RichText::new(label).strong().color(t().on_primary))).min_size(Vec2::new(150.0, 36.0))).clicked() {
@@ -3690,7 +3704,7 @@ fn device_preview(ui: &mut Ui, vm: &VmConfig, running: bool) {
             ui.vertical(|ui| {
                 ui.add_space(24.0);
                 ui.label(RichText::new(if landscape { "Android tablet" } else { "Android phone" }).size(17.0).color(t().text));
-                ui.label(RichText::new(format!("{} Ã— {} screen Â· {} MB RAM Â· {} cores", vm.xres, vm.yres, vm.ram_mb, vm.cpus)).size(12.5).color(t().muted));
+                ui.label(RichText::new(format!("{} × {} screen · {} MB RAM · {} cores", vm.xres, vm.yres, vm.ram_mb, vm.cpus)).size(12.5).color(t().muted));
                 ui.add_space(6.0);
                 if running {
                     pill(ui, "Running in its own window", t().ok, t().surface);
@@ -3754,10 +3768,10 @@ fn binding(k: &KeyBindings, field: &str) -> String {
 fn pretty_key(name: &str) -> String {
     match name {
         "" => "Unbound".into(),
-        "ArrowUp" => "â†‘  Up".into(),
-        "ArrowDown" => "â†“  Down".into(),
-        "ArrowLeft" => "â†  Left".into(),
-        "ArrowRight" => "â†’  Right".into(),
+        "ArrowUp" => "↑  Up".into(),
+        "ArrowDown" => "↓  Down".into(),
+        "ArrowLeft" => "←  Left".into(),
+        "ArrowRight" => "→  Right".into(),
         other => other.to_string(),
     }
 }
@@ -3776,7 +3790,7 @@ fn key_chip(ui: &mut Ui, rect: Rect, id: &str, value: &str, waiting: bool) -> Re
     };
     p.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), CornerRadius::same(7), Color32::from_black_alpha(110));
     p.rect(rect, CornerRadius::same(7), bg, stroke, egui::StrokeKind::Inside);
-    let text = if waiting { "Waitingâ€¦".to_string() } else if id.starts_with("pad:") { controls::glyph(controls::current(), value) } else { pretty_key(value) };
+    let text = if waiting { "Waiting…".to_string() } else if id.starts_with("pad:") { controls::glyph(controls::current(), value) } else { pretty_key(value) };
     p.text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.5), fg);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -4162,7 +4176,7 @@ fn game_tile(ui: &mut Ui, g: &GameEntry, console: &library::Console, playable: b
             let galley = p.layout(name.clone(), FontId::proportional(15.0), t().muted, W - 28.0);
             p.galley(egui::pos2(cover.left() + 14.0, cover.center().y + 6.0), galley, t().muted);
             if loading {
-                p.text(cover.left_bottom() + Vec2::new(14.0, -14.0), Align2::LEFT_BOTTOM, "Finding artworkâ€¦", FontId::proportional(11.0), t().muted);
+                p.text(cover.left_bottom() + Vec2::new(14.0, -14.0), Align2::LEFT_BOTTOM, "Finding artwork…", FontId::proportional(11.0), t().muted);
             }
         }
     }
@@ -4191,7 +4205,7 @@ fn game_tile(ui: &mut Ui, g: &GameEntry, console: &library::Console, playable: b
     // Name (ellipsized) and file size.
     let title_galley = p.layout(name.clone(), FontId::proportional(14.0), t().text, W);
     let first_line = title_galley.rows.first().map(|r| r.text()).unwrap_or_default();
-    let shown = if title_galley.rows.len() > 1 { format!("{}â€¦", first_line.trim_end()) } else { first_line };
+    let shown = if title_galley.rows.len() > 1 { format!("{}…", first_line.trim_end()) } else { first_line };
     p.text(egui::pos2(rect.left() + 1.0, cover.bottom() + 10.0), Align2::LEFT_TOP, shown, FontId::proportional(14.0), t().text);
     let meta = library::human_size(g.size);
     p.text(egui::pos2(rect.left() + 1.0, cover.bottom() + 31.0), Align2::LEFT_TOP, meta, FontId::proportional(11.5), t().muted);

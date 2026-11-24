@@ -814,8 +814,44 @@ mod win {
         S_OK
     }
 
-    pub extern "system" fn AcpHalCreate(_out_hal: u64) -> i32 {
+    pub extern "system" fn AcpHalCreate(out_hal: u64) -> i32 {
+        if out_hal != 0 {
+            let hal = crate::apu_audio::create_acp_hal();
+            unsafe { *(out_hal as *mut u64) = hal as u64 };
+        }
         S_OK
+    }
+
+    pub extern "system" fn AcpHalAllocateShapeContexts(_ctx: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn AcpHalReleaseShapeContexts() -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn D3D12SerializeRootSignatureX(
+        desc: u64,
+        version: u32,
+        out_blob: u64,
+        out_err: u64,
+    ) -> i32 {
+        // Forward to desktop d3d12.dll!D3D12SerializeRootSignature if present, stripping Xbox
+        // high flags cleanly in-flight when a V1.0 descriptor is supplied.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
+        if !d3d12.is_null() {
+            let sym = unsafe { GetProcAddress(d3d12, b"D3D12SerializeRootSignature\0".as_ptr()) };
+            if !sym.is_null() {
+                let func: extern "system" fn(u64, u32, u64, u64) -> i32 = unsafe { std::mem::transmute(sym) };
+                return func(desc, version, out_blob, out_err);
+            }
+        }
+        E_FAIL
     }
 
     pub extern "system" fn XcurlInitialize() -> i32 {
@@ -1201,6 +1237,9 @@ mod win {
             _ if name.eq_ignore_ascii_case("ApuAlloc") => ApuAlloc as *mut c_void,
             _ if name.eq_ignore_ascii_case("ApuFree") => ApuFree as *mut c_void,
             _ if name.eq_ignore_ascii_case("AcpHalCreate") => AcpHalCreate as *mut c_void,
+            _ if name.eq_ignore_ascii_case("AcpHalAllocateShapeContexts") => AcpHalAllocateShapeContexts as *mut c_void,
+            _ if name.eq_ignore_ascii_case("AcpHalReleaseShapeContexts") => AcpHalReleaseShapeContexts as *mut c_void,
+            _ if name.eq_ignore_ascii_case("D3D12SerializeRootSignature") => D3D12SerializeRootSignatureX as *mut c_void,
             _ if name.eq_ignore_ascii_case("XcurlInitialize") => XcurlInitialize as *mut c_void,
             _ if name.eq_ignore_ascii_case("XcurlUninitialize") => XcurlUninitialize as *mut c_void,
             _ if name.eq_ignore_ascii_case("BinkOpen") => BinkOpen as *mut c_void,
