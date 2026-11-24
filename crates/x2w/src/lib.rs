@@ -617,4 +617,174 @@ mod tests {
 
         assert_eq!(XGameRuntimeUninitialize(), 0);
     }
+
+    #[test]
+    fn converts_and_executes_clean_room_xbox_pe_natively_with_x2w_dll() {
+        // Locate freshly built x2w.dll next to the test runner or in target/{debug,release}
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let ws_root = manifest_dir.parent().unwrap().parent().unwrap();
+        let dll_src = [
+            ws_root.join("target").join("debug").join("x2w.dll"),
+            ws_root.join("target").join("release").join("x2w.dll"),
+        ]
+        .into_iter()
+        .find(|p| p.is_file());
+        let Some(dll_src) = dll_src else {
+            return; // skip if cdylib not yet built in this profile
+        };
+
+        // Synthesize a valid 64-bit Xbox Series X|S PE32+ executable (Subsystem = 14)
+        // importing xgameruntime.dll, dstorage_xs.dll, d3d12_xs.dll, acphal.dll, kernel32.dll
+        let mut pe = vec![0u8; 0xC00];
+        let w16 = |b: &mut [u8], off: usize, v: u16| b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+
+        pe[0..2].copy_from_slice(b"MZ");
+        w32(&mut pe, 0x3C, 0x80);
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        w16(&mut pe, 0x84, 0x8664); // AMD64
+        w16(&mut pe, 0x86, 2);      // 2 sections (.text, .rdata)
+        w16(&mut pe, 0x94, 0xF0);   // SizeOfOptionalHeader
+        w16(&mut pe, 0x96, 0x0022); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+        let opt = 0x98usize;
+        w16(&mut pe, opt, 0x20B);                 // PE32+
+        w32(&mut pe, opt + 16, 0x1000);           // AddressOfEntryPoint
+        w64(&mut pe, opt + 24, 0x0001_4000_0000); // ImageBase
+        w32(&mut pe, opt + 32, 0x1000);           // SectionAlignment
+        w32(&mut pe, opt + 36, 0x200);            // FileAlignment
+        w16(&mut pe, opt + 40, 6);                // MajorOSVersion
+        w16(&mut pe, opt + 48, 6);                // MajorSubsystemVersion
+        w32(&mut pe, opt + 56, 0x3000);           // SizeOfImage
+        w32(&mut pe, opt + 60, 0x200);            // SizeOfHeaders
+        w16(&mut pe, opt + 68, 14);               // IMAGE_SUBSYSTEM_XBOX
+        w16(&mut pe, opt + 70, 0x8160);           // DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT | TERMINAL_SERVER_AWARE
+        w64(&mut pe, opt + 72, 0x100000);         // SizeOfStackReserve
+        w64(&mut pe, opt + 80, 0x1000);           // SizeOfStackCommit
+        w64(&mut pe, opt + 88, 0x100000);         // SizeOfHeapReserve
+        w64(&mut pe, opt + 96, 0x1000);           // SizeOfHeapCommit
+        w32(&mut pe, opt + 108, 16);              // NumberOfRvaAndSizes
+        // DataDirectory[1] = Import Directory at RVA 0x2000
+        w32(&mut pe, opt + 120, 0x2000);
+        w32(&mut pe, opt + 124, 120);
+
+        // Section 1: .text (RVA 0x1000, file 0x200, size 0x200)
+        let s1 = opt + 0xF0;
+        pe[s1..s1 + 5].copy_from_slice(b".text");
+        w32(&mut pe, s1 + 8, 0x200);
+        w32(&mut pe, s1 + 12, 0x1000);
+        w32(&mut pe, s1 + 16, 0x200);
+        w32(&mut pe, s1 + 20, 0x200);
+        w32(&mut pe, s1 + 36, 0x6000_0020);
+
+        // Section 2: .rdata (RVA 0x2000, file 0x400, size 0x800, RW for IAT fixups)
+        let s2 = s1 + 40;
+        pe[s2..s2 + 6].copy_from_slice(b".rdata");
+        w32(&mut pe, s2 + 8, 0x800);
+        w32(&mut pe, s2 + 12, 0x2000);
+        w32(&mut pe, s2 + 16, 0x800);
+        w32(&mut pe, s2 + 20, 0x400);
+        w32(&mut pe, s2 + 36, 0xC000_0040);
+
+        // Helper mapping .rdata RVA (0x2000..) -> file offset (0x400..)
+        let rdata_off = |rva: u32| -> usize { 0x400 + (rva - 0x2000) as usize };
+
+        // Write DLL names & Hint/Name entries in .rdata
+        let mut str_rva = 0x2300u32;
+        let mut put_cstr = |b: &mut [u8], s: &str| -> u32 {
+            let rva = str_rva;
+            let off = rdata_off(rva);
+            b[off..off + s.len()].copy_from_slice(s.as_bytes());
+            b[off + s.len()] = 0;
+            str_rva = (str_rva + s.len() as u32 + 2) & !1;
+            rva
+        };
+        let mut hn_rva = 0x2400u32;
+        let mut put_hn = |b: &mut [u8], name: &str| -> u64 {
+            let rva = hn_rva;
+            let off = rdata_off(rva);
+            b[off] = 0;
+            b[off + 1] = 0;
+            b[off + 2..off + 2 + name.len()].copy_from_slice(name.as_bytes());
+            b[off + 2 + name.len()] = 0;
+            hn_rva = (hn_rva + 2 + name.len() as u32 + 2) & !1;
+            rva as u64
+        };
+
+        let dll_xgr = put_cstr(&mut pe, "xgameruntime.dll");
+        let dll_ds = put_cstr(&mut pe, "dstorage_xs.dll");
+        let dll_d3d = put_cstr(&mut pe, "d3d12_xs.dll");
+        let dll_acp = put_cstr(&mut pe, "acphal.dll");
+        let dll_k32 = put_cstr(&mut pe, "kernel32.dll");
+
+        let hn_init = put_hn(&mut pe, "XGameRuntimeInitialize");
+        let hn_devtype = put_hn(&mut pe, "XSystemGetDeviceType");
+        let hn_ds = put_hn(&mut pe, "DStorageGetFactory");
+        let hn_d3d = put_hn(&mut pe, "D3D12XBOX_CreateDevice");
+        let hn_acp = put_hn(&mut pe, "AcpHalCreate");
+        let hn_exit = put_hn(&mut pe, "ExitProcess");
+
+        // Write 5 Import Descriptors at RVA 0x2000 (each 20 bytes)
+        let descs: [(u32, u32, u32, &[u64]); 5] = [
+            (0x2100, 0x2200, dll_xgr, &[hn_init, hn_devtype]),
+            (0x2118, 0x2218, dll_ds, &[hn_ds]),
+            (0x2128, 0x2228, dll_d3d, &[hn_d3d]),
+            (0x2138, 0x2238, dll_acp, &[hn_acp]),
+            (0x2148, 0x2248, dll_k32, &[hn_exit]),
+        ];
+        for (i, (ilt, iat, name_rva, thunks)) in descs.iter().enumerate() {
+            let d = rdata_off(0x2000 + (i as u32) * 20);
+            w32(&mut pe, d, *ilt);
+            w32(&mut pe, d + 12, *name_rva);
+            w32(&mut pe, d + 16, *iat);
+            for (j, &t) in thunks.iter().enumerate() {
+                w64(&mut pe, rdata_off(*ilt + (j as u32) * 8), t);
+                w64(&mut pe, rdata_off(*iat + (j as u32) * 8), t);
+            }
+        }
+
+        // Emit x86-64 entry point at RVA 0x1000 (file offset 0x200)
+        let mut code: Vec<u8> = Vec::new();
+        let emit_call_iat = |c: &mut Vec<u8>, iat_rva: u32| {
+            c.extend_from_slice(&[0xFF, 0x15]); // call [rip + disp32]
+            let next_rip = 0x1000u32 + c.len() as u32 + 4;
+            let disp = (iat_rva as i32) - (next_rip as i32);
+            c.extend_from_slice(&disp.to_le_bytes());
+        };
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+        // XGameRuntimeInitialize(0, 0)
+        code.extend_from_slice(&[0x31, 0xC9, 0x31, 0xD2]);
+        emit_call_iat(&mut code, 0x2200);
+        // DStorageGetFactory(0, &local)
+        code.extend_from_slice(&[0x31, 0xC9, 0x48, 0x8D, 0x54, 0x24, 0x20]);
+        emit_call_iat(&mut code, 0x2218);
+        // D3D12XBOX_CreateDevice(0, 0, &local)
+        code.extend_from_slice(&[0x31, 0xC9, 0x31, 0xD2, 0x4C, 0x8D, 0x44, 0x24, 0x20]);
+        emit_call_iat(&mut code, 0x2228);
+        // AcpHalCreate(&local)
+        code.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x24, 0x20]);
+        emit_call_iat(&mut code, 0x2238);
+        // eax = XSystemGetDeviceType() (7); ecx = eax * 6 (42); ExitProcess(42)
+        emit_call_iat(&mut code, 0x2208);
+        code.extend_from_slice(&[0x6B, 0xC8, 0x06]); // imul ecx, eax, 6
+        emit_call_iat(&mut code, 0x2248);
+        pe[0x200..0x200 + code.len()].copy_from_slice(&code);
+
+        // Convert Xbox PE -> Native Windows .exe
+        let converted = xboxone::exe_convert::convert_xbox_pe_to_windows(&pe).unwrap();
+        assert_eq!(converted.rewritten_dlls.len(), 4);
+
+        let dir = std::env::temp_dir().join(format!("x2w_native_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe_out = dir.join("xbox_series_x_test_windows.exe");
+        let dll_out = dir.join("x2w.dll");
+        std::fs::write(&exe_out, &converted.windows_pe).unwrap();
+        std::fs::copy(&dll_src, &dll_out).unwrap();
+
+        let status = std::process::Command::new(&exe_out).status().expect("spawn converted native .exe");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(status.code(), Some(42));
+    }
 }
