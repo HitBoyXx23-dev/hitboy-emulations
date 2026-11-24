@@ -5,17 +5,28 @@
 use crate::era_mem::{MemoryProtect, TitleAddressSpace, PAGE_SIZE_4K, PAGE_SIZE_64K};
 use crate::gpu_bridge::XboxFramebuffer;
 use crate::pe::Pe;
+use crate::shims::{XGAME_RUNTIME_DLL, XGAME_RUNTIME_EXPORTS};
 use std::collections::HashMap;
 
 const EXIT_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_0000;
 const THREAD_EXIT_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_0010;
+const TLS_RETURN_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_0020;
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+const MEM_RESERVE_PLACEHOLDER: u32 = 0x40000;
+const XMEM_PAGE_MODE_MASK: u32 = 0x2040_0000;
 const THUNK_BASE: u64 = 0xFFFF_FFFF_FFFE_0000;
 const THUNK_STRIDE: u64 = 8;
+const XGAME_RUNTIME_HANDLE: u64 = 0xFFFF_FFFF_FFFD_0000;
+const LAST_ERROR_OFFSET: u64 = 0x68;
 
 const RAX: usize = 0;
 const RCX: usize = 1;
 const RDX: usize = 2;
 const RSP: usize = 4;
+const RSI: usize = 6;
+const RDI: usize = 7;
 const R8: usize = 8;
 const R9: usize = 9;
 
@@ -23,6 +34,7 @@ const CF: u64 = 1 << 0;
 const PF: u64 = 1 << 2;
 const ZF: u64 = 1 << 6;
 const SF: u64 = 1 << 7;
+const DF: u64 = 1 << 10;
 const OF: u64 = 1 << 11;
 
 #[derive(Debug, Clone)]
@@ -59,6 +71,80 @@ struct GuestThread {
     teb_va: u64,
     finished: bool,
     exit_code: u32,
+    tls_startup: Option<TlsStartup>,
+}
+
+#[derive(Debug, Clone)]
+struct TlsStartup {
+    entry: u64,
+    stack: u64,
+    parameter: u64,
+    reason: u64,
+    next_callback: usize,
+}
+
+struct ImageTls {
+    image_base: u64,
+    template: Vec<u8>,
+    size: u64,
+    callbacks: Vec<u64>,
+}
+
+impl ImageTls {
+    fn load(mem: &mut TitleAddressSpace, pe: &Pe, base: u64, image_size: u64) -> Result<Option<Self>, String> {
+        let Some(tls) = pe.tls else { return Ok(None) };
+        let image_address = |va: u64, bytes: u64| {
+            va.checked_sub(pe.image_base)
+                .filter(|offset| offset.checked_add(bytes).is_some_and(|end| end <= image_size))
+                .map(|offset| base + offset)
+                .ok_or_else(|| "PE TLS address is outside the image".to_string())
+        };
+        let start = tls.raw_start as u64;
+        let end = tls.raw_end as u64;
+        let template_size = end.checked_sub(start).filter(|_| end <= image_size)
+            .ok_or("Invalid PE TLS template range")?;
+        let size = template_size + tls.zero_fill as u64;
+        if size > 16 * 1024 * 1024 {
+            return Err("PE TLS template exceeds 16 MiB".into());
+        }
+        let mut template = vec![0; template_size as usize];
+        if !template.is_empty() {
+            mem.read_bytes(base + start, &mut template)?;
+        }
+        let index = image_address(tls.index_va, 4)?;
+        mem.write_u32(index, 0)?;
+        let mut callbacks = Vec::new();
+        if tls.callbacks_va != 0 {
+            for i in 0..=64 {
+                let slot = tls.callbacks_va.checked_add(i * 8).ok_or("PE TLS callback list overflow")?;
+                let callback = mem.read_u64(image_address(slot, 8)?)?;
+                if callback == 0 {
+                    break;
+                }
+                if i == 64 || !callback.checked_sub(base).is_some_and(|rva| rva < image_size) {
+                    return Err("Invalid PE TLS callback list".into());
+                }
+                callbacks.push(callback);
+            }
+        }
+        Ok(Some(Self { image_base: base, template, size, callbacks }))
+    }
+
+    fn initialize_thread(&self, mem: &mut TitleAddressSpace, teb: u64) -> Result<(), String> {
+        let data = mem.alloc(None, self.size.max(1), PAGE_SIZE_64K, MemoryProtect::ReadWrite, true)?;
+        if !self.template.is_empty() {
+            mem.load_bytes(data, &self.template)?;
+        }
+        let vector = teb + 0x800;
+        mem.write_u64(vector, data)?;
+        mem.write_u64(teb + 0x58, vector)
+    }
+
+    fn startup(&self, entry: u64, stack: u64, parameter: u64, reason: u64) -> Option<TlsStartup> {
+        (!self.callbacks.is_empty()).then_some(TlsStartup {
+            entry, stack, parameter, reason, next_callback: 0,
+        })
+    }
 }
 
 /// Sandboxed Xbox One / Series X|S x86-64 CPU + HLE runtime.
@@ -75,12 +161,15 @@ pub struct XboxX64Emu {
     threads: Vec<GuestThread>,
     active_thread: usize,
     next_tid: u32,
+    image_tls: Option<ImageTls>,
     tls_slots: Vec<Option<u64>>,
     audio_samples: Vec<f32>,
     thunks: HashMap<u64, ThunkEntry>,
+    runtime_module_refs: u32,
     output: String,
     api_calls: Vec<String>,
     unimplemented_apis: Vec<String>,
+    strict_imports: bool,
     exited: bool,
     exit_code: i32,
     total_instructions: u64,
@@ -170,6 +259,10 @@ impl XboxX64Emu {
         regs[RSP] = initial_rsp;
         let xmm = [0u128; 16];
         let entry_rip = base + pe.entry as u64;
+        let image_tls = ImageTls::load(&mut mem, &pe, base, img_size)?;
+        if let Some(tls) = &image_tls {
+            tls.initialize_thread(&mut mem, teb_va)?;
+        }
 
         let main_thread = GuestThread {
             id: 0x1001,
@@ -180,6 +273,7 @@ impl XboxX64Emu {
             teb_va,
             finished: false,
             exit_code: 0,
+            tls_startup: image_tls.as_ref().and_then(|tls| tls.startup(entry_rip, initial_rsp, 0, 1)),
         };
 
         Ok(Self {
@@ -195,12 +289,17 @@ impl XboxX64Emu {
             threads: vec![main_thread],
             active_thread: 0,
             next_tid: 0x1002,
+            image_tls,
             tls_slots: Vec::new(),
             audio_samples: Vec::new(),
             thunks,
+            runtime_module_refs: u32::from(pe.imports.iter().any(|module| {
+                module.dll.eq_ignore_ascii_case(XGAME_RUNTIME_DLL)
+            })),
             output: String::new(),
             api_calls: Vec::new(),
             unimplemented_apis: Vec::new(),
+            strict_imports: false,
             exited: false,
             exit_code: 0,
             total_instructions: 0,
@@ -209,6 +308,33 @@ impl XboxX64Emu {
             pads: [0; 4],
             pad_packet: 1,
         })
+    }
+
+    fn advance_tls_startup(&mut self) -> Result<(), String> {
+        let thread = &mut self.threads[self.active_thread];
+        let Some(startup) = &mut thread.tls_startup else { return Ok(()) };
+        if startup.next_callback != 0 && self.rip != TLS_RETURN_SENTINEL {
+            return Ok(());
+        }
+        let tls = self.image_tls.as_ref().ok_or("Missing image TLS state")?;
+        self.regs = [0; 16];
+        self.xmm = [0; 16];
+        self.rflags = 0x202;
+        self.regs[RSP] = startup.stack;
+        if let Some(&callback) = tls.callbacks.get(startup.next_callback) {
+            self.mem.write_u64(startup.stack, TLS_RETURN_SENTINEL)?;
+            self.regs[RCX] = tls.image_base;
+            self.regs[RDX] = startup.reason;
+            self.rip = callback;
+            startup.next_callback += 1;
+        } else {
+            let target = if self.active_thread == 0 { EXIT_SENTINEL } else { THREAD_EXIT_SENTINEL };
+            self.mem.write_u64(startup.stack, target)?;
+            self.regs[RCX] = startup.parameter;
+            self.rip = startup.entry;
+            thread.tls_startup = None;
+        }
+        Ok(())
     }
 
     fn save_active_thread(&mut self) {
@@ -301,6 +427,11 @@ impl XboxX64Emu {
         &self.unimplemented_apis
     }
 
+    /// Stop before returning placeholder results for unimplemented imports.
+    pub fn set_strict_imports(&mut self) {
+        self.strict_imports = true;
+    }
+
     /// Converts the RGBA8 offscreen framebuffer to `0RGB` `u32` pixels for desktop scanout.
     pub fn fb_pixels_0rgb(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity((self.framebuffer.width * self.framebuffer.height) as usize);
@@ -317,6 +448,9 @@ impl XboxX64Emu {
         }
         let mut count = 0u64;
         while count < max_instructions && !self.exited {
+            if let Err(error) = self.advance_tls_startup() {
+                return EmuStepState::Stopped(error);
+            }
             if self.rip == EXIT_SENTINEL {
                 self.exit_code = self.regs[RAX] as i32;
                 self.exited = true;
@@ -395,7 +529,31 @@ impl XboxX64Emu {
         let r9 = self.regs[R9];
         let name = thunk.name.as_str();
 
+        // These shims draw or flip a test surface without creating a guest GPU device.
+        if self.strict_imports && [
+            "XDeviceCreate", "D3D12XBOX_CreateDevice", "D3D12CreateDevice", "D3D11XCreateDeviceX",
+            "D3D12XBOX_Present",
+        ].iter().any(|api| name.eq_ignore_ascii_case(api)) {
+            return Err(self.unsupported_import(label));
+        }
+
         let ret_val: u64 = match name {
+            "GetModuleHandleA" | "GetModuleHandleW" if rcx == 0 => self.mem.read_u64(self.peb_va + 0x10)?,
+            "GetModuleHandleA" | "GetModuleHandleW" => {
+                self.get_runtime_module(rcx, name.ends_with('W'), false)?
+            }
+            "LoadLibraryA" | "LoadLibraryW" => self.get_runtime_module(rcx, name.ends_with('W'), true)?,
+            "LoadLibraryExA" | "LoadLibraryExW" if rdx == 0 && r8 == 0 => {
+                self.get_runtime_module(rcx, name.ends_with('W'), true)?
+            }
+            "GetProcAddress" => self.get_runtime_export(rcx, rdx)?,
+            "FreeLibrary" if rcx == XGAME_RUNTIME_HANDLE && self.runtime_module_refs != 0 => {
+                self.runtime_module_refs -= 1;
+                1
+            }
+            "FreeLibrary" => self.library_error(6)?,
+            "GetLastError" => u64::from(self.mem.read_u32(self.teb_va + LAST_ERROR_OFFSET)?),
+            "SetLastError" => self.library_error(rcx as u32)?,
             n if n.eq_ignore_ascii_case("XGameRuntimeInitialize")
                 || n.eq_ignore_ascii_case("XGameRuntimeUninitialize")
                 || n.eq_ignore_ascii_case("XGameFeatureInitialize") =>
@@ -411,6 +569,15 @@ impl XboxX64Emu {
                         }
                     }
                 }
+                0
+            }
+            n if n.eq_ignore_ascii_case("XErrorReport") => {
+                let message = if rdx == 0 {
+                    String::new()
+                } else {
+                    self.mem.read_cstr(rdx, 4096).unwrap_or_else(|_| "<unreadable guest message>".to_owned())
+                };
+                self.output.push_str(&crate::shims::error_report_line(rcx as u32, &message));
                 0
             }
             n if n.eq_ignore_ascii_case("OutputDebugStringA") => {
@@ -478,6 +645,33 @@ impl XboxX64Emu {
                 }
                 0
             }
+            n if n.eq_ignore_ascii_case("XMemVirtualAlloc") => {
+                let flags = r8 as u32;
+                let protection = self.mem.read_u32(self.regs[RSP].wrapping_add(0x28))?;
+                match self.xmem_virtual_alloc(rcx, rdx, flags, protection) {
+                    Some(address) => address,
+                    None => {
+                        let error = self.unsupported_import(format!("{label} allocation flags {flags:#x}"));
+                        if self.strict_imports {
+                            return Err(error);
+                        }
+                        0
+                    }
+                }
+            }
+            n if n.eq_ignore_ascii_case("XMemAllocatePhysicalPages") => {
+                self.xmem_allocate_physical_pages(rdx, r8) as u64
+            }
+            n if n.eq_ignore_ascii_case("XMemFreePhysicalPages") => {
+                self.read_physical_array(rdx, rcx)
+                    .is_some_and(|pages| self.mem.free_physical_pages(&pages)) as u64
+            }
+            n if n.eq_ignore_ascii_case("XMemMapPhysicalPages") => {
+                if self.xmem_map_physical_pages(rcx, rdx, r8, false) { rcx } else { 0 }
+            }
+            n if n.eq_ignore_ascii_case("XMemMapPhysicalPagesScatter") => {
+                self.xmem_map_physical_pages(rcx, rdx as u32 as u64, r8, true) as u64
+            }
             n if n.eq_ignore_ascii_case("VirtualAlloc") || n.eq_ignore_ascii_case("VirtualAllocFromApp") => {
                 let pref = if rcx != 0 { Some(rcx) } else { None };
                 let sz = rdx.max(PAGE_SIZE_4K);
@@ -531,13 +725,16 @@ impl XboxX64Emu {
                 let _ = self.mem.write_u64(rsp, THREAD_EXIT_SENTINEL);
                 let tid = self.next_tid;
                 self.next_tid += 1;
-                let teb = self.mem.alloc(None, PAGE_SIZE_4K, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true).unwrap_or(self.teb_va);
+                let teb = self.mem.alloc(None, PAGE_SIZE_4K, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true)?;
                 let _ = self.mem.write_u64(teb + 0x08, stack_base + stack_sz);
                 let _ = self.mem.write_u64(teb + 0x10, stack_base);
                 let _ = self.mem.write_u64(teb + 0x30, teb);
                 let _ = self.mem.write_u64(teb + 0x40, 0x1000);
                 let _ = self.mem.write_u64(teb + 0x48, tid as u64);
                 let _ = self.mem.write_u64(teb + 0x60, self.peb_va);
+                if let Some(tls) = &self.image_tls {
+                    tls.initialize_thread(&mut self.mem, teb)?;
+                }
 
                 let mut regs = [0u64; 16];
                 regs[RSP] = rsp;
@@ -552,6 +749,7 @@ impl XboxX64Emu {
                     teb_va: teb,
                     finished: false,
                     exit_code: 0,
+                    tls_startup: self.image_tls.as_ref().and_then(|tls| tls.startup(start_addr, rsp, param, 2)),
                 });
                 if tid_out != 0 {
                     let _ = self.mem.write_u32(tid_out, tid);
@@ -675,6 +873,29 @@ impl XboxX64Emu {
                 self.framebuffer.present();
                 0
             }
+            n if n.eq_ignore_ascii_case("DStorageGetFactory")
+                || n.eq_ignore_ascii_case("DStorageSetConfiguration")
+                || n.eq_ignore_ascii_case("SetFrameIntervalX")
+                || n.eq_ignore_ascii_case("ScheduleFrameEventX")
+                || n.eq_ignore_ascii_case("WaitFrameEventX")
+                || n.eq_ignore_ascii_case("AcpHalCreate")
+                || n.eq_ignore_ascii_case("XcurlInitialize")
+                || n.eq_ignore_ascii_case("XcurlUninitialize")
+                || n.eq_ignore_ascii_case("BinkDoFrame")
+                || n.eq_ignore_ascii_case("BinkClose")
+                || n.eq_ignore_ascii_case("BinkOpen") =>
+            {
+                0
+            }
+            n if n.eq_ignore_ascii_case("ApuAlloc") => {
+                let size = r8.max(PAGE_SIZE_4K);
+                let va = self.mem.alloc(None, size, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true).unwrap_or(0);
+                if rcx != 0 {
+                    let _ = self.mem.write_u64(rcx, va);
+                }
+                if va == 0 { 0x8007_000E } else { 0 }
+            }
+            n if n.eq_ignore_ascii_case("ApuFree") => 0,
             n if n.eq_ignore_ascii_case("XDeviceClear") => {
                 self.framebuffer.clear(rcx as u8, rdx as u8, r8 as u8, 255);
                 0
@@ -686,6 +907,18 @@ impl XboxX64Emu {
                 let b = ((rgba >> 8) & 0xFF) as u8;
                 let a = (rgba & 0xFF) as u8;
                 self.framebuffer.fill_rect(rcx as u32, rdx as u32, r8 as u32, r9 as u32, [r, g, b, a]);
+                0
+            }
+            n if thunk.dll.eq_ignore_ascii_case("emu-graphics.dll")
+                && (n.eq_ignore_ascii_case("XDeviceCopyRgba8") || n.eq_ignore_ascii_case("XDeviceReadRgba8")) =>
+            {
+                self.transfer_framebuffer_rgba8(n.eq_ignore_ascii_case("XDeviceCopyRgba8"))?;
+                0
+            }
+            n if thunk.dll.eq_ignore_ascii_case("emu-graphics.dll")
+                && n.eq_ignore_ascii_case("XDeviceDrawRdna2Rect") =>
+            {
+                self.draw_rdna2_rect()?;
                 0
             }
             n if n.eq_ignore_ascii_case("XAudio2SubmitPcm") => {
@@ -726,8 +959,9 @@ impl XboxX64Emu {
                 0
             }
             _ => {
-                if !self.unimplemented_apis.contains(&label) {
-                    self.unimplemented_apis.push(label);
+                let error = self.unsupported_import(label);
+                if self.strict_imports {
+                    return Err(error);
                 }
                 0
             }
@@ -739,6 +973,237 @@ impl XboxX64Emu {
         self.regs[RSP] = self.regs[RSP].wrapping_add(8);
         self.rip = ret_ip;
         Ok(())
+    }
+
+    fn library_error(&mut self, error: u32) -> Result<u64, String> {
+        self.mem.write_u32(self.teb_va + LAST_ERROR_OFFSET, error)?;
+        Ok(0)
+    }
+
+    fn read_library_name(&self, address: u64, wide: bool) -> Option<String> {
+        if !wide {
+            return self.mem.read_cstr(address, 260).ok();
+        }
+        let mut units = Vec::new();
+        for offset in (0..520).step_by(2) {
+            let unit = self.mem.read_u16(address.checked_add(offset)?).ok()?;
+            if unit == 0 {
+                return String::from_utf16(&units).ok();
+            }
+            units.push(unit);
+        }
+        None
+    }
+
+    fn get_runtime_module(&mut self, address: u64, wide: bool, load: bool) -> Result<u64, String> {
+        let Some(name) = self.read_library_name(address, wide) else {
+            return self.library_error(126);
+        };
+        let is_runtime = name.eq_ignore_ascii_case(XGAME_RUNTIME_DLL) || name.eq_ignore_ascii_case("xgameruntime");
+        if !is_runtime || (!load && self.runtime_module_refs == 0) {
+            return self.library_error(126);
+        }
+        if load {
+            self.runtime_module_refs = self.runtime_module_refs.saturating_add(1);
+        }
+        Ok(XGAME_RUNTIME_HANDLE)
+    }
+
+    fn get_runtime_export(&mut self, handle: u64, address: u64) -> Result<u64, String> {
+        if handle != XGAME_RUNTIME_HANDLE || self.runtime_module_refs == 0 {
+            return self.library_error(6);
+        }
+        let Ok(name) = self.mem.read_cstr(address, 256) else {
+            return self.library_error(127);
+        };
+        if !XGAME_RUNTIME_EXPORTS.contains(&name.as_str()) {
+            return self.library_error(127);
+        }
+        if let Some(thunk_address) = self.thunks.iter().filter_map(|(&address, thunk)| {
+            (thunk.dll.eq_ignore_ascii_case(XGAME_RUNTIME_DLL) && thunk.name == name).then_some(address)
+        }).min() {
+            return Ok(thunk_address);
+        }
+        let thunk_address = THUNK_BASE + self.thunks.len() as u64 * THUNK_STRIDE;
+        self.thunks.insert(thunk_address, ThunkEntry { dll: XGAME_RUNTIME_DLL.to_owned(), name });
+        Ok(thunk_address)
+    }
+
+    fn xmem_virtual_alloc(&mut self, address: u64, size: u64, flags: u32, protection: u32) -> Option<u64> {
+        let allocation_type = flags & !XMEM_PAGE_MODE_MASK;
+        let reserve_placeholder = allocation_type & MEM_RESERVE_PLACEHOLDER != 0;
+        let replace_placeholder = allocation_type & MEM_REPLACE_PLACEHOLDER != 0;
+        let backing_type = allocation_type & !(MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER);
+        if !matches!(backing_type, 0 | MEM_RESERVE | 0x3000) {
+            return None;
+        }
+        let mut page_size = match flags & XMEM_PAGE_MODE_MASK {
+            0 => PAGE_SIZE_4K,
+            0x2040_0000 => PAGE_SIZE_64K,
+            0x2000_0000 => 2 * 1024 * 1024,
+            _ => return None,
+        };
+        let protect = match protection & 0xFF {
+            1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x80 => MemoryProtect::from_win32(protection),
+            _ => return Some(0),
+        };
+        if size == 0 {
+            return Some(0);
+        }
+        let commit = allocation_type == 0 || allocation_type & MEM_COMMIT != 0;
+        if reserve_placeholder || replace_placeholder {
+            page_size = page_size.max(PAGE_SIZE_64K);
+            if backing_type & MEM_RESERVE == 0 || (reserve_placeholder && (
+                replace_placeholder || commit || protect != MemoryProtect::NoAccess
+            )) {
+                return Some(0);
+            }
+        }
+        let align = page_size.max(PAGE_SIZE_64K);
+        let base = address & !(align - 1);
+        if address != 0 && base == 0 {
+            return Some(0);
+        }
+        let Some(rounded) = size.checked_add(address - base)
+            .and_then(|size| size.checked_add(page_size - 1))
+            .map(|size| size & !(page_size - 1))
+        else {
+            return Some(0);
+        };
+        if base.checked_add(rounded).is_none() || (commit && rounded > self.mem.status().avail_mem) {
+            return Some(0);
+        }
+        let preferred = (base != 0).then_some(base);
+        if reserve_placeholder {
+            return Some(self.mem.reserve_placeholder(preferred, rounded, align).unwrap_or(0));
+        }
+        let allocated = if replace_placeholder {
+            if address == 0 || address != base {
+                return Some(0);
+            }
+            self.mem.replace_placeholder(base, rounded, protect, commit)
+        } else {
+            self.mem.alloc(preferred, rounded, align, protect, commit)
+        };
+        if let Ok(result) = allocated {
+            if !commit && flags & XMEM_PAGE_MODE_MASK != 0 {
+                self.mem.mark_physical_window(result);
+            }
+            Some(result)
+        } else {
+            Some(0)
+        }
+    }
+
+    fn read_physical_array(&self, pointer: u64, count: u64) -> Option<Vec<u64>> {
+        if count > self.mem.status().total_mem / PAGE_SIZE_64K || (count != 0 && pointer == 0) {
+            return None;
+        }
+        (0..count).map(|index| self.mem.read_u64(pointer.checked_add(index * 8)?).ok()).collect()
+    }
+
+    fn xmem_allocate_physical_pages(&mut self, count_pointer: u64, output: u64) -> bool {
+        let Ok(count) = self.mem.read_u64(count_pointer) else { return false };
+        if count == 0 {
+            return true;
+        }
+        if output == 0 || !count.checked_mul(8).is_some_and(|length| self.mem.can_write_bytes(output, length)) {
+            return false;
+        }
+        let Some(pages) = self.mem.allocate_physical_pages(count) else {
+            let _ = self.mem.write_u64(count_pointer, 0);
+            return false;
+        };
+        let values: Vec<_> = pages.iter().flat_map(|page| page.to_le_bytes()).collect();
+        if self.mem.write_bytes(output, &values).is_err() {
+            self.mem.free_physical_pages(&pages);
+            let _ = self.mem.write_u64(count_pointer, 0);
+            return false;
+        }
+        true
+    }
+
+    fn xmem_map_physical_pages(&mut self, address: u64, count: u64, pointer: u64, scatter: bool) -> bool {
+        if count > self.mem.status().total_mem / PAGE_SIZE_64K || (count != 0 && address == 0) {
+            return false;
+        }
+        let pages = if pointer == 0 { vec![0; count as usize] } else {
+            let Some(pages) = self.read_physical_array(pointer, count) else { return false };
+            pages
+        };
+        let addresses = if scatter {
+            self.read_physical_array(address, count)
+        } else {
+            (0..count).map(|index| address.checked_add(index * PAGE_SIZE_64K)).collect()
+        };
+        let Some(addresses) = addresses else { return false };
+        self.mem.map_physical_pages(&addresses.into_iter().zip(pages).collect::<Vec<_>>())
+    }
+
+    /// Private emulator ABI: x, y, width, height, then a guest pointer to packed RGBA8.
+    fn transfer_framebuffer_rgba8(&mut self, upload: bool) -> Result<(), String> {
+        let (len, rows) = self.framebuffer.rgba8_rows(
+            self.regs[RCX] as u32,
+            self.regs[RDX] as u32,
+            self.regs[R8] as u32,
+            self.regs[R9] as u32,
+        )?;
+        let address = self.mem.read_u64(self.regs[RSP].wrapping_add(0x28))?;
+        let mut pixels = vec![0; len];
+        if upload {
+            // Validate and read the whole source before changing any pixels.
+            self.mem.read_bytes(address, &mut pixels)?;
+            let mut offset = 0;
+            for row in rows {
+                let end = offset + row.len();
+                self.framebuffer.rgba[row].copy_from_slice(&pixels[offset..end]);
+                offset = end;
+            }
+        } else {
+            let mut offset = 0;
+            for row in rows {
+                let end = offset + row.len();
+                pixels[offset..end].copy_from_slice(&self.framebuffer.rgba[row]);
+                offset = end;
+            }
+            self.mem.write_bytes(address, &pixels)?;
+        }
+        Ok(())
+    }
+
+    /// Private emulator ABI: x, y, width, height, shader pointer, byte count.
+    fn draw_rdna2_rect(&mut self) -> Result<(), String> {
+        let width = self.regs[R8] as u32;
+        let height = self.regs[R9] as u32;
+        let (_, rows) = self.framebuffer.rgba8_rows(
+            self.regs[RCX] as u32,
+            self.regs[RDX] as u32,
+            width,
+            height,
+        )?;
+        let stack = self.regs[RSP];
+        let address = self.mem.read_u64(stack.wrapping_add(0x28))?;
+        let len = self.mem.read_u32(stack.wrapping_add(0x30))? as usize;
+        let mut code = [0; crate::rdna2::MAX_SHADER_BYTES];
+        let code = code.get_mut(..len).ok_or("RDNA2 shader exceeds 64 dwords.")?;
+        self.mem.read_bytes(address, code)?;
+        let shader = crate::rdna2::PixelShader::decode(code)?;
+        for (y, row) in rows.enumerate() {
+            let v = (y as f32 + 0.5) / height as f32;
+            for (x, pixel) in self.framebuffer.rgba[row].chunks_exact_mut(4).enumerate() {
+                let u = (x as f32 + 0.5) / width as f32;
+                pixel.copy_from_slice(&shader.shade_rgba8(u, v));
+            }
+        }
+        Ok(())
+    }
+
+    fn unsupported_import(&mut self, label: String) -> String {
+        let error = format!("Unimplemented Xbox import {label}");
+        if !self.unimplemented_apis.contains(&label) {
+            self.unimplemented_apis.push(label);
+        }
+        error
     }
 
     fn fetch_u8(&mut self) -> Result<u8, String> {
@@ -907,6 +1372,21 @@ impl XboxX64Emu {
             ModRmResolved::Reg(r) => self.xmm[r & 15] as u64,
             ModRmResolved::Mem(a) => self.mem.read_u64(a)?,
         }))
+    }
+
+    fn truncate_float_to_integer(value: f64, size: u8) -> u64 {
+        let value = value.trunc();
+        if size == 8 {
+            if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value) {
+                value as i64 as u64
+            } else {
+                i64::MIN as u64
+            }
+        } else if (-2_147_483_648.0..2_147_483_648.0).contains(&value) {
+            value as i32 as u32 as u64
+        } else {
+            i32::MIN as u32 as u64
+        }
     }
 
     fn xmm_lanes_f32(v: u128) -> [f32; 4] {
@@ -1325,6 +1805,34 @@ impl XboxX64Emu {
                 }
                 Ok(())
             }
+            // MOVS / STOS. Each repeated element consumes a step so a large RCX
+            // remains interruptible and indexes stay at the first faulting element.
+            0xA4 | 0xA5 | 0xAA | 0xAB if !rep_f2 => {
+                if rep_f3 && self.regs[RCX] == 0 {
+                    return Ok(());
+                }
+                let size = if op & 1 == 0 { 1 } else { op_size };
+                let moves = op == 0xA4 || op == 0xA5;
+                let value = if moves {
+                    let source = self.regs[RSI].wrapping_add(self.seg_base);
+                    self.read_rm(ModRmResolved::Mem(source), size, has_rex)?
+                } else {
+                    self.read_reg(RAX, size, has_rex)
+                };
+                self.write_rm(ModRmResolved::Mem(self.regs[RDI]), size, has_rex, value)?;
+                let stride = if self.rflags & DF == 0 { size as u64 } else { (size as u64).wrapping_neg() };
+                self.regs[RDI] = self.regs[RDI].wrapping_add(stride);
+                if moves {
+                    self.regs[RSI] = self.regs[RSI].wrapping_add(stride);
+                }
+                if rep_f3 {
+                    self.regs[RCX] -= 1;
+                    if self.regs[RCX] != 0 {
+                        self.rip = start_rip;
+                    }
+                }
+                Ok(())
+            }
             // TEST AL/rAX, imm
             0xA8 => {
                 let imm = self.fetch_u8()? as u64;
@@ -1551,6 +2059,8 @@ impl XboxX64Emu {
             }
             // Two-byte opcodes (0x0F ...)
             0x0F => self.step_0f(start_rip, op_size, op_override, has_rex, rex_r, rex_x, rex_b_bit, rep_f2, rep_f3),
+            0xFC => { self.rflags &= !DF; Ok(()) }
+            0xFD => { self.rflags |= DF; Ok(()) }
             _ => Err(format!("unsupported x86-64 opcode {op:#04x} at {start_rip:#x}")),
         }
     }
@@ -1645,13 +2155,12 @@ impl XboxX64Emu {
                 let (reg, t) = self.decode_modrm(rex_r, rex_x, rex_b_bit)?;
                 let r = self.resolve_target(t, 0);
                 let sz = if op_size == 8 { 8 } else { 4 };
-                let out = if rep_f3 {
-                    let f = self.read_xmm_f32(r)?;
-                    if sz == 8 { (f as i64) as u64 } else { (f as i32) as u32 as u64 }
+                let value = if rep_f3 {
+                    self.read_xmm_f32(r)? as f64
                 } else {
-                    let d = self.read_xmm_f64(r)?;
-                    if sz == 8 { (d as i64) as u64 } else { (d as i32) as u32 as u64 }
+                    self.read_xmm_f64(r)?
                 };
+                let out = Self::truncate_float_to_integer(value, sz);
                 self.write_reg(reg, sz, has_rex, out);
                 Ok(())
             }
@@ -2176,12 +2685,6 @@ mod tests {
         pe[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes()); // SizeOfHeaders
         pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
 
-        if dll.is_some() {
-            // Import directory at RVA 0x1400
-            pe[opt + 112 + 8..opt + 112 + 12].copy_from_slice(&0x1400u32.to_le_bytes());
-            pe[opt + 112 + 12..opt + 112 + 16].copy_from_slice(&40u32.to_le_bytes());
-        }
-
         let sh = opt + 0xF0;
         pe[sh..sh + 5].copy_from_slice(b".text");
         pe[sh + 8..sh + 12].copy_from_slice(&0x1000u32.to_le_bytes()); // vsize
@@ -2194,19 +2697,457 @@ mod tests {
         pe[0x200..0x200 + code.len()].copy_from_slice(code);
 
         if let (Some(dll_name), Some(fn_name)) = (dll, func) {
-            // File offset for RVA 0x1400 is 0x600.
-            // Import descriptor at RVA 0x1400 (file 0x600)
-            // OFT at RVA 0x1440 (file 0x640), IAT at RVA 0x1450 (file 0x650)
-            // DLL name at RVA 0x1460 (file 0x660), Hint/Name at RVA 0x1480 (file 0x680)
-            pe[0x600..0x604].copy_from_slice(&0x1440u32.to_le_bytes()); // OFT
-            pe[0x60C..0x610].copy_from_slice(&0x1460u32.to_le_bytes()); // DLL Name RVA
-            pe[0x610..0x614].copy_from_slice(&0x1450u32.to_le_bytes()); // IAT RVA
-            pe[0x640..0x648].copy_from_slice(&0x1480u64.to_le_bytes()); // OFT[0]
-            pe[0x650..0x658].copy_from_slice(&0x1480u64.to_le_bytes()); // IAT[0]
-            pe[0x660..0x660 + dll_name.len()].copy_from_slice(dll_name.as_bytes());
-            pe[0x682..0x682 + fn_name.len()].copy_from_slice(fn_name.as_bytes());
+            set_test_imports(&mut pe, dll_name, &[fn_name]);
         }
         pe
+    }
+
+    fn set_test_imports(pe: &mut [u8], dll: &str, names: &[&str]) {
+        assert!(names.len() <= 5 && dll.len() < 32);
+        let directory = 0x98 + 112 + 8;
+        pe[directory..directory + 4].copy_from_slice(&0x1400u32.to_le_bytes());
+        pe[directory + 4..directory + 8].copy_from_slice(&40u32.to_le_bytes());
+        pe[0x600..0x604].copy_from_slice(&0x14C0u32.to_le_bytes()); // Lookup table
+        pe[0x60C..0x610].copy_from_slice(&0x14A0u32.to_le_bytes()); // DLL name
+        pe[0x610..0x614].copy_from_slice(&0x1450u32.to_le_bytes()); // IAT
+        pe[0x6A0..0x6A0 + dll.len()].copy_from_slice(dll.as_bytes());
+        for (index, name) in names.iter().enumerate() {
+            let offset = 0x700 + index * 0x40;
+            let rva = (offset as u64 + 0xE00).to_le_bytes();
+            let slot = index * 8;
+            pe[0x6C0 + slot..0x6C8 + slot].copy_from_slice(&rva);
+            pe[0x650 + slot..0x658 + slot].copy_from_slice(&rva);
+            pe[offset + 2..offset + 2 + name.len()].copy_from_slice(name.as_bytes());
+        }
+    }
+
+    #[test]
+    fn guest_maps_aliased_physical_pages_through_imports() {
+        const RETURN_IF_ZERO: [u8; 10] = [0x48, 0x85, 0xC0, 0x75, 5, 0x48, 0x83, 0xC4, 0x48, 0xC3];
+        const WINDOW_IN_RCX: [u8; 5] = [0x48, 0x8B, 0x4C, 0x24, 0x38];
+        const ALIAS_OFFSET: [u8; 7] = [0x48, 0x81, 0xC1, 0, 0, 1, 0];
+        const MAP_ONE_PAGE: [u8; 10] = [0xBA, 1, 0, 0, 0, 0x4C, 0x8D, 0x44, 0x24, 0x30];
+        let mut entry = vec![
+            0x48, 0x83, 0xEC, 0x48, 0x31, 0xC9,
+            0xBA, 0, 0, 2, 0, 0x41, 0xB8, 0, 0x20, 0x40, 0x20,
+            0x41, 0xB9, 7, 0, 0, 0, 0xC7, 0x44, 0x24, 0x20, 1, 0, 0, 0,
+        ];
+        call_import(&mut entry, 0);
+        entry.extend_from_slice(&RETURN_IF_ZERO);
+        entry.extend_from_slice(&[
+            0x48, 0x89, 0x44, 0x24, 0x38,
+            0x48, 0xC7, 0x44, 0x24, 0x28, 1, 0, 0, 0,
+            0xB9, 0x80, 2, 0, 0, 0x48, 0x8D, 0x54, 0x24, 0x28, 0x4C, 0x8D, 0x44, 0x24, 0x30,
+        ]);
+        call_import(&mut entry, 1);
+        entry.extend_from_slice(&RETURN_IF_ZERO);
+        entry.extend_from_slice(&WINDOW_IN_RCX);
+        entry.extend_from_slice(&MAP_ONE_PAGE);
+        call_import(&mut entry, 2);
+        entry.extend_from_slice(&RETURN_IF_ZERO);
+        entry.extend_from_slice(&[0xC6, 0, 42]);
+        entry.extend_from_slice(&WINDOW_IN_RCX);
+        entry.extend_from_slice(&ALIAS_OFFSET);
+        entry.extend_from_slice(&MAP_ONE_PAGE);
+        call_import(&mut entry, 2);
+        entry.extend_from_slice(&RETURN_IF_ZERO);
+        entry.extend_from_slice(&[0x0F, 0xB6, 0, 0x83, 0xF8, 42, 0x74, 5, 0x48, 0x83, 0xC4, 0x48, 0xC3]);
+        entry.extend_from_slice(&WINDOW_IN_RCX);
+        entry.extend_from_slice(&[0xBA, 2, 0, 0, 0, 0x45, 0x31, 0xC0]);
+        call_import(&mut entry, 2);
+        entry.extend_from_slice(&RETURN_IF_ZERO);
+        entry.extend_from_slice(&[0xB9, 1, 0, 0, 0, 0x48, 0x8D, 0x54, 0x24, 0x30]);
+        call_import(&mut entry, 3);
+        entry.extend_from_slice(&RETURN_IF_ZERO);
+        entry.extend_from_slice(&[0xB8, 42, 0, 0, 0, 0x48, 0x83, 0xC4, 0x48, 0xC3]);
+
+        let imports = ["XMemVirtualAlloc", "XMemAllocatePhysicalPages", "XMemMapPhysicalPages", "XMemFreePhysicalPages"];
+        let mut program = build_test_pe(&entry, None, None);
+        set_test_imports(&mut program, "xmem.dll", &imports);
+        let mut interpreter = XboxX64Emu::load_pe(&program).unwrap();
+        interpreter.set_strict_imports();
+        let result = interpreter.run(200);
+        assert!(result.stopped_reason.is_none(), "{result:?}");
+        assert_eq!(result.exit_code, 42);
+
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let result = crate::native::run(&program).expect("native run with physical aliases");
+            assert!(result.is_complete(), "{result:?}");
+            assert_eq!(result.shimmed, imports);
+            assert_eq!(result.exit_code, 42);
+        }
+    }
+
+    const READ_STATIC_TLS: [u8; 14] = [
+        0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0, 0x48, 0x8B, 0, 0x8B, 0,
+    ];
+
+    fn static_tls_program(code: &[u8]) -> Vec<u8> {
+        let mut program = build_test_pe(code, None, None);
+        let directory = 0x98 + 112 + 9 * 8;
+        program[directory..directory + 4].copy_from_slice(&0x1200u32.to_le_bytes());
+        program[directory + 4..directory + 8].copy_from_slice(&40u32.to_le_bytes());
+        let base = 0x14000_0000u64;
+        for (offset, rva) in [(0x400, 0x1280), (0x408, 0x1284), (0x410, 0x1290), (0x418, 0x12A0)] {
+            program[offset..offset + 8].copy_from_slice(&(base + rva).to_le_bytes());
+        }
+        program[0x420..0x424].copy_from_slice(&12u32.to_le_bytes());
+        program[0x480..0x484].copy_from_slice(&40u32.to_le_bytes());
+        program[0x490..0x494].fill(0xFF);
+        for offset in [0x4A0, 0x4A8] {
+            program[offset..offset + 8].copy_from_slice(&(base + 0x12C0).to_le_bytes());
+        }
+        let callback = [0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0, 0x48, 0x8B, 0, 0x01, 0x10, 0xC3];
+        program[0x4C0..0x4C0 + callback.len()].copy_from_slice(&callback);
+        program
+    }
+
+    #[test]
+    fn guest_physical_pages_alias_across_windows_and_unmap_before_free() {
+        let mut emu = XboxX64Emu::load_pe(&build_test_pe(&[0xC3], None, None)).unwrap();
+        let first = emu.xmem_virtual_alloc(0, 2 * PAGE_SIZE_64K, 0x2040_2000, 1).unwrap();
+        let second = emu.xmem_virtual_alloc(0, 2 * PAGE_SIZE_64K, 0x2040_2000, 4).unwrap();
+        let args = emu.xmem_virtual_alloc(0, PAGE_SIZE_4K, 0x3000, 4).unwrap();
+        let stack = emu.regs[RSP];
+        let before = emu.mem.committed_bytes();
+        let call = |emu: &mut XboxX64Emu, name: &str, a, b, c| {
+            emu.regs[RSP] = stack;
+            emu.regs[RCX] = a;
+            emu.regs[RDX] = b;
+            emu.regs[R8] = c;
+            emu.dispatch_hle(&ThunkEntry { dll: "xmem.dll".into(), name: name.into() }).unwrap();
+            emu.regs[RAX]
+        };
+        emu.mem.write_u64(args, 2).unwrap();
+        assert_eq!(call(&mut emu, "XMemAllocatePhysicalPages", 0x280, args, args + 8), 1);
+        assert_eq!(emu.mem.read_u64(args).unwrap(), 2);
+        assert_eq!(emu.mem.committed_bytes(), before + 2 * PAGE_SIZE_64K);
+        let page0 = emu.mem.read_u64(args + 8).unwrap();
+        let page1 = emu.mem.read_u64(args + 16).unwrap();
+        assert_eq!(page1 - page0, 16);
+        assert_eq!(call(&mut emu, "XMemMapPhysicalPages", first, 2, args + 8), first);
+        emu.mem.write_u64(args + 24, second).unwrap();
+        emu.mem.write_u64(args + 32, second + PAGE_SIZE_64K).unwrap();
+        assert_eq!(call(&mut emu, "XMemMapPhysicalPagesScatter", args + 24, 2, args + 8), 1);
+        emu.mem.write_u32(first + PAGE_SIZE_64K - 2, 0x1234_5678).unwrap();
+        assert_eq!(emu.mem.read_u32(second + PAGE_SIZE_64K - 2).unwrap(), 0x1234_5678);
+        assert_eq!(call(&mut emu, "XMemFreePhysicalPages", 2, args + 8, 0), 0);
+        assert_eq!(call(&mut emu, "XMemMapPhysicalPagesScatter", args + 24, 1, 0), 1);
+        assert!(emu.mem.write_u32(second + PAGE_SIZE_64K - 2, 0).is_err());
+        assert_eq!(emu.mem.read_u16(first + PAGE_SIZE_64K).unwrap(), 0x1234);
+        assert_eq!(call(&mut emu, "XMemMapPhysicalPages", first, 2, 0), first);
+        assert_eq!(call(&mut emu, "XMemMapPhysicalPagesScatter", args + 24, 2, 0), 1);
+        assert_eq!(call(&mut emu, "XMemFreePhysicalPages", 2, args + 8, 0), 1);
+        assert_eq!(emu.mem.committed_bytes(), before);
+    }
+
+    #[test]
+    fn guest_xmem_virtual_alloc_reserves_and_commits_console_page_sizes() {
+        let run = |flags: u32, protection: u32, size: u64| {
+            let mut entry = vec![0x48, 0x83, 0xEC, 0x28, 0x31, 0xC9, 0x48, 0xBA];
+            entry.extend_from_slice(&size.to_le_bytes());
+            entry.extend_from_slice(&[0x41, 0xB8]);
+            entry.extend_from_slice(&flags.to_le_bytes());
+            entry.extend_from_slice(&[0x41, 0xB9, 7, 0, 0, 0, 0xC7, 0x44, 0x24, 0x20]);
+            entry.extend_from_slice(&protection.to_le_bytes());
+            call_import(&mut entry, 0);
+            entry.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+            let program = build_test_pe(&entry, Some("xmem.dll"), Some("XMemVirtualAlloc"));
+            let mut emu = XboxX64Emu::load_pe(&program).unwrap();
+            emu.set_strict_imports();
+            let before = emu.mem.committed_bytes();
+            let result = emu.run(32);
+            (emu, before, result)
+        };
+
+        let (reserved, before, result) = run(0x2040_2000, 1, 1);
+        assert!(result.stopped_reason.is_none(), "{:?}", result.stopped_reason);
+        let address = reserved.regs[RAX];
+        assert_ne!(address, 0);
+        assert_eq!(address % PAGE_SIZE_64K, 0);
+        assert_eq!(reserved.mem.committed_bytes(), before);
+        assert!(reserved.mem.read_u8(address).is_err());
+
+        let large = 2 * 1024 * 1024;
+        let (mut committed, before, result) = run(0x2000_3000, 0x802, 4097);
+        assert!(result.stopped_reason.is_none(), "{:?}", result.stopped_reason);
+        let address = committed.regs[RAX];
+        assert_ne!(address, 0);
+        assert_eq!(address % large, 0);
+        assert_eq!(committed.mem.committed_bytes(), before + large);
+        assert_eq!(committed.mem.read_u8(address + large - 1).unwrap(), 0);
+        assert!(committed.mem.write_u8(address, 1).is_err());
+
+        let (rejected, before, result) = run(0x2000_3000, 4, u64::MAX);
+        assert!(result.stopped_reason.is_none(), "{:?}", result.stopped_reason);
+        assert_eq!(rejected.regs[RAX], 0);
+        assert_eq!(rejected.mem.committed_bytes(), before);
+
+        let (mut placeholders, before, result) = run(0x42000, 1, 3 * PAGE_SIZE_64K);
+        assert!(result.stopped_reason.is_none(), "{:?}", result.stopped_reason);
+        let base = placeholders.regs[RAX];
+        assert_ne!(base, 0);
+        let middle = base + PAGE_SIZE_64K;
+        assert_eq!(placeholders.xmem_virtual_alloc(middle, PAGE_SIZE_64K, 0x2040_6000, 4), Some(middle));
+        assert!(placeholders.mem.read_u8(middle).is_err());
+        assert_eq!(placeholders.xmem_virtual_alloc(middle, PAGE_SIZE_64K, 0x7000, 4), Some(0));
+        assert_eq!(placeholders.xmem_virtual_alloc(base, PAGE_SIZE_64K, 0x7000, 4), Some(base));
+        assert_eq!(placeholders.xmem_virtual_alloc(base + 2 * PAGE_SIZE_64K, PAGE_SIZE_64K, 0x7000, 4), Some(base + 2 * PAGE_SIZE_64K));
+        assert_eq!(placeholders.mem.committed_bytes(), before + 2 * PAGE_SIZE_64K);
+        assert_eq!(placeholders.mem.read_u8(base).unwrap(), 0);
+        assert_eq!(placeholders.mem.read_u8(base + 2 * PAGE_SIZE_64K).unwrap(), 0);
+
+        let (_, _, result) = run(0x100000, 4, PAGE_SIZE_64K);
+        assert!(result.stopped_reason.unwrap().contains("XMemVirtualAlloc allocation flags 0x100000"));
+    }
+
+    #[test]
+    fn guest_static_tls_callbacks_run_before_entry_with_a_step_budget() {
+        let mut entry = READ_STATIC_TLS.to_vec();
+        entry.push(0xC3);
+        let program = static_tls_program(&entry);
+        let base = 0x14000_0000u64;
+        let mut emu = XboxX64Emu::load_pe(&program).unwrap();
+        assert_eq!(emu.mem.read_u32(base + 0x1290).unwrap(), 0);
+        let vector = emu.mem.read_u64(emu.teb_va + 0x58).unwrap();
+        let data = emu.mem.read_u64(vector).unwrap();
+        assert_eq!(emu.mem.read_u32(data).unwrap(), 40);
+        assert_eq!(emu.mem.read_u64(data + 4).unwrap(), 0);
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert_eq!(emu.mem.read_u32(data).unwrap(), 40);
+        assert_eq!(emu.step_budget(32), EmuStepState::Exited(42));
+        assert_eq!(emu.mem.read_u32(data).unwrap(), 42);
+    }
+
+    #[test]
+    fn guest_worker_gets_separate_static_tls_and_preserves_its_entry_argument() {
+        let mut entry = vec![0x48, 0x83, 0xEC, 0x48, 0x31, 0xD2, 0x4C, 0x8D, 0x05];
+        let worker_offset = 0x100i32;
+        entry.extend_from_slice(&(worker_offset - (entry.len() as i32 + 4)).to_le_bytes());
+        entry.extend_from_slice(&[0x41, 0xB9, 7, 0, 0, 0]);
+        call_import(&mut entry, 0);
+        entry.extend_from_slice(&[0x48, 0x89, 0xC1, 0x31, 0xD2]);
+        call_import(&mut entry, 1);
+        entry.extend_from_slice(&READ_STATIC_TLS);
+        entry.extend_from_slice(&[0x48, 0x83, 0xC4, 0x48, 0xC3]);
+        entry.resize(worker_offset as usize, 0);
+        entry.extend_from_slice(&READ_STATIC_TLS);
+        entry.extend_from_slice(&[0x01, 0xC8, 0xC3]);
+        let mut program = static_tls_program(&entry);
+        set_test_imports(&mut program, "kernelx.dll", &["CreateThread", "WaitForSingleObject"]);
+        let mut emu = XboxX64Emu::load_pe(&program).unwrap();
+        emu.set_strict_imports();
+        let result = emu.run(100);
+        assert!(result.stopped_reason.is_none(), "{:?}", result.stopped_reason);
+        assert_eq!(result.exit_code, 42);
+        assert_eq!(emu.threads[1].exit_code, 51);
+    }
+
+    fn call_import(code: &mut Vec<u8>, slot: i32) {
+        let displacement = 0x450 + slot * 8 - (code.len() as i32 + 6);
+        code.extend_from_slice(&[0xFF, 0x15]);
+        code.extend_from_slice(&displacement.to_le_bytes());
+    }
+
+    #[test]
+    fn guest_draws_copies_reads_back_and_presents_verified_pixels() {
+        let pixels: [[u8; 4]; 4] = [
+            [0x11, 0x22, 0x33, 0x44],
+            [0x55, 0x66, 0x77, 0x88],
+            [0x99, 0xAA, 0xBB, 0xCC],
+            [0xDD, 0xEE, 0xFF, 0x00],
+        ];
+        let mut code = vec![0x48, 0x83, 0xEC, 0x68]; // sub rsp, 0x68
+        code.extend_from_slice(&[0xB9, 1, 0, 0, 0, 0xBA, 2, 0, 0, 0, 0x41, 0xB8, 3, 0, 0, 0]);
+        call_import(&mut code, 0); // clear RGBA8 to (1, 2, 3, 255)
+        code.extend_from_slice(&[0xB9, 10, 0, 0, 0, 0xBA, 11, 0, 0, 0]); // x = 10, y = 11
+        code.extend_from_slice(&[0x41, 0xB8, 3, 0, 0, 0, 0x41, 0xB9, 2, 0, 0, 0]); // 3 x 2
+        code.extend_from_slice(&[0xC7, 0x44, 0x24, 0x20, 10, 9, 8, 7]); // packed RGBA = 0x0708090A
+        call_import(&mut code, 1); // draw a solid rectangle
+        for (index, pixel) in pixels.iter().enumerate() {
+            code.extend_from_slice(&[0xC7, 0x44, 0x24, 0x30 + 4 * index as u8]);
+            code.extend_from_slice(pixel); // write each pixel to the guest upload buffer
+        }
+        code.extend_from_slice(&[0xB9, 3, 0, 0, 0, 0xBA, 4, 0, 0, 0]); // x = 3, y = 4
+        code.extend_from_slice(&[0x41, 0xB8, 2, 0, 0, 0, 0x41, 0xB9, 2, 0, 0, 0]); // 2 x 2
+        code.extend_from_slice(&[0x48, 0x8D, 0x44, 0x24, 0x30]); // lea rax, [rsp + 0x30]
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // fifth parameter
+        call_import(&mut code, 2); // upload
+        code.extend_from_slice(&[0x48, 0x8D, 0x44, 0x24, 0x40]); // separate readback buffer
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+        call_import(&mut code, 3); // readback
+        call_import(&mut code, 4); // present
+        code.extend_from_slice(&[0x8B, 0x44, 0x24, 0x4C]); // return the last pixel as the exit code
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x68, 0xC3]);
+
+        let mut pe = build_test_pe(&code, None, None);
+        let imports = [
+            "XDeviceClear",
+            "XDeviceFillRect",
+            "XDeviceCopyRgba8",
+            "XDeviceReadRgba8",
+            "XDevicePresent",
+        ];
+        set_test_imports(&mut pe, "emu-graphics.dll", &imports);
+        let mut emu = XboxX64Emu::load_pe(&pe).unwrap();
+        emu.set_strict_imports();
+        let readback_address = emu.regs[RSP] - 0x68 + 0x40;
+        let result = emu.run(200);
+
+        assert!(result.stopped_reason.is_none(), "{:?}", result.stopped_reason);
+        assert_eq!(result.exit_code, i32::from_le_bytes(pixels[3]));
+        assert_eq!(result.api_calls, imports.map(|name| format!("emu-graphics.dll!{name}")));
+        assert!(result.unimplemented_apis.is_empty());
+        assert_eq!(result.framebuffer.presents, 1);
+
+        let mut readback = [0; 16];
+        emu.mem.read_bytes(readback_address, &mut readback).unwrap();
+        assert_eq!(readback.as_slice(), pixels.as_flattened());
+        let width = result.framebuffer.width as usize;
+        for (index, actual) in result.framebuffer.rgba.chunks_exact(4).enumerate() {
+            let expected = match (index % width, index / width) {
+                (x @ 3..=4, y @ 4..=5) => pixels[(y - 4) * 2 + (x - 3)],
+                (10..=12, 11..=12) => [7, 8, 9, 10],
+                _ => [1, 2, 3, 255],
+            };
+            assert_eq!(actual, expected, "pixel {index}");
+        }
+    }
+
+    #[test]
+    fn guest_executes_rdna2_shader_and_reads_back_a_gradient() {
+        let shader: [u32; 10] = [
+            0x0A08_0700, // v_subrev_f32_e32 v4, v0, v3
+            0x7E0A_02FF, // v_mov_b32_e32 v5, literal
+            0x3E00_0000, // 0.125
+            0x080A_0B01, // v_sub_f32_e32 v5, v1, v5
+            0x100C_0300, // v_mul_f32_e32 v6, v0, v1
+            0x060E_04F0, // v_add_f32_e32 v7, 0.5, v2
+            0x560E_0300, // v_fmac_f32_e32 v7, v0, v1
+            0xF800_180F, // exp mrt0, v4, v5, v6, v7 done vm
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ];
+        let mut code = vec![0x48, 0x83, 0xEC, 0x68]; // sub rsp, 0x68
+        code.extend_from_slice(&[0xB9, 3, 0, 0, 0, 0xBA, 4, 0, 0, 0]); // x = 3, y = 4
+        code.extend_from_slice(&[0x41, 0xB8, 2, 0, 0, 0, 0x41, 0xB9, 2, 0, 0, 0]); // 2 x 2
+        let displacement = 0x180i32 - (code.len() as i32 + 7);
+        code.extend_from_slice(&[0x48, 0x8D, 0x05]); // lea rax, [rip + shader]
+        code.extend_from_slice(&displacement.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // pointer
+        code.extend_from_slice(&[0xC7, 0x44, 0x24, 0x28]); // mov dword [rsp + 0x28], byte count
+        code.extend_from_slice(&(size_of_val(&shader) as u32).to_le_bytes());
+        call_import(&mut code, 0);
+        code.extend_from_slice(&[0x48, 0x8D, 0x44, 0x24, 0x30]); // readback buffer
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+        call_import(&mut code, 1);
+        call_import(&mut code, 2);
+        code.extend_from_slice(&[0x8B, 0x44, 0x24, 0x30]); // return first pixel
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x68, 0xC3]);
+        code.resize(0x180, 0);
+        code.extend(shader.into_iter().flat_map(u32::to_le_bytes));
+        let mut pe = build_test_pe(&code, None, None);
+        let imports = ["XDeviceDrawRdna2Rect", "XDeviceReadRgba8", "XDevicePresent"];
+        set_test_imports(&mut pe, "emu-graphics.dll", &imports);
+        let expected = [
+            [191, 32, 16, 143], [64, 32, 48, 175],
+            [191, 159, 48, 175], [64, 159, 143, 255],
+        ];
+
+        let mut emu = XboxX64Emu::load_pe(&pe).unwrap();
+        emu.set_strict_imports();
+        let readback_addr = emu.regs[RSP] - 0x68 + 0x30;
+        let result = emu.run(100);
+        assert!(result.stopped_reason.is_none(), "{:?}", result.stopped_reason);
+        assert_eq!(result.exit_code, i32::from_le_bytes(expected[0]));
+        assert_eq!(result.framebuffer.presents, 1);
+        assert_eq!(result.api_calls, imports.map(|name| format!("emu-graphics.dll!{name}")));
+        let mut readback = [0; 16];
+        emu.mem.read_bytes(readback_addr, &mut readback).unwrap();
+        assert_eq!(readback.as_slice(), expected.as_flattened());
+
+        let width = result.framebuffer.width as usize;
+        for (index, pixel) in result.framebuffer.rgba.chunks_exact(4).enumerate() {
+            let expected_pixel = match (index % width, index / width) {
+                (x @ 3..=4, y @ 4..=5) => expected[(y - 4) * 2 + x - 3],
+                _ => [0; 4],
+            };
+            assert_eq!(pixel, expected_pixel, "pixel {index}");
+        }
+
+        for (word, expected_error) in [
+            (0u32, "Unsupported RDNA2"),
+            (0x5608_0300, "reads uninitialized v4"),
+        ] {
+            pe[0x380..0x384].copy_from_slice(&word.to_le_bytes());
+            let mut invalid = XboxX64Emu::load_pe(&pe).unwrap();
+            invalid.set_strict_imports();
+            let result = invalid.run(100);
+            assert!(result.stopped_reason.unwrap().contains(expected_error));
+            assert_eq!(result.framebuffer.presents, 0);
+            assert!(result.framebuffer.rgba.iter().all(|&channel| channel == 0));
+        }
+    }
+
+    #[test]
+    fn guest_framebuffer_copy_rejects_invalid_geometry_and_memory() {
+        let code = [0xFF, 0x15, 0x4A, 0x04, 0x00, 0x00, 0xC3]; // call the first import; ret
+        let pe = build_test_pe(&code, Some("emu-graphics.dll"), Some("XDeviceCopyRgba8"));
+        for (x, expected_error) in [(u32::MAX, "copy rectangle"), (0, "read fault")] {
+            let mut emu = XboxX64Emu::load_pe(&pe).unwrap();
+            emu.set_strict_imports();
+            emu.regs[RCX] = x.into();
+            emu.regs[R8] = 2;
+            emu.regs[R9] = 2;
+            emu.mem.write_bytes(emu.regs[RSP] + 0x20, &0u64.to_le_bytes()).unwrap();
+            let result = emu.run(20);
+            assert!(result.stopped_reason.unwrap().contains(expected_error));
+            assert!(result.framebuffer.rgba.iter().all(|&byte| byte == 0));
+            assert_eq!(result.framebuffer.presents, 0);
+        }
+    }
+
+    #[test]
+    fn repeated_string_operations_respect_direction_and_step_budget() {
+        // std; rep movsb; cld; rep stosw; ret
+        let pe = build_test_pe(&[0xFD, 0xF3, 0xA4, 0xFC, 0xF3, 0x66, 0xAB, 0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&pe).unwrap();
+        let src = emu.rip + 0x100;
+        let dest = src + 0x20;
+        emu.mem.write_bytes(src, &[1, 2, 3]).unwrap();
+        emu.regs[RSI] = src + 2;
+        emu.regs[RDI] = dest + 2;
+        emu.regs[RCX] = 3;
+
+        assert_eq!(emu.step_budget(2), EmuStepState::Running);
+        assert_eq!(emu.regs[RCX], 2);
+        assert_eq!(emu.mem.read_u8(dest + 2).unwrap(), 3);
+        assert_eq!(emu.step_budget(3), EmuStepState::Running);
+        assert_eq!(emu.mem.read_u16(dest).unwrap(), 0x0201);
+        assert_eq!(emu.regs[RSI], src - 1);
+        assert_eq!(emu.regs[RDI], dest - 1);
+        assert_eq!(emu.rflags & DF, 0);
+
+        emu.regs[RAX] = 0x1234;
+        emu.regs[RDI] = dest + 4;
+        emu.regs[RCX] = 2;
+        assert_eq!(emu.step_budget(20), EmuStepState::Exited(0x1234));
+        assert_eq!(emu.mem.read_u32(dest + 4).unwrap(), 0x1234_1234);
+    }
+
+    #[test]
+    fn strict_probe_stops_at_placeholder_graphics_or_unknown_import() {
+        for name in ["D3D12XBOX_CreateDevice", "UnimplementedTestApi"] {
+            // call [rip + (0x1450 - 0x1006)]; ret
+            let pe = build_test_pe(&[0xFF, 0x15, 0x4A, 0x04, 0x00, 0x00, 0xC3], Some("d3d12_xs.dll"), Some(name));
+            let mut emu = XboxX64Emu::load_pe(&pe).unwrap();
+            emu.set_strict_imports();
+            let result = emu.run(20);
+            assert!(result.stopped_reason.unwrap().contains(name));
+            assert_eq!(result.unimplemented_apis, [format!("d3d12_xs.dll!{name}")]);
+            assert_eq!(emu.total_instructions(), 1);
+        }
     }
 
     #[test]
@@ -2267,6 +3208,55 @@ mod tests {
     }
 
     #[test]
+    fn guest_can_load_and_call_runtime_error_export_dynamically() {
+        let base = 0x14000_1000u64;
+        let library = base + 0x200;
+        let export = base + 0x240;
+        let message = base + 0x280;
+        let mut code = vec![0x48, 0x83, 0xEC, 0x28, 0x48, 0xB9];
+        code.extend_from_slice(&library.to_le_bytes());
+        call_import(&mut code, 0);
+        code.extend_from_slice(&[0x48, 0x89, 0xC1, 0x48, 0xBA]);
+        code.extend_from_slice(&export.to_le_bytes());
+        call_import(&mut code, 1);
+        code.extend_from_slice(&[0xB9, 5, 0x40, 0, 0x80, 0x48, 0xBA]);
+        code.extend_from_slice(&message.to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        code.resize(0x200, 0);
+        code.extend("XGameRuntime.dll\0".encode_utf16().flat_map(u16::to_le_bytes));
+        code.resize(0x240, 0);
+        code.extend_from_slice(b"XErrorReport\0");
+        code.resize(0x280, 0);
+        code.extend_from_slice(b"startup failed\0");
+
+        let mut program = build_test_pe(&code, None, None);
+        set_test_imports(&mut program, "kernelx.dll", &["LoadLibraryW", "GetProcAddress"]);
+        let mut emu = XboxX64Emu::load_pe(&program).unwrap();
+        emu.set_strict_imports();
+        assert_eq!(emu.get_runtime_module(library, true, false).unwrap(), 0);
+        let result = emu.run(100);
+        assert!(result.stopped_reason.is_none(), "{result:?}");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.output, "XErrorReport(0x80004005): startup failed\n");
+        let handle = emu.get_runtime_module(library, true, false).unwrap();
+        let before = emu.thunks.len();
+        assert_ne!(emu.get_runtime_export(handle, export).unwrap(), 0);
+        assert_eq!(emu.thunks.len(), before);
+        assert_eq!(emu.get_runtime_export(handle, message).unwrap(), 0);
+        assert_eq!(emu.mem.read_u32(emu.teb_va + LAST_ERROR_OFFSET).unwrap(), 127);
+
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let native = crate::native::run(&program).expect("native run with dynamic Xbox export");
+            assert!(native.is_complete(), "{native:?}");
+            assert_eq!(native.resolved, 2);
+            assert_eq!(native.shimmed, ["XErrorReport"]);
+            assert_eq!(native.exit_code, result.exit_code);
+            assert_eq!(native.output, result.output);
+        }
+    }
+
+    #[test]
     fn xinput_get_state_reports_pressed_buttons() {
         // sub rsp, 0x38
         // xor ecx, ecx               ; pad 0
@@ -2294,6 +3284,62 @@ mod tests {
         let res = emu.run(1000);
         assert!(res.stopped_reason.is_none(), "{:?}", res.stopped_reason);
         assert_eq!(res.exit_code as u16, 0x1011);
+    }
+
+    #[test]
+    fn scalar_truncation_matches_x64_for_invalid_and_boundary_inputs() {
+        let values = [
+            f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0,
+            1.9, -1.9, 2_147_483_647.9, 2_147_483_648.0,
+            -2_147_483_648.9, -2_147_483_649.0,
+            9_223_372_036_854_774_784.0, 9_223_372_036_854_775_808.0,
+            -9_223_372_036_854_775_808.0, -9_223_372_036_854_777_856.0,
+        ];
+        for single in [false, true] {
+            for wide in [false, true] {
+                for memory in [false, true] {
+                    let mut code = vec![if single { 0xF3 } else { 0xF2 }];
+                    if wide {
+                        code.push(0x48);
+                    }
+                    code.extend_from_slice(&[0x0F, 0x2C, if memory { 0x00 } else { 0xC0 }]);
+                    let pe = build_test_pe(&code, None, None);
+                    let mut emu = XboxX64Emu::load_pe(&pe).unwrap();
+                    let entry = emu.rip;
+                    let size = if wide { 8 } else { 4 };
+                    let buffer = emu.mem.alloc(None, PAGE_SIZE_4K, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true).unwrap();
+                    let operand = buffer + PAGE_SIZE_4K - if single { 4 } else { 8 };
+                    for value in values {
+                        let value = if single { (value as f32) as f64 } else { value };
+                        let bits = if single { (value as f32).to_bits() as u64 } else { value.to_bits() };
+                        if single {
+                            emu.mem.write_u32(operand, bits as u32).unwrap();
+                        } else {
+                            emu.mem.write_u64(operand, bits).unwrap();
+                        }
+                        let original_xmm = (u128::MAX << 64) | bits as u128;
+                        emu.xmm[0] = original_xmm;
+                        emu.regs[RAX] = if memory { operand } else { u64::MAX };
+                        emu.rip = entry;
+                        emu.step().unwrap();
+                        let expected = XboxX64Emu::truncate_float_to_integer(value, size);
+                        assert_eq!(emu.regs[RAX], expected);
+                        assert_eq!(emu.xmm[0], original_xmm);
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            use std::arch::x86_64::*;
+                            let native = match (single, wide) {
+                                (true, true) => _mm_cvttss_si64(_mm_set_ss(value as f32)) as u64,
+                                (true, false) => _mm_cvttss_si32(_mm_set_ss(value as f32)) as u32 as u64,
+                                (false, true) => _mm_cvttsd_si64(_mm_set_sd(value)) as u64,
+                                (false, false) => _mm_cvttsd_si32(_mm_set_sd(value)) as u32 as u64,
+                            };
+                            assert_eq!(emu.regs[RAX], native, "value={value}, single={single}, wide={wide}, memory={memory}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

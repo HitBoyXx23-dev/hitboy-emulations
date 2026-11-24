@@ -30,6 +30,20 @@ pub struct NativeResult {
     pub resolved: usize,
 }
 
+#[derive(Debug, Default)]
+pub struct NativeImports {
+    pub resolved: usize,
+    pub shimmed: Vec<String>,
+    pub unimplemented: Vec<String>,
+    pub missing_modules: Vec<String>,
+}
+
+impl NativeImports {
+    pub fn is_complete(&self) -> bool {
+        self.unimplemented.is_empty() && self.missing_modules.is_empty()
+    }
+}
+
 impl NativeResult {
     /// True when nothing important was left unresolved.
     pub fn is_complete(&self) -> bool {
@@ -42,14 +56,21 @@ pub fn run(_file: &[u8]) -> Result<NativeResult, String> {
     Err("Native mode runs the game on this PC's own processor, so it needs 64-bit Windows. Use Emulator mode on this system.".into())
 }
 
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub fn check_imports(_file: &[u8]) -> Result<NativeImports, String> {
+    Err("Checking native Xbox imports requires 64-bit Windows.".into())
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub use win::*;
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod win {
-    use super::NativeResult;
+    use super::{NativeImports, NativeResult};
     use crate::modules::{self, Provider};
-    use crate::pe::{Pe, PAGE_READONLY, PAGE_READWRITE};
+    use crate::native_pages::PhysicalPages;
+    use crate::pe::{Pe, PAGE_EXECUTE_READ, PAGE_READWRITE};
+    use crate::shims::{XGAME_RUNTIME_DLL, XGAME_RUNTIME_EXPORTS};
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::sync::Mutex;
@@ -61,7 +82,14 @@ mod win {
         fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
         fn VirtualProtect(addr: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
         fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        fn GetModuleHandleA(name: *const u8) -> *mut c_void;
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn LoadLibraryA(name: *const u8) -> *mut c_void;
         fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn LoadLibraryExA(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void;
+        fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+        fn FreeLibrary(module: *mut c_void) -> i32;
+        fn SetLastError(error: u32);
         fn RtlAddFunctionTable(function_table: *mut c_void, entry_count: u32, base_address: u64) -> u8;
         fn RtlDeleteFunctionTable(function_table: *mut c_void) -> u8;
     }
@@ -70,8 +98,11 @@ mod win {
     const MEM_RELEASE: u32 = 0x8000;
     /// Alignment the Windows loader gives every section.
     const SECTION_ALIGN: u64 = 0x1000;
+    const RUNTIME_HANDLE: usize = 0xFFFF_FFFF_FFFD_0000;
+    const XBOX_SHIM_HANDLE: usize = 0xFFFF_FFFF_FFFC_0000;
 
     /// State shared with the shim dispatcher while a game is running.
+    #[derive(Default)]
     struct Run {
         modules: Vec<String>,
         shimmed: Vec<String>,
@@ -80,6 +111,8 @@ mod win {
         output: String,
         exit_code: Option<i32>,
         resolved: usize,
+        runtime_refs: u32,
+        physical_pages: PhysicalPages,
     }
 
     impl Run {
@@ -99,6 +132,11 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
     fn with<R>(f: impl FnOnce(&mut Run) -> R) -> R {
         let mut g = RUN.lock().unwrap_or_else(|e| e.into_inner());
         f(g.as_mut().expect("a native run is active"))
+    }
+
+    pub(crate) fn with_physical_pages<R>(f: impl FnOnce(&mut PhysicalPages) -> R) -> Option<R> {
+        let mut state = RUN.lock().unwrap_or_else(|e| e.into_inner());
+        state.as_mut().map(|run| f(&mut run.physical_pages))
     }
 
     /// The libraries a running game pulled in, so a shim can tell where a call came from.
@@ -124,6 +162,269 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     fn wide(name: &str) -> Vec<u16> {
         name.encode_utf16().chain(Some(0)).collect()
+    }
+
+    unsafe fn name_matches(address: usize, wide: bool, expected: &str, ignore_case: bool) -> bool {
+        address != 0 && expected.bytes().chain(Some(0)).enumerate().all(|(index, byte)| {
+            let value = if wide {
+                unsafe { (address as *const u16).add(index).read_unaligned() }
+            } else {
+                u16::from(unsafe { (address as *const u8).add(index).read() })
+            };
+            if ignore_case && value <= 0x7f {
+                (value as u8).eq_ignore_ascii_case(&byte)
+            } else {
+                value == u16::from(byte)
+            }
+        })
+    }
+
+    unsafe fn is_runtime_name(address: usize, wide: bool) -> bool {
+        unsafe { name_matches(address, wide, XGAME_RUNTIME_DLL, true)
+            || name_matches(address, wide, "xgameruntime", true) }
+    }
+
+    fn runtime_handle(load: bool) -> *mut c_void {
+        let loaded = with(|run| {
+            if load {
+                run.runtime_refs = run.runtime_refs.saturating_add(1);
+            }
+            run.runtime_refs != 0
+        });
+        if loaded {
+            RUNTIME_HANDLE as *mut c_void
+        } else {
+            unsafe { SetLastError(126) };
+            std::ptr::null_mut()
+        }
+    }
+
+    unsafe fn read_guest_name(address: usize, wide: bool) -> String {
+        if address == 0 {
+            return String::new();
+        }
+        let mut out = String::new();
+        for index in 0..260usize {
+            let v = if wide {
+                unsafe { (address as *const u16).add(index).read_unaligned() }
+            } else {
+                u16::from(unsafe { (address as *const u8).add(index).read() })
+            };
+            if v == 0 {
+                break;
+            }
+            if let Some(ch) = char::from_u32(u32::from(v)) {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Maps an Xbox console DLL name passed to `LoadLibrary` / `GetModuleHandle` into either
+    /// its Windows counterpart or our virtual Xbox console shim handle.
+    fn resolve_console_dll(raw_name: &str, load: bool) -> Option<*mut c_void> {
+        let base = raw_name
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(raw_name)
+            .to_ascii_lowercase();
+        let with_ext = if base.ends_with(".dll") { base } else { format!("{base}.dll") };
+        if with_ext == XGAME_RUNTIME_DLL {
+            return Some(runtime_handle(load));
+        }
+        match modules::provider(&with_ext) {
+            Some(Provider::Windows(win_dll)) if !win_dll.eq_ignore_ascii_case(&with_ext) => {
+                let w = wide(win_dll);
+                let h = if load {
+                    unsafe { LoadLibraryW(w.as_ptr()) }
+                } else {
+                    unsafe { GetModuleHandleW(w.as_ptr()) }
+                };
+                if !h.is_null() {
+                    return Some(h);
+                }
+                Some(XBOX_SHIM_HANDLE as *mut c_void)
+            }
+            Some(Provider::Shim { .. }) => Some(XBOX_SHIM_HANDLE as *mut c_void),
+            _ => None,
+        }
+    }
+
+    unsafe extern "system" fn guest_get_module_handle_a(name: *const u8) -> *mut c_void {
+        if unsafe { is_runtime_name(name as usize, false) } {
+            runtime_handle(false)
+        } else {
+            let s = unsafe { read_guest_name(name as usize, false) };
+            if let Some(h) = resolve_console_dll(&s, false) {
+                return h;
+            }
+            unsafe { GetModuleHandleA(name) }
+        }
+    }
+
+    unsafe extern "system" fn guest_get_module_handle_w(name: *const u16) -> *mut c_void {
+        if unsafe { is_runtime_name(name as usize, true) } {
+            runtime_handle(false)
+        } else {
+            let s = unsafe { read_guest_name(name as usize, true) };
+            if let Some(h) = resolve_console_dll(&s, false) {
+                return h;
+            }
+            unsafe { GetModuleHandleW(name) }
+        }
+    }
+
+    unsafe extern "system" fn guest_load_library_a(name: *const u8) -> *mut c_void {
+        if unsafe { is_runtime_name(name as usize, false) } {
+            runtime_handle(true)
+        } else {
+            let s = unsafe { read_guest_name(name as usize, false) };
+            if let Some(h) = resolve_console_dll(&s, true) {
+                return h;
+            }
+            unsafe { LoadLibraryA(name) }
+        }
+    }
+
+    unsafe extern "system" fn guest_load_library_w(name: *const u16) -> *mut c_void {
+        if unsafe { is_runtime_name(name as usize, true) } {
+            runtime_handle(true)
+        } else {
+            let s = unsafe { read_guest_name(name as usize, true) };
+            if let Some(h) = resolve_console_dll(&s, true) {
+                return h;
+            }
+            unsafe { LoadLibraryW(name) }
+        }
+    }
+
+    fn load_runtime_ex(file: *mut c_void, flags: u32) -> *mut c_void {
+        if file.is_null() && flags == 0 {
+            runtime_handle(true)
+        } else {
+            unsafe { SetLastError(87) };
+            std::ptr::null_mut()
+        }
+    }
+
+    unsafe extern "system" fn guest_load_library_ex_a(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void {
+        if unsafe { is_runtime_name(name as usize, false) } {
+            load_runtime_ex(file, flags)
+        } else {
+            let s = unsafe { read_guest_name(name as usize, false) };
+            if let Some(h) = resolve_console_dll(&s, true) {
+                return h;
+            }
+            unsafe { LoadLibraryExA(name, file, flags) }
+        }
+    }
+
+    unsafe extern "system" fn guest_load_library_ex_w(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void {
+        if unsafe { is_runtime_name(name as usize, true) } {
+            load_runtime_ex(file, flags)
+        } else {
+            let s = unsafe { read_guest_name(name as usize, true) };
+            if let Some(h) = resolve_console_dll(&s, true) {
+                return h;
+            }
+            unsafe { LoadLibraryExW(name, file, flags) }
+        }
+    }
+
+    unsafe extern "system" fn guest_get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void {
+        if module as usize == XBOX_SHIM_HANDLE {
+            if name as usize > u16::MAX as usize {
+                let sym = unsafe { read_guest_name(name as usize, false) };
+                if let Some(address) = crate::shims::resolve(&sym) {
+                    with(|run| {
+                        if !run.shimmed.iter().any(|n| n == &sym) {
+                            run.shimmed.push(sym.clone());
+                        }
+                    });
+                    return address;
+                }
+            }
+            unsafe { SetLastError(127) };
+            return std::ptr::null_mut();
+        }
+        if module as usize != RUNTIME_HANDLE {
+            let address = unsafe { GetProcAddress(module, name) };
+            if !address.is_null() {
+                return if address == VirtualFree as *mut c_void {
+                    crate::native_pages::guest_virtual_free as *mut c_void
+                } else {
+                    address
+                };
+            }
+            // Fallback: Xbox-specific extensions queried on redirected Windows DLLs (e.g. d3d12_xs -> d3d12.dll)
+            if name as usize > u16::MAX as usize {
+                let sym = unsafe { read_guest_name(name as usize, false) };
+                if let Some(shim_addr) = crate::shims::resolve(&sym) {
+                    with(|run| {
+                        if !run.shimmed.iter().any(|n| n == &sym) {
+                            run.shimmed.push(sym.clone());
+                        }
+                    });
+                    return shim_addr;
+                }
+            }
+            return std::ptr::null_mut();
+        }
+        if !with(|run| run.runtime_refs != 0) {
+            unsafe { SetLastError(6) };
+            return std::ptr::null_mut();
+        }
+        if name as usize > u16::MAX as usize {
+            for &export in XGAME_RUNTIME_EXPORTS {
+                if unsafe { name_matches(name as usize, false, export, false) } {
+                    if let Some(address) = crate::shims::resolve(export) {
+                        with(|run| {
+                            if !run.shimmed.iter().any(|name| name == export) {
+                                run.shimmed.push(export.to_owned());
+                            }
+                        });
+                        return address;
+                    }
+                }
+            }
+        }
+        unsafe { SetLastError(127) };
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "system" fn guest_free_library(module: *mut c_void) -> i32 {
+        if module as usize == XBOX_SHIM_HANDLE {
+            return 1;
+        }
+        if module as usize != RUNTIME_HANDLE {
+            return unsafe { FreeLibrary(module) };
+        }
+        let released = with(|run| {
+            if run.runtime_refs == 0 {
+                return false;
+            }
+            run.runtime_refs -= 1;
+            true
+        });
+        if !released {
+            unsafe { SetLastError(6) };
+        }
+        i32::from(released)
+    }
+
+    fn guest_loader_export(name: &str) -> Option<*mut c_void> {
+        Some(match name {
+            "GetModuleHandleA" => guest_get_module_handle_a as *mut c_void,
+            "GetModuleHandleW" => guest_get_module_handle_w as *mut c_void,
+            "LoadLibraryA" => guest_load_library_a as *mut c_void,
+            "LoadLibraryW" => guest_load_library_w as *mut c_void,
+            "LoadLibraryExA" => guest_load_library_ex_a as *mut c_void,
+            "LoadLibraryExW" => guest_load_library_ex_w as *mut c_void,
+            "GetProcAddress" => guest_get_proc_address as *mut c_void,
+            "FreeLibrary" => guest_free_library as *mut c_void,
+            "VirtualFree" => crate::native_pages::guest_virtual_free as *mut c_void,
+            _ => return None,
+        })
     }
 
     /// Resolves one export by name, or by ordinal when the name starts with '#'.
@@ -207,14 +508,13 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
         Ok(())
     }
 
-    /// Applies each section's final page protection (except the section holding the IAT, which
-    /// stays writable until `bind_imports` finishes).
     fn protect_sections(pe: &Pe, img: &Image) -> Result<(), String> {
-        let iat = pe.iat_range();
         for s in &pe.sections {
             let dst = img.rva(s.vaddr) as *mut u8;
-            let holds_iat = iat.is_some_and(|(lo, hi)| s.vaddr <= lo && hi <= s.vaddr + s.vsize.max(s.raw_size));
-            let prot = if holds_iat { PAGE_READWRITE } else { s.protect() };
+            let prot = s.protect();
+            if s.vsize.max(s.raw_size) == 0 {
+                continue;
+            }
             if prot != PAGE_READWRITE {
                 let mut old = 0;
                 let len = align_up(s.vsize.max(s.raw_size) as u64, SECTION_ALIGN) as usize;
@@ -243,17 +543,29 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     /// Fills the import address table: Windows libraries from the real DLL, Xbox-only libraries
     /// from our shims. Returns how many slots got a working address.
-    fn bind_imports(pe: &Pe, img: &Image, out: &mut Run) -> usize {
+    fn bind_imports(pe: &Pe, img: Option<&Image>, out: &mut Run) -> usize {
         let mut filled = 0;
         // Handles stay loaded for the whole run so resolved addresses keep working.
         let mut handles: HashMap<String, *mut c_void> = HashMap::new();
+        let write_slot = |rva: u32, address: *mut c_void| {
+            if let Some(img) = img {
+                unsafe { *(img.rva(rva) as *mut *mut c_void) = address };
+            }
+        };
         for module in &pe.imports {
             if !out.modules.contains(&module.dll) {
                 out.modules.push(module.dll.clone());
             }
             match modules::provider(&module.dll) {
                 Some(Provider::Windows(sys)) => {
-                    let h = *handles.entry(sys.to_string()).or_insert_with(|| unsafe { LoadLibraryW(wide(sys).as_ptr()) });
+                    let h = *handles.entry(sys.to_string()).or_insert_with(|| unsafe {
+                        if img.is_some() {
+                            LoadLibraryW(wide(sys).as_ptr())
+                        } else {
+                            const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
+                            LoadLibraryExW(wide(sys).as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32)
+                        }
+                    });
                     if h.is_null() {
                         if !out.missing.contains(&module.dll) {
                             out.missing.push(module.dll.clone());
@@ -264,15 +576,17 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
                         // Xbox kernels and graphics DLLs carry a few console-specific exports
                         // alongside the standard Windows ones; check our shims when Windows doesn't
                         // export the symbol.
-                        let p = resolve(h, &f.name).or_else(|| resolve(h, f.name.trim_start_matches('_')));
+                        let name = f.name.trim_start_matches('_');
+                        let guest_loader = (sys == "kernel32.dll").then(|| guest_loader_export(name)).flatten();
+                        let p = guest_loader.or_else(|| resolve(h, &f.name)).or_else(|| resolve(h, name));
                         match p {
                             Some(p) => {
-                                unsafe { *(img.rva(f.slot) as *mut *mut c_void) = p };
+                                write_slot(f.slot, p);
                                 filled += 1;
                             }
                             None => match crate::shims::resolve(&f.name) {
                                 Some(p) => {
-                                    unsafe { *(img.rva(f.slot) as *mut *mut c_void) = p };
+                                    write_slot(f.slot, p);
                                     filled += 1;
                                     if !out.shimmed.contains(&f.name) {
                                         out.shimmed.push(f.name.clone());
@@ -287,7 +601,7 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
                     for f in &module.functions {
                         match crate::shims::resolve(&f.name) {
                             Some(p) => {
-                                unsafe { *(img.rva(f.slot) as *mut *mut c_void) = p };
+                                write_slot(f.slot, p);
                                 filled += 1;
                                 if !out.shimmed.contains(&f.name) {
                                     out.shimmed.push(f.name.clone());
@@ -305,35 +619,64 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
                 None => out.note(module.dll.clone()),
             }
         }
+        if img.is_none() {
+            for handle in handles.into_values().filter(|handle| !handle.is_null()) {
+                unsafe { FreeLibrary(handle) };
+            }
+        }
         filled
     }
 
-    /// Makes the import table read-only, as the Windows loader does, so the game can't rewrite
-    /// its own imports after we bound them.
-    fn lock_iat(pe: &Pe, img: &Image) {
-        if let Some((lo, hi)) = pe.iat_range() {
-            let mut old = 0;
-            unsafe { VirtualProtect(img.rva(lo) as *mut c_void, (hi - lo) as usize, PAGE_READONLY, &mut old) };
+    pub fn check_imports(file: &[u8]) -> Result<NativeImports, String> {
+        let _slot = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let pe = crate::pe::parse(file)?;
+        if !pe.is_x64() {
+            return Err(format!("Native Xbox import checks require x86-64; this image uses {:#x}.", pe.machine));
         }
+        let mut report = Run::default();
+        let resolved = bind_imports(&pe, None, &mut report);
+        Ok(NativeImports {
+            resolved,
+            shimmed: report.shimmed,
+            unimplemented: report.unimplemented,
+            missing_modules: report.missing,
+        })
     }
 
-    /// Walks the image's TLS callbacks, which the Windows loader runs before the entry point.
-    fn run_tls_callbacks(pe: &Pe, base: u64) {
-        let Some(tls) = pe.tls else { return };
-        if tls.callbacks_va == 0 || tls.callbacks_va < pe.image_base {
-            return;
-        }
-        let delta = (base as i64).wrapping_sub(pe.image_base as i64);
-        let mut at = (tls.callbacks_va as i64).wrapping_add(delta) as u64;
-        // The list is null-terminated.
-        for _ in 0..64 {
-            let p = unsafe { *(at as *const u64) };
-            if p == 0 {
-                break;
+    fn tls_callbacks(pe: &Pe, image: &Image, image_size: usize) -> Result<Vec<u64>, String> {
+        let Some(tls) = pe.tls.filter(|tls| tls.callbacks_va != 0) else { return Ok(Vec::new()) };
+        let offset = tls.callbacks_va.checked_sub(pe.image_base)
+            .ok_or("PE TLS callback table precedes the image")?;
+        let mut callbacks = Vec::new();
+        for index in 0..=64 {
+            let slot = offset.checked_add(index * 8)
+                .filter(|slot| slot.checked_add(8).is_some_and(|end| end <= image_size as u64))
+                .ok_or("PE TLS callback table runs past the image")?;
+            let address = unsafe { ((image.base + slot) as *const u64).read_unaligned() };
+            if address == 0 {
+                return Ok(callbacks);
             }
-            let f: extern "system" fn(*mut c_void, u32, *mut c_void) = unsafe { std::mem::transmute(p as usize) };
-            f(base as *mut c_void, 1, std::ptr::null_mut()); // DLL_PROCESS_ATTACH
-            at += 8;
+            let relative = address.checked_sub(image.base)
+                .filter(|rva| *rva < image_size as u64)
+                .ok_or("PE TLS callback address is outside the image")?;
+            let executable = pe.sections.iter().any(|section| {
+                section.protect() == PAGE_EXECUTE_READ
+                    && relative.checked_sub(u64::from(section.vaddr))
+                        .is_some_and(|offset| offset < u64::from(section.vsize.max(section.raw_size)))
+            });
+            if !executable {
+                return Err("PE TLS callback address is outside executable sections".into());
+            }
+            callbacks.push(address);
+        }
+        Err("PE TLS callback table has more than 64 entries".into())
+    }
+
+    fn run_tls_callbacks(callbacks: &[u64], base: u64) {
+        for &address in callbacks {
+            let callback: extern "system" fn(*mut c_void, u32, *mut c_void) =
+                unsafe { std::mem::transmute(address as usize) };
+            callback(base as *mut c_void, 1, std::ptr::null_mut());
         }
     }
 
@@ -352,7 +695,6 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
         let img = Image::reserve(pe.image_base, size, !pe.relocs.is_empty())?;
         copy_sections(&pe, file, &img)?;
         relocate(&pe, &img, (img.base as i64).wrapping_sub(pe.image_base as i64));
-        protect_sections(&pe, &img)?;
 
         let mut state = Run {
             modules: Vec::new(),
@@ -362,14 +704,14 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
             output: String::new(),
             exit_code: None,
             resolved: 0,
+            runtime_refs: u32::from(pe.imports.iter().any(|module| module.dll.eq_ignore_ascii_case(XGAME_RUNTIME_DLL))),
+            physical_pages: PhysicalPages::default(),
         };
-        state.resolved = bind_imports(&pe, &img, &mut state);
-        lock_iat(&pe, &img);
+        state.resolved = bind_imports(&pe, Some(&img), &mut state);
+        let callbacks = tls_callbacks(&pe, &img, size)?;
+        protect_sections(&pe, &img)?;
 
-        // Take the image's own allocation out of `img` so it survives the spawned thread, which
-        // borrows nothing but the entry address.
         let base = img.base;
-        std::mem::forget(img);
         // Register x64 SEH unwind entries (.pdata) so exceptions inside the title unwind cleanly.
         let seh_table = if pe.exception_rva != 0 && pe.exception_size >= 12 {
             let tbl = (base + pe.exception_rva as u64) as *mut c_void;
@@ -383,13 +725,12 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
             None
         };
 
-        run_tls_callbacks(&pe, base);
-
         *RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
         let entry_addr = base + pe.entry as u64;
         let t = std::thread::Builder::new()
             .stack_size(64 << 20)
             .spawn(move || {
+                run_tls_callbacks(&callbacks, base);
                 // Xbox entry points take no arguments and return the process exit code.
                 let f: extern "system" fn() -> i32 = unsafe { std::mem::transmute(entry_addr as usize) };
                 let rc = f();
@@ -398,15 +739,14 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
                         r.exit_code = Some(rc);
                     }
                 });
-            })
-            .map_err(|e| e.to_string())?;
-        let _ = t.join();
+            });
+        let thread_result = t.map(|thread| thread.join());
         let r = RUN.lock().unwrap_or_else(|e| e.into_inner()).take().expect("run state");
         if let Some(tbl) = seh_table {
             unsafe { RtlDeleteFunctionTable(tbl) };
         }
-        // Free the game image only once its thread has finished with it.
-        unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
+        thread_result.map_err(|e| e.to_string())?
+            .map_err(|_| "The native title thread panicked.".to_string())?;
         Ok(NativeResult {
             output: r.output,
             exit_code: r.exit_code.unwrap_or(0),
@@ -626,6 +966,223 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
             assert_eq!(r.exit_code, 7);
             assert!(r.resolved >= 1, "the Windows import should have been resolved: {r:?}");
             assert!(r.missing_modules.is_empty());
+        }
+
+        #[test]
+        fn executes_code_sharing_a_page_with_the_import_table() {
+            let mut program = sample_program("GetCurrentProcessId", 0x0000_0002_4000_0000);
+            program[0x310..0x314].copy_from_slice(&0x11C0u32.to_le_bytes());
+            program[0x20D..0x211].copy_from_slice(&(0x11C0i32 - 0x1011).to_le_bytes());
+            let result = run(&program).expect("native run with executable IAT section");
+            assert_eq!(result.exit_code, 7);
+            assert_eq!(result.resolved, 1);
+            assert!(result.is_complete());
+        }
+
+        #[test]
+        fn binds_import_tables_in_separate_sections() {
+            let mut program = sample_program("GetCurrentProcessId", 0x0000_0002_6000_0000);
+            program[0x314..0x318].copy_from_slice(&0x11A0u32.to_le_bytes());
+            program[0x320..0x324].copy_from_slice(&0x1160u32.to_le_bytes());
+            program[0x324..0x328].copy_from_slice(&0x11C0u32.to_le_bytes());
+            program[0x360..0x36C].copy_from_slice(b"kernelx.dll\0");
+            program[0x382..0x396].copy_from_slice(b"GetCurrentProcessId\0");
+            program[0x3A0..0x3A8].copy_from_slice(&0x1180u64.to_le_bytes());
+            program[0x20D..0x211].copy_from_slice(&(0x11C0i32 - 0x1011).to_le_bytes());
+            let result = run(&program).expect("native run with import tables in separate sections");
+            assert_eq!(result.exit_code, 7);
+            assert_eq!(result.resolved, 2);
+            assert!(result.is_complete());
+            let mut emu = crate::x64_emu::XboxX64Emu::load_pe(&program).unwrap();
+            emu.set_strict_imports();
+            let interpreted = emu.run(100);
+            assert!(interpreted.stopped_reason.is_none(), "{:?}", interpreted.stopped_reason);
+            assert_eq!(interpreted.exit_code, result.exit_code);
+        }
+
+        #[test]
+        fn guest_uses_xbox_memory_allocator_through_native_import_table() {
+            let mut program = full_program("", 0x0000_0002_8000_0000);
+            program[0x502..0x513].copy_from_slice(b"XMemVirtualAlloc\0");
+            program[0x5C0..0x5CC].fill(0);
+            program[0x5C0..0x5C9].copy_from_slice(b"xmem.dll\0");
+            program[0x310..0x314].copy_from_slice(&0x21D0u32.to_le_bytes());
+            program[0x314..0x318].copy_from_slice(&0x11A0u32.to_le_bytes());
+            program[0x320..0x324].copy_from_slice(&0x1160u32.to_le_bytes());
+            program[0x324..0x328].copy_from_slice(&0x11C0u32.to_le_bytes());
+            program[0x360..0x36C].copy_from_slice(b"kernelx.dll\0");
+            program[0x382..0x38E].copy_from_slice(b"VirtualFree\0");
+            program[0x3A0..0x3A8].copy_from_slice(&0x1180u64.to_le_bytes());
+
+            let entry = [
+                0x48, 0x83, 0xEC, 0x28,
+                0x31, 0xC9,
+                0xBA, 1, 0, 0, 0,
+                0x41, 0xB8, 0, 0x30, 0, 0x20,
+                0x41, 0xB9, 7, 0, 0, 0,
+                0xC7, 0x44, 0x24, 0x20, 4, 8, 0, 0,
+                0xFF, 0x15, 0xAB, 0x11, 0, 0,
+                0x48, 0x85, 0xC0,
+                0x74, 0x1F,
+                0x48, 0x89, 0xC1,
+                0xA9, 0xFF, 0xFF, 0x1F, 0,
+                0x75, 0x15,
+                0xC6, 0x80, 0xFF, 0xFF, 0x1F, 0, 42,
+                0x31, 0xD2,
+                0x41, 0xB8, 0, 0x80, 0, 0,
+                0xFF, 0x15, 0x77, 1, 0, 0,
+                0x48, 0x83, 0xC4, 0x28,
+                0xC3,
+            ];
+            program[0x200..0x200 + entry.len()].copy_from_slice(&entry);
+
+            let result = run(&program).expect("native run with Xbox allocation");
+            assert!(result.is_complete(), "{result:?}");
+            assert_eq!(result.shimmed, ["XMemVirtualAlloc"]);
+            assert_eq!(result.exit_code, 1);
+        }
+
+        #[test]
+        fn guest_allocates_and_frees_native_physical_pages() {
+            let mut program = sample_program("XMemAllocatePhysicalPages", 0x0000_0002_C000_0000);
+            let library = b"xmem.dll\0";
+            program[0x5C0..0x5C0 + library.len()].copy_from_slice(library);
+            program[0x310..0x314].copy_from_slice(&0x21D0u32.to_le_bytes());
+            program[0x588..0x590].copy_from_slice(&0x2140u64.to_le_bytes());
+            let free = b"XMemFreePhysicalPages\0";
+            program[0x542..0x542 + free.len()].copy_from_slice(free);
+
+            let mut entry = vec![
+                0x48, 0x83, 0xEC, 0x38,
+                0x48, 0xC7, 0x44, 0x24, 0x20, 1, 0, 0, 0,
+                0xB9, 0x80, 2, 0, 0,
+                0x48, 0x8D, 0x54, 0x24, 0x20,
+                0x4C, 0x8D, 0x44, 0x24, 0x28,
+                0xFF, 0x15,
+            ];
+            let displacement = 0x21D0i32 - (0x1000 + entry.len() as i32 + 4);
+            entry.extend_from_slice(&displacement.to_le_bytes());
+            entry.extend_from_slice(&[
+                0x85, 0xC0, 0x74, 0x10,
+                0xB9, 1, 0, 0, 0,
+                0x48, 0x8D, 0x54, 0x24, 0x28,
+                0xFF, 0x15,
+            ]);
+            let displacement = 0x21D8i32 - (0x1000 + entry.len() as i32 + 4);
+            entry.extend_from_slice(&displacement.to_le_bytes());
+            entry.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0xC3]);
+            program[0x200..0x200 + entry.len()].copy_from_slice(&entry);
+
+            let result = run(&program).expect("native run with Xbox physical pages");
+            assert!(result.is_complete(), "{result:?}");
+            assert_eq!(result.shimmed, ["XMemAllocatePhysicalPages", "XMemFreePhysicalPages"]);
+            assert_eq!(result.exit_code, 1);
+        }
+
+        #[test]
+        fn guest_runtime_error_is_captured_in_both_launch_modes() {
+            let mut program = full_program("startup failed", 0x0000_0002_9000_0000);
+            let dll = b"xgameruntime.dll\0";
+            let import = b"XErrorReport\0";
+            program[0x5C0..0x5C0 + dll.len()].copy_from_slice(dll);
+            program[0x502..0x502 + import.len()].copy_from_slice(import);
+            let entry = [
+                0x48, 0x83, 0xEC, 0x28,
+                0xB9, 0x05, 0x40, 0, 0x80,
+                0x48, 0x8D, 0x15, 0xF0, 0x0F, 0, 0,
+                0xFF, 0x15, 0xAA, 0x11, 0, 0,
+                0x48, 0x83, 0xC4, 0x28,
+                0xC3,
+            ];
+            program[0x200..0x200 + entry.len()].copy_from_slice(&entry);
+
+            let mut interpreter = crate::x64_emu::XboxX64Emu::load_pe(&program).unwrap();
+            interpreter.set_strict_imports();
+            let interpreted = interpreter.run(100);
+            assert!(interpreted.stopped_reason.is_none(), "{interpreted:?}");
+
+            let native = run(&program).expect("native run with Xbox error reporting");
+            assert!(native.is_complete(), "{native:?}");
+            assert_eq!(native.shimmed, ["XErrorReport"]);
+            assert_eq!(native.exit_code, 0);
+            assert_eq!(interpreted.exit_code, native.exit_code);
+            assert_eq!(native.output, "XErrorReport(0x80004005): startup failed\n");
+            assert_eq!(interpreted.output, native.output);
+        }
+
+        #[test]
+        fn native_import_preflight_never_calls_the_entry_point() {
+            let base = 0x0000_0002_B000_0000u64;
+            for (function, available) in [("VirtualFree", true), ("UnknownXboxExport", false)] {
+                let mut program = sample_program(function, base);
+                program[0x200..0x202].copy_from_slice(&[0x0F, 0x0B]);
+                let report = check_imports(&program).unwrap();
+                assert_eq!(report.is_complete(), available);
+                assert_eq!(report.resolved, usize::from(available));
+                if !available {
+                    assert_eq!(report.unimplemented, ["kernelx.dll!UnknownXboxExport"]);
+                }
+            }
+        }
+
+        #[test]
+        fn preserves_writable_data_sharing_a_page_with_the_import_table() {
+            let mut program = full_program("", 0x0000_0002_5000_0000);
+            let data_flags = 0x188 + 40 + 36;
+            program[data_flags..data_flags + 4].copy_from_slice(&0xC000_0040u32.to_le_bytes());
+            let code = [
+                0xC7, 0x05, 0xF6, 0x0F, 0, 0, 42, 0, 0, 0,
+                0x8B, 0x05, 0xF0, 0x0F, 0, 0, 0xC3,
+            ];
+            program[0x200..0x200 + code.len()].copy_from_slice(&code);
+            let result = run(&program).expect("native run with writable IAT section");
+            assert_eq!(result.exit_code, 42);
+            assert_eq!(result.resolved, 1);
+            assert!(result.is_complete());
+        }
+
+        #[test]
+        fn runs_process_attach_callback_on_the_native_entry_thread() {
+            let base = 0x0000_0002_7000_0000u64;
+            let mut program = full_program("", base);
+            let data_flags = 0x188 + 40 + 36;
+            program[data_flags..data_flags + 4].copy_from_slice(&0xC000_0040u32.to_le_bytes());
+            let directory = 0x98 + 112 + 9 * 8;
+            program[directory..directory + 4].copy_from_slice(&0x2040u32.to_le_bytes());
+            program[directory + 4..directory + 8].copy_from_slice(&40u32.to_le_bytes());
+            program[0x450..0x458].copy_from_slice(&(base + 0x2030).to_le_bytes());
+            program[0x458..0x460].copy_from_slice(&(base + 0x2080).to_le_bytes());
+            program[0x480..0x488].copy_from_slice(&(base + 0x1040).to_le_bytes());
+            let entry = [
+                0x65, 0x8B, 0x04, 0x25, 0x48, 0, 0, 0, 0x2B, 0x05, 0xF2, 0x0F, 0, 0, 0xC3,
+            ];
+            let callback = [
+                0x65, 0x8B, 0x04, 0x25, 0x48, 0, 0, 0, 0x89, 0x81, 0x00, 0x20, 0, 0, 0xC3,
+            ];
+            program[0x200..0x200 + entry.len()].copy_from_slice(&entry);
+            program[0x240..0x240 + callback.len()].copy_from_slice(&callback);
+            let result = run(&program).expect("native run with a TLS callback");
+            assert_eq!(result.exit_code, 0);
+            assert!(result.is_complete());
+        }
+
+        #[test]
+        fn rejects_tls_callbacks_outside_the_mapped_executable_sections() {
+            let base = 0x0000_0002_A000_0000u64;
+            let mut program = full_program("", base);
+            let directory = 0x98 + 112 + 9 * 8;
+            program[directory..directory + 4].copy_from_slice(&0x2040u32.to_le_bytes());
+            program[directory + 4..directory + 8].copy_from_slice(&40u32.to_le_bytes());
+
+            program[0x458..0x460].copy_from_slice(&(base + 0x3000).to_le_bytes());
+            assert!(run(&program).unwrap_err().contains("callback table runs past the image"));
+
+            program[0x458..0x460].copy_from_slice(&(base + 0x2080).to_le_bytes());
+            program[0x480..0x488].copy_from_slice(&(base + 0x3000).to_le_bytes());
+            assert!(run(&program).unwrap_err().contains("callback address is outside the image"));
+
+            program[0x480..0x488].copy_from_slice(&(base + 0x2000).to_le_bytes());
+            assert!(run(&program).unwrap_err().contains("callback address is outside executable sections"));
         }
 
         #[test]

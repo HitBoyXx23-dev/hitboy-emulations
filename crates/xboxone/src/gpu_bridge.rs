@@ -2,6 +2,8 @@
 //! sanitization, D3D12.X root-signature flag normalization, XG texture surface layout calculations,
 //! and an offscreen RGBA framebuffer for Emulator mode presentation.
 
+use std::ops::Range;
+
 /// Standard desktop D3D12_ROOT_SIGNATURE_FLAGS bits (through Direct3D 12 Agility SDK).
 pub const DESKTOP_ROOT_SIG_FLAG_MASK: u32 = 0x0000_0FFF;
 
@@ -134,26 +136,41 @@ pub enum XgTileMode {
 pub enum XgFormat {
     R8G8B8A8Unorm,
     B8G8R8A8Unorm,
+    R10G10B10A2Unorm,
+    R11G11B10Float,
     R16G16B16A16Float,
     R32Float,
     D32Float,
     Bc1Unorm,
     Bc3Unorm,
+    Bc4Unorm,
+    Bc5Unorm,
+    Bc6hUf16,
     Bc7Unorm,
 }
 
 impl XgFormat {
     pub fn bytes_per_block(self) -> u32 {
         match self {
-            Self::R8G8B8A8Unorm | Self::B8G8R8A8Unorm | Self::R32Float | Self::D32Float => 4,
-            Self::R16G16B16A16Float | Self::Bc1Unorm => 8,
-            Self::Bc3Unorm | Self::Bc7Unorm => 16,
+            Self::R8G8B8A8Unorm
+            | Self::B8G8R8A8Unorm
+            | Self::R10G10B10A2Unorm
+            | Self::R11G11B10Float
+            | Self::R32Float
+            | Self::D32Float => 4,
+            Self::R16G16B16A16Float | Self::Bc1Unorm | Self::Bc4Unorm => 8,
+            Self::Bc3Unorm | Self::Bc5Unorm | Self::Bc6hUf16 | Self::Bc7Unorm => 16,
         }
     }
 
     pub fn block_dim(self) -> u32 {
         match self {
-            Self::Bc1Unorm | Self::Bc3Unorm | Self::Bc7Unorm => 4,
+            Self::Bc1Unorm
+            | Self::Bc3Unorm
+            | Self::Bc4Unorm
+            | Self::Bc5Unorm
+            | Self::Bc6hUf16
+            | Self::Bc7Unorm => 4,
             _ => 1,
         }
     }
@@ -270,9 +287,96 @@ impl XboxFramebuffer {
         }
     }
 
+    /// Byte ranges for copying a tightly packed RGBA8 rectangle to or from the framebuffer.
+    pub(crate) fn rgba8_rows(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(usize, impl Iterator<Item = Range<usize>>), String> {
+        let right = x.checked_add(width).filter(|&right| right <= self.width);
+        let bottom = y.checked_add(height).filter(|&bottom| bottom <= self.height);
+        if width == 0 || height == 0 || right.is_none() || bottom.is_none() {
+            return Err("The RGBA8 copy rectangle must fit inside the framebuffer.".into());
+        }
+
+        let row_bytes = width as usize * 4;
+        let pitch = self.width as usize * 4;
+        let first = y as usize * pitch + x as usize * 4;
+        let rows = (0..height as usize).map(move |row| {
+            let start = first + row * pitch;
+            start..start + row_bytes
+        });
+        Ok((row_bytes * height as usize, rows))
+    }
+
     pub fn present(&mut self) -> u64 {
         self.presents += 1;
         self.presents
+    }
+}
+
+/// Cached RDNA2 -> HLSL translation entry keyed by 64-bit FNV-1a hash.
+#[derive(Debug, Clone)]
+pub struct TranslatedShader {
+    pub hash: u64,
+    pub analysis: crate::rdna2_disasm::ShaderAnalysis,
+}
+
+/// D3D12.X / D3D12.XS shader & pipeline translator with hash-indexed cache, occlusion-query
+/// un-nesting, and console frame pacing.
+#[derive(Default)]
+pub struct D3D12XPipelineTranslator {
+    pub cache: std::collections::HashMap<u64, TranslatedShader>,
+    pub occlusion: crate::exe_convert::OcclusionQueryUnnester,
+    pub pacer: crate::exe_convert::FramePacer,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+}
+
+impl D3D12XPipelineTranslator {
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h
+    }
+
+    /// Translates a raw RDNA2 shader or an Xbox DXBC container carrying `XDAT`/`XBOX`/`SCAR`
+    /// bytecode, returning the cached or freshly synthesized HLSL + Root Signature.
+    pub fn translate_shader(&mut self, blob: &[u8]) -> Result<TranslatedShader, String> {
+        let rdna2_slice: &[u8] = if blob.len() >= 32 && &blob[0..4] == b"DXBC" {
+            let cont = DxbcContainer::parse(blob)?;
+            if let Some(ch) = cont.chunks.iter().find(|c| matches!(&c.fourcc, b"XDAT" | b"XBOX" | b"SCAR")) {
+                let hash = Self::fnv1a64(&ch.data);
+                if let Some(hit) = self.cache.get(&hash) {
+                    self.cache_hits += 1;
+                    return Ok(hit.clone());
+                }
+                self.cache_misses += 1;
+                let analysis = crate::rdna2_disasm::analyze_rdna2(&ch.data)?;
+                let entry = TranslatedShader { hash, analysis };
+                self.cache.insert(hash, entry.clone());
+                return Ok(entry);
+            }
+            return Err("DXBC container has no console RDNA2 chunk (use desktop DXIL directly).".into());
+        } else {
+            blob
+        };
+
+        let hash = Self::fnv1a64(rdna2_slice);
+        if let Some(hit) = self.cache.get(&hash) {
+            self.cache_hits += 1;
+            return Ok(hit.clone());
+        }
+        self.cache_misses += 1;
+        let analysis = crate::rdna2_disasm::analyze_rdna2(rdna2_slice)?;
+        let entry = TranslatedShader { hash, analysis };
+        self.cache.insert(hash, entry.clone());
+        Ok(entry)
     }
 }
 
@@ -355,5 +459,29 @@ mod tests {
         let idx = ((4 * 64 + 4) * 4) as usize;
         assert_eq!(&fb.rgba[idx..idx + 4], &[255, 0, 128, 255]);
         assert_eq!(fb.present(), 1);
+    }
+
+    #[test]
+    fn pipeline_translator_caches_rdna2_mesh_shaders_and_synthesizes_root_sig() {
+        let dwords: [u32; 4] = [
+            0xBF90_0003, // s_sendmsg 3 (GS_ALLOC_REQ)
+            0xF800_014F, // exp prim (target=20, en=0xF)
+            0x0302_0100, // v0..v3
+            0xBF81_0000, // s_endpgm
+        ];
+        let blob: Vec<u8> = dwords.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut tr = D3D12XPipelineTranslator::default();
+        let first = tr.translate_shader(&blob).unwrap();
+        assert_eq!(first.analysis.stage, crate::rdna2_disasm::ShaderStage::Mesh);
+        assert!(first.analysis.root_sig.uses_mesh_dispatch);
+        assert_eq!(tr.cache_misses, 1);
+        assert_eq!(tr.cache_hits, 0);
+
+        let second = tr.translate_shader(&blob).unwrap();
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(tr.cache_hits, 1);
+
+        let hdr = compute_texture2d_layout(512, 512, 1, XgFormat::Bc6hUf16, XgTileMode::Thin2D);
+        assert_eq!(hdr.mips[0].row_pitch_bytes, 2048);
     }
 }
