@@ -42,7 +42,7 @@ const fn brand(
         primary,
         secondary,
         on_primary,
-        bg: Color32::from_rgb(0x06, 0x06, 0x0A),
+        bg: Color32::BLACK,
         panel: Color32::from_rgb(0x0C, 0x0D, 0x13),
         surface: Color32::from_rgb(0x13, 0x15, 0x1E),
         surface_hover: Color32::from_rgb(0x1B, 0x1E, 0x2B),
@@ -54,7 +54,8 @@ const fn brand(
     }
 }
 
-pub static HITBOY: Brand = brand("hitboy", "HitBoy's", ROYAL_PURPLE, ROYAL_BLUE, Color32::WHITE);
+pub static NAVURYX: Brand = brand("navuryx", "Navuryx", ROYAL_PURPLE, ROYAL_BLUE, Color32::WHITE);
+pub static HITBOY: Brand = brand("hitboy", "HitBoy's", ROYAL_BLUE, ROYAL_PURPLE, Color32::WHITE);
 
 static ACTIVE: OnceLock<&'static Brand> = OnceLock::new();
 
@@ -64,7 +65,7 @@ pub fn set(brand: &'static Brand) {
 
 /// The active brand/theme.
 pub fn t() -> &'static Brand {
-    ACTIVE.get().copied().unwrap_or(&HITBOY)
+    ACTIVE.get().copied().unwrap_or(&NAVURYX)
 }
 
 impl Brand {

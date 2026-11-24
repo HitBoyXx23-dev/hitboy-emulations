@@ -519,6 +519,8 @@ mod win {
 
     pub fn run(file: &[u8]) -> Result<NativeResult, String> {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let image = crate::image::program_image(file)?;
+        let file = image.as_ref();
         let elf = Elf::parse(file)?;
         let loads: Vec<_> = elf.segments.iter().filter(|s| s.is_loadable()).collect();
         let min_va = loads.iter().map(|s| s.vaddr).min().ok_or("The program has nothing to load.")?;

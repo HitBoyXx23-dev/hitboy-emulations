@@ -87,7 +87,7 @@ pub struct GameEntry {
 fn bin_fits(path: &Path, console: &str) -> bool {
     let fname = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if fname == "eboot.bin" {
-        return (console == "ps4" || console == "ps5") && crate::cores::ps_console_id(path) == console;
+        return matches!(console, "ps4" | "ps5") && crate::cores::console_for_path(path) == Some(console);
     }
     if console == "ps5" {
         return path.extension().is_some_and(|e| e.eq_ignore_ascii_case("elf") || e.eq_ignore_ascii_case("self"));

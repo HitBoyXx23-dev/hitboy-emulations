@@ -184,6 +184,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "android"
+version = "0.1.0"
+dependencies = [
+ "zip",
+]
+
+[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1040,6 +1047,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpuarm_v7"
+version = "0.1.0"
+
+[[package]]
 name = "cpubits"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1088,6 +1099,10 @@ version = "0.1.0"
 dependencies = [
  "state",
 ]
+
+[[package]]
+name = "cpush"
+version = "0.1.0"
 
 [[package]]
 name = "cpusm83"
@@ -1316,6 +1331,13 @@ name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
+
+[[package]]
+name = "dreamcast"
+version = "0.1.0"
+dependencies = [
+ "cpush",
+]
 
 [[package]]
 name = "ecolor"
@@ -1694,9 +1716,11 @@ dependencies = [
 name = "frontend"
 version = "0.1.0"
 dependencies = [
+ "android",
  "atari2600",
  "atari7800",
  "cpal",
+ "dreamcast",
  "eframe",
  "gamedump",
  "gb",
@@ -1706,17 +1730,23 @@ dependencies = [
  "intv",
  "ios",
  "md",
+ "n3ds",
  "n64",
+ "nds",
+ "neogeo",
  "nes",
  "pc",
  "pce",
  "png 0.17.16",
  "ps2",
+ "ps3",
  "ps5",
+ "psp",
  "psx",
  "rars",
  "resvg",
  "rfd",
+ "saturn",
  "serde",
  "serde_json",
  "sevenz-rust",
@@ -1727,6 +1757,9 @@ dependencies = [
  "state",
  "switch",
  "vb",
+ "vita",
+ "wii",
+ "wiiu",
  "ws",
  "x360",
  "xbox",
@@ -2699,6 +2732,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "n3ds"
+version = "0.1.0"
+dependencies = [
+ "cpuarm_v7",
+]
+
+[[package]]
 name = "n64"
 version = "0.1.0"
 dependencies = [
@@ -2778,6 +2818,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "nds"
+version = "0.1.0"
+dependencies = [
+ "cpuarm_v7",
+]
+
+[[package]]
+name = "neogeo"
+version = "0.1.0"
+dependencies = [
+ "cpu68k",
+ "zip",
 ]
 
 [[package]]
@@ -3464,10 +3519,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ps3"
+version = "0.1.0"
+dependencies = [
+ "cpuxenon",
+]
+
+[[package]]
 name = "ps5"
 version = "0.1.0"
 dependencies = [
  "cpui686",
+]
+
+[[package]]
+name = "psp"
+version = "0.1.0"
+dependencies = [
+ "flate2",
 ]
 
 [[package]]
@@ -3827,6 +3896,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "saturn"
+version = "0.1.0"
+dependencies = [
+ "cpush",
 ]
 
 [[package]]
@@ -4676,6 +4752,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vita"
+version = "0.1.0"
+dependencies = [
+ "cpuarm_v7",
+ "zip",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4900,18 +4984,27 @@ version = "0.1.0"
 dependencies = [
  "atari2600",
  "atari7800",
+ "dreamcast",
  "gb",
  "gba",
+ "ios",
  "md",
+ "n3ds",
+ "nds",
+ "neogeo",
  "nes",
  "pce",
+ "psp",
+ "saturn",
  "sms",
  "snes",
  "state",
  "vb",
+ "vita",
  "wasm-bindgen",
  "wasmlibc",
  "ws",
+ "xboxone",
  "zip",
 ]
 
@@ -5058,6 +5151,21 @@ dependencies = [
  "js-sys",
  "log",
  "web-sys",
+]
+
+[[package]]
+name = "wii"
+version = "0.1.0"
+dependencies = [
+ "cpugekko",
+]
+
+[[package]]
+name = "wiiu"
+version = "0.1.0"
+dependencies = [
+ "cpugekko",
+ "flate2",
 ]
 
 [[package]]
@@ -5572,6 +5680,13 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x2w"
+version = "0.1.0"
+dependencies = [
+ "xboxone",
+]
 
 [[package]]
 name = "x360"

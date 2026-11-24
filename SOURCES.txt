@@ -87,3 +87,61 @@ Mobile & Multi-OS Virtual Machines:
   Closed-source binary edition built from the same clean-room engine.
 - Neither edition includes copyrighted game dumps, BIOS ROMs, or decryption keys.
 ===============================================================================
+
+Emulation and compatibility references
+Checked 2026-11-24
+
+These are research references. The app uses its own emulator cores and native compatibility code. Do not add a reference project's executable, core, or runtime library to the application.
+
+Xbox One and Xbox Series X|S
+
+Xbox One Research wiki
+https://github.com/xboxoneresearch/wiki
+Console operating systems, storage layout, and terminology.
+
+emoose/xvdtool
+https://github.com/emoose/xvdtool
+XVD and XVC parsing and documented key-based tooling.
+
+R0Y00/Xbox2Windows
+https://github.com/R0Y00/Xbox2Windows
+Windows PE loading, CPU translation, shader translation, and source-built GPU fixtures.
+
+LooperSalty/AnyXboxX
+https://github.com/LooperSalty/AnyXboxX
+Xbox Series X prototype and references for GDK import coverage and startup diagnostics.
+
+omonkeyz/xbox-emulator
+https://github.com/omonkeyz/xbox-emulator
+TomBox and rage9 research, runtime interfaces, and progress reports.
+
+XCL
+https://github.com/ivall/xcl
+Xbox ABI, storage, shader translation, and native compatibility research.
+https://github.com/ivall/xcl/issues/159
+Retail 1.0.2.1 startup evidence and limits.
+https://github.com/ivall/xcl/issues/627
+Public executable identity and import metadata.
+
+VIctory
+https://github.com/Marvisak/VIctory
+Xbox native compatibility, graphics, audio, and input research.
+https://github.com/Marvisak/VIctory/issues/49
+Version-specific test reports and rendering limitations.
+
+Leonida
+https://github.com/ItsNotRexed/Leonida
+https://github.com/ProjectLeonida/Leonida
+Historical project locations. The preserved local checkout is target/leonida-gta-comparison at 5d74c27. Public URLs have returned 404 in earlier checks.
+
+PlayStation 5
+
+boykopovar/AnyPS5
+https://github.com/boykopovar/AnyPS5
+PS5-to-host relinking, system library interfaces, and shader translation references.
+
+Portability reference
+
+SDL3 platform support
+https://github.com/libsdl-org/SDL/blob/main/docs/README-platforms.md
+Window, controller, and audio integration across host platforms where applicable.

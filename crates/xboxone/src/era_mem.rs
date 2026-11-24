@@ -1,7 +1,7 @@
 //! Xbox One / Series X|S memory architecture: Title Virtual Address (VA) management,
 //! GPU-visible alias windows, aligned XMem heap pools, and TitleMemoryStatus reporting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Page granularity for Era / Scarlett virtual memory operations (64 KiB large-block / 4 KiB base).
 pub const PAGE_SIZE_4K: u64 = 0x1000;
@@ -56,6 +56,8 @@ pub struct VaRegion {
     pub protect: MemoryProtect,
     pub gpu_visible: bool,
     pub data: Vec<u8>,
+    placeholder: bool,
+    physical_window: bool,
 }
 
 /// GPU alias mapping: maps a GPU-visible address range onto a title VA backing region.
@@ -86,6 +88,9 @@ pub struct TitleMemoryStatus {
 pub struct TitleAddressSpace {
     regions: BTreeMap<u64, VaRegion>,
     gpu_aliases: Vec<GpuAliasWindow>,
+    physical_pages: BTreeMap<u64, Vec<u8>>,
+    physical_mappings: BTreeMap<u64, u64>,
+    next_physical_page: u64,
     next_alloc_va: u64,
     next_gpu_va: u64,
     total_budget: u64,
@@ -103,6 +108,9 @@ impl TitleAddressSpace {
         Self {
             regions: BTreeMap::new(),
             gpu_aliases: Vec::new(),
+            physical_pages: BTreeMap::new(),
+            physical_mappings: BTreeMap::new(),
+            next_physical_page: 16,
             next_alloc_va: 0x0000_0001_0000_0000,
             next_gpu_va: 0x0000_0100_0000_0000,
             total_budget,
@@ -121,21 +129,28 @@ impl TitleAddressSpace {
         if !align.is_power_of_two() {
             return Err("alignment must be a power of two".into());
         }
-        let rounded = Self::align_up(size.max(PAGE_SIZE_4K), PAGE_SIZE_4K);
+        let checked_align = |value: u64, alignment: u64| {
+            value.checked_add(alignment - 1).map(|v| v & !(alignment - 1))
+                .ok_or("Title address range overflow")
+        };
+        let rounded = checked_align(size.max(PAGE_SIZE_4K), PAGE_SIZE_4K)?;
         let base = match preferred {
             Some(addr) if addr != 0 => {
                 let aligned = addr & !(PAGE_SIZE_4K - 1);
+                let end = aligned.checked_add(rounded).ok_or("Title address range overflow")?;
                 if self.overlaps(aligned, rounded) {
-                    return Err(format!("VA range {aligned:#x}..{:#x} overlaps an existing region", aligned + rounded));
+                    return Err(format!("VA range {aligned:#x}..{end:#x} overlaps an existing region"));
                 }
                 aligned
             }
             _ => {
-                let mut cand = Self::align_up(self.next_alloc_va, align);
+                let mut cand = checked_align(self.next_alloc_va, align)?;
                 while self.overlaps(cand, rounded) {
-                    cand = Self::align_up(cand.saturating_add(rounded), align);
+                    let next = cand.checked_add(rounded).ok_or("Title address range overflow")?;
+                    cand = checked_align(next, align)?;
                 }
-                self.next_alloc_va = Self::align_up(cand.saturating_add(rounded), PAGE_SIZE_64K);
+                let next = cand.checked_add(rounded).ok_or("Title address range overflow")?;
+                self.next_alloc_va = checked_align(next, PAGE_SIZE_64K)?;
                 cand
             }
         };
@@ -150,20 +165,194 @@ impl TitleAddressSpace {
                 protect,
                 gpu_visible,
                 data,
+                placeholder: false,
+                physical_window: false,
             },
         );
         self.update_peak();
         Ok(base)
     }
 
+    pub fn reserve_placeholder(
+        &mut self,
+        preferred: Option<u64>,
+        size: u64,
+        align: u64,
+    ) -> Result<u64, String> {
+        if size == 0 || size % PAGE_SIZE_64K != 0 || align < PAGE_SIZE_64K
+            || preferred.is_some_and(|base| base % align != 0)
+        {
+            return Err("Placeholder reservations must use aligned 64 KiB blocks".into());
+        }
+        let base = self.alloc(preferred, size, align, MemoryProtect::NoAccess, false)?;
+        self.regions.get_mut(&base).unwrap().placeholder = true;
+        Ok(base)
+    }
+
+    pub fn replace_placeholder(
+        &mut self,
+        base: u64,
+        size: u64,
+        protect: MemoryProtect,
+        commit: bool,
+    ) -> Result<u64, String> {
+        if base % PAGE_SIZE_64K != 0 || size == 0 || size % PAGE_SIZE_64K != 0 {
+            return Err("Placeholder replacements must use complete 64 KiB blocks".into());
+        }
+        let end = base.checked_add(size).ok_or("Placeholder replacement range overflow")?;
+        let region = self.find_region(base)
+            .filter(|region| region.placeholder && end <= region.base + region.size)
+            .ok_or("Replacement is outside a single placeholder")?;
+        let original_base = region.base;
+        let original_end = region.base + region.size;
+
+        let mut data = Vec::new();
+        if commit {
+            if size > self.status().avail_mem {
+                return Err("Replacement exceeds the title memory budget".into());
+            }
+            let capacity = usize::try_from(size).map_err(|_| "Replacement is too large")?;
+            data.try_reserve_exact(capacity).map_err(|_| "Could not allocate replacement memory")?;
+            data.resize(capacity, 0);
+        }
+        self.regions.remove(&original_base);
+        for (start, stop) in [(original_base, base), (end, original_end)] {
+            if start < stop {
+                self.regions.insert(start, VaRegion {
+                    base: start,
+                    size: stop - start,
+                    committed: false,
+                    protect: MemoryProtect::NoAccess,
+                    gpu_visible: false,
+                    data: Vec::new(),
+                    placeholder: true,
+                    physical_window: false,
+                });
+            }
+        }
+        self.regions.insert(base, VaRegion {
+            base,
+            size,
+            committed: commit,
+            protect,
+            gpu_visible: matches!(protect, MemoryProtect::GpuCoherentReadWrite),
+            data,
+            placeholder: false,
+            physical_window: false,
+        });
+        self.update_peak();
+        Ok(base)
+    }
+
     /// Releases a region by its base address.
     pub fn free(&mut self, base: u64) -> bool {
-        if self.regions.remove(&base).is_some() {
+        if let Some(region) = self.regions.remove(&base) {
+            self.physical_mappings.retain(|address, _| *address < base || *address >= base + region.size);
             self.gpu_aliases.retain(|w| w.title_va != base);
             true
         } else {
             false
         }
+    }
+
+    pub(crate) fn mark_physical_window(&mut self, base: u64) {
+        if let Some(region) = self.regions.get_mut(&base) {
+            region.physical_window = true;
+            if region.protect == MemoryProtect::NoAccess {
+                region.protect = MemoryProtect::ReadWrite;
+            }
+        }
+    }
+
+    pub(crate) fn allocate_physical_pages(&mut self, count: u64) -> Option<Vec<u64>> {
+        if count > self.status().avail_mem / PAGE_SIZE_64K {
+            return None;
+        }
+        let end = self.next_physical_page.checked_add(count.checked_mul(16)?)?;
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(count as usize).ok()?;
+        for number in (self.next_physical_page..end).step_by(16) {
+            let mut data = Vec::new();
+            data.try_reserve_exact(PAGE_SIZE_64K as usize).ok()?;
+            data.resize(PAGE_SIZE_64K as usize, 0);
+            frames.push((number, data));
+        }
+        let numbers = frames.iter().map(|(number, _)| *number).collect();
+        self.physical_pages.extend(frames);
+        self.next_physical_page = end;
+        self.update_peak();
+        Some(numbers)
+    }
+
+    pub(crate) fn free_physical_pages(&mut self, pages: &[u64]) -> bool {
+        let unique: BTreeSet<_> = pages.iter().copied().collect();
+        if unique.len() != pages.len()
+            || unique.iter().any(|page| !self.physical_pages.contains_key(page))
+            || self.physical_mappings.values().any(|page| unique.contains(page))
+        {
+            return false;
+        }
+        for page in unique {
+            self.physical_pages.remove(&page);
+        }
+        true
+    }
+
+    pub(crate) fn map_physical_pages(&mut self, mappings: &[(u64, u64)]) -> bool {
+        let mut addresses = BTreeSet::new();
+        for &(address, page) in mappings {
+            if address % PAGE_SIZE_64K != 0
+                || !addresses.insert(address)
+                || (page != 0 && !self.physical_pages.contains_key(&page))
+                || !self.find_region(address).is_some_and(|region| {
+                    region.physical_window && address.checked_add(PAGE_SIZE_64K)
+                        .is_some_and(|end| end <= region.base + region.size)
+                })
+            {
+                return false;
+            }
+        }
+        for &(address, page) in mappings {
+            if page == 0 {
+                self.physical_mappings.remove(&address);
+            } else {
+                self.physical_mappings.insert(address, page);
+            }
+        }
+        true
+    }
+
+    fn physical_slices(&self, address: u64, length: usize, region_end: u64) -> Result<Vec<(u64, usize, usize)>, String> {
+        let end = address.checked_add(length as u64).filter(|end| *end <= region_end)
+            .ok_or("Physical memory access crosses its reserved window")?;
+        let mut slices = Vec::new();
+        let mut cursor = address;
+        while cursor < end {
+            let base = cursor & !(PAGE_SIZE_64K - 1);
+            let offset = cursor - base;
+            let bytes = (PAGE_SIZE_64K - offset).min(end - cursor);
+            let page = self.physical_mappings.get(&base)
+                .ok_or_else(|| format!("Unmapped physical page at {base:#x}"))?;
+            slices.push((*page, offset as usize, bytes as usize));
+            cursor += bytes;
+        }
+        Ok(slices)
+    }
+
+    pub(crate) fn can_write_bytes(&self, address: u64, length: u64) -> bool {
+        let resolved = self.translate_gpu_va(address).unwrap_or(address);
+        self.find_region(resolved).is_some_and(|region| {
+            if !region.protect.is_writable() {
+                return false;
+            }
+            if region.physical_window {
+                return usize::try_from(length).ok().is_some_and(|length| {
+                    self.physical_slices(resolved, length, region.base + region.size).is_ok()
+                });
+            }
+            region.committed && resolved.checked_add(length)
+                .is_some_and(|end| end <= region.base + region.size)
+        })
     }
 
     /// Updates page protections on an existing region and returns the previous protection.
@@ -215,6 +404,17 @@ impl TitleAddressSpace {
         let r = self
             .find_region(resolved)
             .ok_or_else(|| format!("memory read fault at {addr:#x}"))?;
+        if r.physical_window {
+            if !r.protect.is_readable() {
+                return Err(format!("Unreadable physical memory at {addr:#x}"));
+            }
+            let mut destination = 0;
+            for (page, offset, len) in self.physical_slices(resolved, out.len(), r.base + r.size)? {
+                out[destination..destination + len].copy_from_slice(&self.physical_pages[&page][offset..offset + len]);
+                destination += len;
+            }
+            return Ok(());
+        }
         if !r.committed || !r.protect.is_readable() {
             return Err(format!("unreadable memory at {addr:#x}"));
         }
@@ -235,6 +435,19 @@ impl TitleAddressSpace {
             .next_back()
             .filter(|(_, r)| resolved < r.base + r.size)
             .ok_or_else(|| format!("memory write fault at {addr:#x}"))?;
+        let region = &self.regions[&base];
+        if region.physical_window {
+            if !region.protect.is_writable() {
+                return Err(format!("Non-writable physical memory at {addr:#x}"));
+            }
+            let mut source = 0;
+            for (page, offset, len) in self.physical_slices(resolved, src.len(), base + region.size)? {
+                self.physical_pages.get_mut(&page).unwrap()[offset..offset + len]
+                    .copy_from_slice(&src[source..source + len]);
+                source += len;
+            }
+            return Ok(());
+        }
         let r = self.regions.get_mut(&base).unwrap();
         if !r.committed || !r.protect.is_writable() {
             return Err(format!("non-writable memory at {addr:#x}"));
@@ -319,7 +532,8 @@ impl TitleAddressSpace {
     }
 
     pub fn committed_bytes(&self) -> u64 {
-        self.regions.values().filter(|r| r.committed).map(|r| r.size).sum()
+        self.regions.values().filter(|r| r.committed).map(|r| r.size).sum::<u64>()
+            + self.physical_pages.len() as u64 * PAGE_SIZE_64K
     }
 
     pub fn status(&self) -> TitleMemoryStatus {

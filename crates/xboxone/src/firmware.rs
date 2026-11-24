@@ -31,8 +31,8 @@ pub fn inspect_firmware(data: &[u8]) -> Result<FirmwareInfo, String> {
 
     // 1. Xbox One / Series X|S XVD / EmbeddedXvd / System OS container ("msft-xvd" at +0x200)
     if data.len() >= 0x400 && &data[0x200..0x208] == b"msft-xvd" {
-        let fmt_ver = u32::from_le_bytes(data[0x218..0x21C].try_into().unwrap());
-        let content_type = u32::from_le_bytes(data[0x234..0x238].try_into().unwrap());
+        let fmt_ver = u32::from_le_bytes(data[0x20C..0x210].try_into().unwrap());
+        let content_type = u32::from_le_bytes(data[0x284..0x288].try_into().unwrap());
         // Series X|S Era / Scarlet System OS images typically use format >= 3 or content_type >= 18
         let kind = if fmt_ver >= 3 || content_type >= 18 {
             XboxFirmwareKind::XboxSeriesSystemOs
@@ -50,7 +50,7 @@ pub fn inspect_firmware(data: &[u8]) -> Result<FirmwareInfo, String> {
             content_type,
             size_bytes,
             summary: format!(
-                "{label} verified ({:.1} MB, XVD format v{fmt_ver}, content type {content_type}). Ready for console OS bring-up diagnostics.",
+                "{label} candidate ({:.1} MB, XVD format v{fmt_ver}, content type {content_type}). Firmware boot is unverified.",
                 size_bytes as f64 / (1024.0 * 1024.0)
             ),
         });
@@ -104,11 +104,13 @@ mod tests {
     fn identifies_xbox_series_xvd_and_xbox360_nand() {
         let mut xvd = vec![0u8; 0x1000];
         xvd[0x200..0x208].copy_from_slice(b"msft-xvd");
-        xvd[0x218..0x21C].copy_from_slice(&3u32.to_le_bytes());
-        xvd[0x234..0x238].copy_from_slice(&20u32.to_le_bytes());
+        xvd[0x20C..0x210].copy_from_slice(&3u32.to_le_bytes());
+        xvd[0x218..0x220].copy_from_slice(&0x1000u64.to_le_bytes());
+        xvd[0x284..0x288].copy_from_slice(&20u32.to_le_bytes());
         let info = inspect_firmware(&xvd).unwrap();
         assert_eq!(info.kind, XboxFirmwareKind::XboxSeriesSystemOs);
         assert_eq!(info.format_version, 3);
+        assert_eq!(info.content_type, 20);
 
         let mut nand = vec![0u8; 0x4000];
         nand[0] = 0xFF;

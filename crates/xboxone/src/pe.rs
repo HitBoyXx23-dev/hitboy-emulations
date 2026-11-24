@@ -337,8 +337,14 @@ fn read_tls(d: &[u8], p: &Pe, rva: u32, plus: bool) -> Result<Option<Tls>, Strin
         return Ok(None);
     }
     let Some(o) = p.rva_to_off(rva) else { return Ok(None) };
-    // Directory fields are virtual addresses, so strip the image base to get an RVA.
-    let to_rva = |v: u64| -> u32 { (v.wrapping_sub(p.image_base) & 0xFFFF_FFFF) as u32 };
+    let to_rva = |v: u64| -> Result<u32, String> {
+        if v == 0 {
+            return Ok(0);
+        }
+        v.checked_sub(p.image_base)
+            .and_then(|rva| u32::try_from(rva).ok())
+            .ok_or_else(|| "PE TLS template address is outside the image".into())
+    };
     let read_v = |at: usize| -> u64 {
         if plus {
             u64_at(d, at).unwrap_or(0)
@@ -347,8 +353,8 @@ fn read_tls(d: &[u8], p: &Pe, rva: u32, plus: bool) -> Result<Option<Tls>, Strin
         }
     };
     Ok(Some(Tls {
-        raw_start: to_rva(read_v(o)),
-        raw_end: to_rva(read_v(o + 8)),
+        raw_start: to_rva(read_v(o))?,
+        raw_end: to_rva(read_v(o + 8))?,
         index_va: read_v(o + 16),
         callbacks_va: read_v(o + 24),
         zero_fill: u32_at(d, o + if plus { 32 } else { 16 })?,

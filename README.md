@@ -1,5 +1,7 @@
 # HitBoy's Emulations
 
+See the [emulation handoff](docs/EMULATION-HANDOFF.md) for console test entry points and [SOURCES.txt](SOURCES.txt) for research references.
+
 **HitBoy's Emulations** is a from-scratch multi-system console emulator, mobile OS runner, and virtual machine suite written in **Rust** and **C++** by **HitBoyXx23**.
 
 Performance-critical CPU cores are written in **C++** behind a clean C ABI, while buses, PPU/GPU pipelines, OS runtimes, input, save states, rewind, and the cross-platform `egui` frontend + WebAssembly browser player are written in **Rust**.

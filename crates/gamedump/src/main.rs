@@ -3,14 +3,17 @@
 use std::path::Path;
 use std::time::Instant;
 
-const USAGE: &str = "Game Dump Helper (HitBoy's Emulations)
+const USAGE: &str = "Game Dump Helper (HitBoyXx23 / Navuryx)
 
   gamedump check <file or folder>   Say what a dump is and whether it looks complete
   gamedump hash <file>              SHA-1 and CRC-32 (compare with redump.org)
   gamedump drives                   List disc drives
   gamedump rip <drive> <out.iso>    Copy a plain data disc (2048-byte sectors) to an ISO
   gamedump run <eboot.bin|folder> [steps]   Try running a decrypted PlayStation 4/5 program on our own CPU
+  gamedump ps-native <eboot.bin|folder>    Run a decrypted PlayStation program directly on Windows x64
   gamedump xbox <package folder>    Inspect an Xbox One / Series package, then run it natively
+  gamedump xbox --inspect-only <package folder|manifest>   Check native imports without starting the title
+  gamedump xbox-emu <package folder|manifest> [steps]   Probe the Xbox interpreter and stop on missing imports
   gamedump receive [folder] [--max-gb N]   Receive files from another device on your network (default limit 64 GB per file)
   gamedump switch <game.nsp|xci>    Try running a Switch game on our own ARM64 core (needs your prod.keys)
   gamedump ps4boot <kernel.elf>     Bring-up: start a PS4 kernel from your own console and list the hardware it needs
@@ -26,7 +29,10 @@ fn main() {
         Some("drives") => drives(),
         Some("rip") if a.len() >= 3 => rip(&a[1], &a[2]),
         Some("run") if a.len() >= 2 => run(&a[1], a.get(2).map(String::as_str)),
-        Some("xbox") if a.len() >= 2 => xbox(&a[1..]),
+        Some("ps-native") if a.len() == 2 => ps_native(&a[1]),
+        Some("xbox") if a.get(1).is_some_and(|arg| arg == "--inspect-only") && a.len() == 3 => xbox_native_imports(&a[2]),
+        Some("xbox") if a.len() >= 2 && a[1] != "--inspect-only" => xbox(&a[1..]),
+        Some("xbox-emu") if (2..=3).contains(&a.len()) => xbox_emu(&a[1], a.get(2)),
         Some("receive") => receive(&a[1..]),
         Some("switch") if a.len() >= 2 => switch_run(&a[1..]),
         Some("ps4boot") if a.len() >= 2 => ps4boot(&a[1..]),
@@ -40,6 +46,94 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+fn xbox_native_imports(path: &str) -> i32 {
+    let (game, executable) = match xboxone::load_for_native(Path::new(path)) {
+        Ok(title) => title,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    let report = match xboxone::native::check_imports(&executable) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    println!("{} ({})", game.name, game.executable);
+    println!("Resolved {} static imports on this PC. No guest code ran.", report.resolved);
+    if !report.shimmed.is_empty() {
+        println!("Xbox shims: {}", report.shimmed.join(", "));
+    }
+    if !report.missing_modules.is_empty() {
+        println!("Missing libraries: {}", report.missing_modules.join(", "));
+    }
+    if !report.unimplemented.is_empty() {
+        println!("Unresolved imports: {}", report.unimplemented.join(", "));
+    }
+    i32::from(!report.is_complete())
+}
+
+fn xbox_emu(path: &str, steps: Option<&String>) -> i32 {
+    let limit = if let Some(steps) = steps {
+        match steps.parse::<u64>() {
+            Ok(limit @ 1..=100_000_000) => limit,
+            _ => {
+                eprintln!("Set an instruction budget from 1 to 100000000.");
+                return 2;
+            }
+        }
+    } else {
+        1_000_000
+    };
+    let (game, image) = match xboxone::load_for_native(Path::new(path)) {
+        Ok(title) => title,
+        Err(error) => { eprintln!("{error}"); return 1; }
+    };
+    let mut core = match xboxone::x64_emu::XboxX64Emu::load_pe(&image) {
+        Ok(core) => core,
+        Err(error) => { eprintln!("{error}"); return 1; }
+    };
+    core.set_strict_imports();
+    println!("{} ({})", game.name, game.devices.join(", "));
+    let result = core.run(limit);
+    if !result.output.is_empty() {
+        print!("{}", result.output);
+    }
+    println!("\nExecuted {} interpreter steps.", result.instructions);
+    if !result.api_calls.is_empty() {
+        println!("Imports reached: {}", result.api_calls.join(", "));
+    }
+    if let Some(reason) = result.stopped_reason {
+        eprintln!("{reason}");
+        return 1;
+    }
+    println!("Guest exited with code {}.", result.exit_code);
+    0
+}
+
+fn ps_native(path: &str) -> i32 {
+    let path = Path::new(path);
+    let executable = if path.is_dir() { path.join("eboot.bin") } else { path.to_path_buf() };
+    let result = std::fs::read(&executable)
+        .map_err(|error| format!("Could not read {}: {error}", executable.display()))
+        .and_then(|image| ps5::native::run(&image));
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => { eprintln!("{error}"); return 1; }
+    };
+    println!("Guest exited with code {}. VideoOut flips: {}.", report.exit_code, report.video_flips);
+    if !report.output.is_empty() {
+        print!("{}", report.output);
+    }
+    if !report.unimplemented.is_empty() {
+        eprintln!("Unimplemented PlayStation imports: {}", report.unimplemented.join(", "));
+        return 1;
+    }
+    0
 }
 
 fn check(paths: &[String]) -> i32 {
