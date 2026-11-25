@@ -880,6 +880,19 @@ impl XboxX64Emu {
                 }
                 rcx
             }
+            "memcpy" | "memmove" => {
+                let end = rcx.checked_add(r8).ok_or("Guest memcpy address overflow")?;
+                let mut address = rcx;
+                while address < end {
+                    let page_remaining = PAGE_SIZE_4K - address % PAGE_SIZE_4K;
+                    let count = (end - address).min(page_remaining);
+                    let mut bytes = vec![0u8; count as usize];
+                    self.mem.read_bytes(rdx + (address - rcx), &mut bytes)?;
+                    self.mem.write_bytes(address, &bytes)?;
+                    address += count;
+                }
+                rcx
+            }
             "InitializeSListHead" => {
                 if rcx == 0 || rcx % 16 != 0 {
                     return Err("Unaligned guest SLIST header".into());
@@ -1300,8 +1313,37 @@ impl XboxX64Emu {
                 || n.eq_ignore_ascii_case("D3D12CreateDevice")
                 || n.eq_ignore_ascii_case("D3D11XCreateDeviceX") =>
             {
+                let out_ptr = if n.eq_ignore_ascii_case("D3D12CreateDevice") {
+                    r9
+                } else if n.eq_ignore_ascii_case("XDeviceCreate") {
+                    rdx
+                } else {
+                    r8
+                };
+                if out_ptr != 0 {
+                    let _ = self.mem.write_u64(out_ptr, 0xD3D1_2001);
+                }
                 self.framebuffer.clear(18, 28, 52, 255);
                 self.framebuffer.present();
+                0
+            }
+            n if n.eq_ignore_ascii_case("XGComputeOptimalTileMode") => {
+                crate::gpu_bridge::XgTileMode::Thin2D as u64
+            }
+            n if n.eq_ignore_ascii_case("XSystemGetAnalyticsInfo") => {
+                if rcx != 0 {
+                    let _ = self.mem.write_bytes(rcx, &[0u8; 160]);
+                    let _ = self.mem.write_u16(rcx, 10);
+                    let _ = self.mem.write_u16(rcx + 4, 26100);
+                    0
+                } else {
+                    0x8007_0057
+                }
+            }
+            n if n.eq_ignore_ascii_case("PIXBeginEventOnCommandList")
+                || n.eq_ignore_ascii_case("PIXEndEventOnCommandList")
+                || n.eq_ignore_ascii_case("PIXSetMarkerOnCommandList") =>
+            {
                 0
             }
             n if n.eq_ignore_ascii_case("XDevicePresent") || n.eq_ignore_ascii_case("D3D12XBOX_Present") => {
@@ -3541,6 +3583,280 @@ impl XboxX64Emu {
                 self.xmm[reg] = unpack(self.xmm[source], low);
                 self.ymm_high[reg] = if vector_256 { unpack(self.ymm_high[source], high) } else { 0 };
             }
+            (1, 0x71) => {
+                // VPSRLW / VPSRAW / VPSLLW by imm8; the destination is vvvv.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let imm = self.fetch_u8()?;
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let shift = |v: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for i in 0..8u32 {
+                        let x = ((v >> (16 * i)) & 0xFFFF) as u16;
+                        let r = if imm >= 16 {
+                            if reg == 4 { ((x as i16) >> 15) as u16 } else { 0 }
+                        } else {
+                            match reg {
+                                2 => x >> imm,
+                                4 => ((x as i16) >> imm) as u16,
+                                _ => x << imm,
+                            }
+                        };
+                        out |= u128::from(r) << (16 * i);
+                    }
+                    out
+                };
+                self.xmm[source] = shift(low);
+                self.ymm_high[source] = if vector_256 { shift(high) } else { 0 };
+            }
+            (1, 0x72) => {
+                // VPSRLD / VPSRAD / VPSLLD by imm8; the ModRM.reg field selects the operation and
+                // the destination is vvvv.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let imm = self.fetch_u8()?;
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let shift = |v: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for i in 0..4u32 {
+                        let x = ((v >> (32 * i)) & 0xFFFF_FFFF) as u32;
+                        let r = if imm >= 32 {
+                            if reg == 4 { ((x as i32) >> 31) as u32 } else { 0 }
+                        } else {
+                            match reg {
+                                2 => x >> imm,
+                                4 => ((x as i32) >> imm) as u32,
+                                _ => x << imm,
+                            }
+                        };
+                        out |= u128::from(r) << (32 * i);
+                    }
+                    out
+                };
+                self.xmm[source] = shift(low);
+                self.ymm_high[source] = if vector_256 { shift(high) } else { 0 };
+            }
+            (1, op @ (0xFC | 0xFD | 0xFE | 0xF8 | 0xF9 | 0xFA)) => {
+                // VPADDB/W/D and VPSUBB/W/D: per-lane wrapping integer add or subtract.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let width = match op {
+                    0xFC | 0xF8 => 1u32,
+                    0xFD | 0xF9 => 2,
+                    _ => 4,
+                };
+                let subtract = matches!(op, 0xF8 | 0xF9 | 0xFA);
+                let apply = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    let lanes = 128 / (width * 8);
+                    let mask: u128 = if width == 4 { u128::from(u32::MAX) } else { (1u128 << (width * 8)) - 1 };
+                    for i in 0..lanes {
+                        let shift = width * 8 * i;
+                        let x = (a >> shift) & mask;
+                        let y = (b >> shift) & mask;
+                        let r = if subtract { x.wrapping_sub(y) } else { x.wrapping_add(y) } & mask;
+                        out |= r << shift;
+                    }
+                    out
+                };
+                self.xmm[reg] = apply(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[source], high) } else { 0 };
+            }
+            (1, op @ (0xDB | 0xDF | 0xEB)) => {
+                // VPAND / VPANDN / VPOR.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let apply = |a: u128, b: u128| -> u128 {
+                    match op {
+                        0xDB => a & b,
+                        0xDF => !a & b,
+                        _ => a | b,
+                    }
+                };
+                self.xmm[reg] = apply(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[source], high) } else { 0 };
+            }
+            (1, op @ (0x76 | 0x66)) => {
+                // VPCMPEQD / VPCMPGTD: all-ones lane where the signed comparison holds.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let greater = op == 0x66;
+                let apply = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for i in 0..4u32 {
+                        let x = ((a >> (32 * i)) & 0xFFFF_FFFF) as u32 as i32;
+                        let y = ((b >> (32 * i)) & 0xFFFF_FFFF) as u32 as i32;
+                        let hit = if greater { x > y } else { x == y };
+                        if hit {
+                            out |= u128::from(u32::MAX) << (32 * i);
+                        }
+                    }
+                    out
+                };
+                self.xmm[reg] = apply(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[source], high) } else { 0 };
+            }
+            (1, 0xD5) => {
+                // VPMULLW: low 16 bits of each signed word product.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let apply = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for i in 0..8u32 {
+                        let x = ((a >> (16 * i)) & 0xFFFF) as u16 as i16;
+                        let y = ((b >> (16 * i)) & 0xFFFF) as u16 as i16;
+                        out |= u128::from(x.wrapping_mul(y) as u16) << (16 * i);
+                    }
+                    out
+                };
+                self.xmm[reg] = apply(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[source], high) } else { 0 };
+            }
+            (1, 0xF5) => {
+                // VPMADDWD: multiply signed word pairs and add each pair into a dword.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let apply = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for i in 0..4u32 {
+                        let mut sum: i32 = 0;
+                        for j in 0..2u32 {
+                            let shift = 16 * (2 * i + j);
+                            let x = ((a >> shift) & 0xFFFF) as u16 as i16;
+                            let y = ((b >> shift) & 0xFFFF) as u16 as i16;
+                            sum = sum.wrapping_add(i32::from(x) * i32::from(y));
+                        }
+                        out |= u128::from(sum as u32) << (32 * i);
+                    }
+                    out
+                };
+                self.xmm[reg] = apply(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[source], high) } else { 0 };
+            }
+            (1, 0x70) => {
+                // VPSHUFD: permute dwords within each 128-bit lane by imm8.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let imm = self.fetch_u8()?;
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let apply = |v: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for i in 0..4u32 {
+                        let sel = u32::from((imm >> (2 * i)) & 3);
+                        out |= ((v >> (32 * sel)) & 0xFFFF_FFFF) << (32 * i);
+                    }
+                    out
+                };
+                self.xmm[reg] = apply(low);
+                self.ymm_high[reg] = if vector_256 { apply(high) } else { 0 };
+            }
+            (1, op @ (0x60..=0x6D)) => {
+                // VPUNPCKL/H BW, WD, DQ, QDQ: interleave low or high lanes of both operands.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let width = match op {
+                    0x60 | 0x68 => 1u32,
+                    0x61 | 0x69 => 2,
+                    0x62 | 0x6A => 4,
+                    _ => 8,
+                };
+                let high_half = matches!(op, 0x68..=0x6D);
+                let apply = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    let lanes = 128 / (width * 8);
+                    let mask: u128 = if width == 8 { u128::from(u64::MAX) } else { (1u128 << (width * 8)) - 1 };
+                    let base = if high_half { lanes / 2 } else { 0 };
+                    for i in 0..lanes / 2 {
+                        let shift = width * 8 * (base + i);
+                        let x = (a >> shift) & mask;
+                        let y = (b >> shift) & mask;
+                        out |= x << (width * 8 * 2 * i);
+                        out |= y << (width * 8 * (2 * i + 1));
+                    }
+                    out
+                };
+                self.xmm[reg] = apply(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[source], high) } else { 0 };
+            }
+            (pp @ 0..=3, 0xC2) => {
+                // VCMPPS / VCMPPD / VCMPSS / VCMPSD: imm8 selects the predicate and each lane
+                // becomes all-ones or all-zeros.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let imm = self.fetch_u8()?;
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let scalar = pp >= 2;
+                let double = pp == 1 || pp == 3;
+                let apply = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    let lanes = if double { if scalar { 1 } else { 2 } } else if scalar { 1 } else { 4 };
+                    for i in 0..lanes {
+                        let shift = if double { 64 * i } else { 32 * i };
+                        let mask: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                        let (x, y) = if double {
+                            (
+                                f64::from_bits(((a >> shift) & mask) as u64),
+                                f64::from_bits(((b >> shift) & mask) as u64),
+                            )
+                        } else {
+                            (
+                                f64::from(f32::from_bits(((a >> shift) & mask) as u32)),
+                                f64::from(f32::from_bits(((b >> shift) & mask) as u32)),
+                            )
+                        };
+                        let hit = match imm & 7 {
+                            0 => x == y,
+                            1 => x < y,
+                            2 => x <= y,
+                            3 => x.is_nan() || y.is_nan(),
+                            4 => x != y || x.is_nan() || y.is_nan(),
+                            5 => !(x < y),
+                            6 => !(x <= y),
+                            _ => !(x.is_nan() || y.is_nan()),
+                        };
+                        if hit {
+                            out |= mask << shift;
+                        }
+                    }
+                    out
+                };
+                let result = apply(self.xmm[source], low);
+                self.xmm[reg] = if scalar {
+                    let keep: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                    (self.xmm[source] & !keep) | (result & keep)
+                } else {
+                    result
+                };
+                self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[source], high) } else { 0 };
+            }
+            (pp @ (2 | 3), op @ (0x2C | 0x2D)) => {
+                // VCVTTSS2SI / VCVTTSD2SI truncate; VCVTSS2SI / VCVTSD2SI round per MXCSR.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let truncate = op == 0x2C;
+                let value = if pp == 3 {
+                    f64::from_bits(self.read_xmm_f64(target)? as u64)
+                } else {
+                    f64::from(self.read_xmm_f32(target)?)
+                };
+                let rounded = if truncate { value.trunc() } else { value.round_ties_even() };
+                let indefinite: i64 = if operand_64 { i64::MIN } else { i64::from(i32::MIN) };
+                let limit = if operand_64 { 9_223_372_036_854_775_808.0 } else { 2_147_483_648.0 };
+                let out = if rounded.is_nan() || rounded >= limit || rounded < -limit {
+                    indefinite
+                } else if operand_64 {
+                    rounded as i64
+                } else {
+                    i64::from(rounded as i32)
+                };
+                self.write_reg(reg, if operand_64 { 8 } else { 4 }, rex_r != 0, out as u64);
+            }
             _ => return Err(format!("Unsupported VEX vector operation {opcode:#04x} (pp={mandatory_prefix}, l={vector_256}) at {start_rip:#x}")),
         }
         Ok(())
@@ -3700,6 +4016,37 @@ impl XboxX64Emu {
             }
             self.xmm[reg] = out;
             self.ymm_high[reg] = 0;
+            return Ok(());
+        }
+
+        if map == 3 && pp == 1 && matches!(op, 0x4A | 0x4B) && !w {
+            // VBLENDVPS / VBLENDVPD: the mask register is imm8[7:4], one bit per lane.
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let target = self.resolve_target(target, 0);
+            let imm = self.fetch_u8()?;
+            let mask_reg = usize::from(imm >> 4);
+            let vector_256 = b2 & 4 != 0;
+            let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+            let double = op == 0x4B;
+            let blend_lane = |a: u128, b: u128, m: u128| -> u128 {
+                let mut out: u128 = 0;
+                let lanes = if double { 2 } else { 4 };
+                for i in 0..lanes {
+                    let shift = if double { 64 * i } else { 32 * i };
+                    let lane_mask: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                    let sign_bit = if double { 63 } else { 31 };
+                    let pick = (m >> (shift + sign_bit)) & 1 != 0;
+                    let v = if pick { b } else { a };
+                    out |= ((v >> shift) & lane_mask) << shift;
+                }
+                out
+            };
+            self.xmm[reg] = blend_lane(self.xmm[vvvv], low, self.xmm[mask_reg]);
+            self.ymm_high[reg] = if vector_256 {
+                blend_lane(self.ymm_high[vvvv], high, self.ymm_high[mask_reg])
+            } else {
+                0
+            };
             return Ok(());
         }
 

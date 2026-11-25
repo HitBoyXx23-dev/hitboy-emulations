@@ -52,6 +52,7 @@ mod win {
     /// Xbox's `HRESULT`. Games that get furthest are the ones that treat a failed call as a normal
     /// outcome and carry on, so most shims report failure rather than aborting.
     pub const E_FAIL: i32 = 0x8000_0405u32 as i32;
+    pub const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
     pub const S_OK: i32 = 0;
 
     /// Remembers which shim each import name resolved to, so the loader can report coverage.
@@ -814,6 +815,134 @@ mod win {
         S_OK
     }
 
+    /// `ApuCreateHeap`: reserve a heap for APU-visible audio buffers and hand back its base.
+    pub extern "system" fn ApuCreateHeap(out_heap: u64, size: u32, _align: u32) -> i32 {
+        let ptr = XMemAlloc(size as usize, 0);
+        if out_heap != 0 {
+            unsafe { *(out_heap as *mut u64) = ptr as u64 };
+        }
+        if ptr.is_null() { E_FAIL } else { S_OK }
+    }
+
+    /// `ApuIsVirtualAddressValid`: report whether the address is a non-null APU address.
+    pub extern "system" fn ApuIsVirtualAddressValid(va: u64) -> i32 {
+        i32::from(va != 0)
+    }
+
+    /// `ApuMapApuAddress`: expose a physical audio page at a guest virtual address.
+    pub extern "system" fn ApuMapApuAddress(out_va: u64, pa: u64, size: u32) -> i32 {
+        if out_va == 0 {
+            return E_INVALIDARG;
+        }
+        let ptr = XMemAlloc(size as usize, 0);
+        if ptr.is_null() {
+            return E_FAIL;
+        }
+        unsafe { *(out_va as *mut u64) = ptr as u64 };
+        let _ = pa;
+        S_OK
+    }
+
+    /// `XApuConnect`: open an APU command channel.
+    pub extern "system" fn XApuConnect(out_handle: u64) -> i32 {
+        if out_handle != 0 {
+            unsafe { *(out_handle as *mut u64) = 1 };
+        }
+        S_OK
+    }
+
+    pub extern "system" fn XApuDisconnect(_handle: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn XApuEnqueueCommand(_handle: u64, _command: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn XApuDequeueResult(_handle: u64, out_result: u64) -> i32 {
+        if out_result != 0 {
+            unsafe { *(out_result as *mut u64) = 0 };
+        }
+        S_OK
+    }
+
+    pub extern "system" fn XApuGetResultCount(_handle: u64, out_count: u64) -> i32 {
+        if out_count != 0 {
+            unsafe { *(out_count as *mut u32) = 0 };
+        }
+        S_OK
+    }
+
+    pub extern "system" fn XDspActivate(_handle: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn XDspDeactivate(_handle: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn XDspConnectWithMaximumStreamLimit(_handle: u64, _limit: u32) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn XDspDisconnect(_handle: u64) -> i32 {
+        S_OK
+    }
+
+    pub extern "system" fn XDspSubmitCommand(_handle: u64, _command: u64) -> i32 {
+        S_OK
+    }
+
+    /// `XGCreateTextureComputer`: the tiled-texture helper object the title uses for uploads.
+    /// The descriptor layout is not decoded yet, so this hands back a 1x1 placeholder computer.
+    pub extern "system" fn XGCreateTextureComputer(_desc_ptr: u64, out_computer: u64) -> i32 {
+        if out_computer == 0 {
+            return E_INVALIDARG;
+        }
+        let computer = crate::gpu_bridge::create_texture2d_computer(1, 1, 1, crate::gpu_bridge::XgFormat::Bc7Unorm);
+        unsafe { *(out_computer as *mut u64) = computer as u64 };
+        if computer.is_null() { E_FAIL } else { S_OK }
+    }
+
+    /// `XGSuggestSwizzleMode`: pick a tiling mode for the described texture.
+    pub extern "system" fn XGSuggestSwizzleMode(
+        dim: u32,
+        fmt: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        bind: u32,
+    ) -> u32 {
+        XGComputeOptimalTileMode(dim, fmt, width, height, depth, bind)
+    }
+
+    /// `XMemGetWorkingSetStatistics`: working-set accounting is not tracked yet, so both the
+    /// current and peak values are reported as zero.
+    pub extern "system" fn XMemGetWorkingSetStatistics(out_stats: u64) -> i32 {
+        if out_stats == 0 {
+            return E_INVALIDARG;
+        }
+        unsafe {
+            *(out_stats as *mut u64) = 0;
+            *((out_stats + 8) as *mut u64) = 0;
+        }
+        S_OK
+    }
+
+    /// `XMemIsToolsMemAvailable`: development tools memory is never present in a retail run.
+    pub extern "system" fn XMemIsToolsMemAvailable() -> i32 {
+        0
+    }
+
+    /// `XMemTransferMemory`: copy bytes between two guest allocations.
+    pub extern "system" fn XMemTransferMemory(dst: u64, src: u64, size: u64) -> i32 {
+        if dst == 0 || src == 0 {
+            return E_INVALIDARG;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, size as usize) };
+        S_OK
+    }
+
     pub extern "system" fn AcpHalCreate(out_hal: u64) -> i32 {
         if out_hal != 0 {
             let hal = crate::apu_audio::create_acp_hal();
@@ -1124,6 +1253,44 @@ mod win {
         crate::gpu_bridge::XgTileMode::Thin2D as u32
     }
 
+    pub extern "system" fn XGCreateTexture2DComputer(desc_ptr: u64, out_comp: u64) -> i32 {
+        if out_comp == 0 {
+            return E_FAIL;
+        }
+        let (w, h, mips) = if desc_ptr != 0 {
+            unsafe {
+                let w = std::ptr::read_unaligned(desc_ptr as *const u32).max(1);
+                let h = std::ptr::read_unaligned((desc_ptr + 4) as *const u32).max(1);
+                let m = std::ptr::read_unaligned((desc_ptr + 8) as *const u32).clamp(1, 16);
+                (w, h, m)
+            }
+        } else {
+            (256, 256, 1)
+        };
+        let comp = crate::gpu_bridge::create_texture2d_computer(w, h, mips, crate::gpu_bridge::XgFormat::R8G8B8A8Unorm);
+        unsafe { std::ptr::write_unaligned(out_comp as *mut u64, comp as u64) };
+        S_OK
+    }
+
+    pub extern "system" fn XSystemGetAnalyticsInfo(out_info: u64) -> i32 {
+        if out_info == 0 {
+            return E_FAIL;
+        }
+        // Zero-init 160-byte XSystemAnalyticsInfo and stamp OS version 10.0.26100.1
+        unsafe {
+            std::ptr::write_bytes(out_info as *mut u8, 0, 160);
+            std::ptr::write_unaligned(out_info as *mut u16, 10);
+            std::ptr::write_unaligned((out_info + 2) as *mut u16, 0);
+            std::ptr::write_unaligned((out_info + 4) as *mut u16, 26100);
+            std::ptr::write_unaligned((out_info + 6) as *mut u16, 1);
+        }
+        S_OK
+    }
+
+    pub extern "system" fn PIXBeginEventOnCommandList(_cmd: u64, _color: u64, _fmt: u64) {}
+    pub extern "system" fn PIXEndEventOnCommandList(_cmd: u64) {}
+    pub extern "system" fn PIXSetMarkerOnCommandList(_cmd: u64, _color: u64, _fmt: u64) {}
+
     /// D3D12XBOX_CreateDevice bridge: always returns our Xbox-ABI-safe `ID3D12DeviceX` COM
     /// wrapper (which internally attaches a live desktop `ID3D12Device*` when `d3d12.dll` is
     /// present) so Xbox extension slots (44..63, including slot 49) never mis-dispatch into
@@ -1219,6 +1386,11 @@ mod win {
             _ if name.eq_ignore_ascii_case("XUserGetLocalId") => XUserGetLocalId as *mut c_void,
             _ if name.eq_ignore_ascii_case("XDeviceCreate") => XDeviceCreate as *mut c_void,
             _ if name.eq_ignore_ascii_case("XGComputeOptimalTileMode") => XGComputeOptimalTileMode as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XGCreateTexture2DComputer") => XGCreateTexture2DComputer as *mut c_void,
+            _ if name.eq_ignore_ascii_case("XSystemGetAnalyticsInfo") => XSystemGetAnalyticsInfo as *mut c_void,
+            _ if name.eq_ignore_ascii_case("PIXBeginEventOnCommandList") => PIXBeginEventOnCommandList as *mut c_void,
+            _ if name.eq_ignore_ascii_case("PIXEndEventOnCommandList") => PIXEndEventOnCommandList as *mut c_void,
+            _ if name.eq_ignore_ascii_case("PIXSetMarkerOnCommandList") => PIXSetMarkerOnCommandList as *mut c_void,
             _ if name.eq_ignore_ascii_case("D3D12XBOX_CreateDevice")
                 || name.eq_ignore_ascii_case("D3D12XboxCreateDevice") => D3D12XBOX_CreateDevice as *mut c_void,
             _ if name.eq_ignore_ascii_case("D3D12XboxCreateDevice") => D3D12XBOX_CreateDevice as *mut c_void,

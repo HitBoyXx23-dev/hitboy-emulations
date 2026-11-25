@@ -301,6 +301,12 @@ pub unsafe extern "system" fn free_pages(count: usize, ids: *const usize) -> i32
     i32::from(crate::native::with_physical_pages(|pages| pages.free(&ids)))
 }
 
+/// Reports `(current_bytes, peak_bytes)` of physical pages backed by `native_pages`.
+pub fn working_set_statistics() -> (u64, u64) {
+    let cur = crate::native::with_physical_pages(|pages| pages.pages.len() as u64 * PAGE_SIZE_64K);
+    (cur, cur)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

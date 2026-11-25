@@ -379,6 +379,31 @@ mod exports {
     }
 
     #[no_mangle]
+    pub extern "system" fn XGCreateTexture2DComputer(desc_ptr: u64, out_comp: u64) -> i32 {
+        shims::XGCreateTexture2DComputer(desc_ptr, out_comp)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XSystemGetAnalyticsInfo(out_info: u64) -> i32 {
+        shims::XSystemGetAnalyticsInfo(out_info)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn PIXBeginEventOnCommandList(cmd: u64, color: u64, fmt: u64) {
+        shims::PIXBeginEventOnCommandList(cmd, color, fmt)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn PIXEndEventOnCommandList(cmd: u64) {
+        shims::PIXEndEventOnCommandList(cmd)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn PIXSetMarkerOnCommandList(cmd: u64, color: u64, fmt: u64) {
+        shims::PIXSetMarkerOnCommandList(cmd, color, fmt)
+    }
+
+    #[no_mangle]
     pub extern "system" fn SetFrameIntervalX(device: u64, interval: u32, period: u32, flags: u32) -> i32 {
         shims::SetFrameIntervalX(device, interval, period, flags)
     }
@@ -415,6 +440,103 @@ mod exports {
     #[no_mangle]
     pub extern "system" fn ApuFree(va: u64) -> i32 {
         shims::ApuFree(va)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn ApuCreateHeap(out_heap: u64, size: u32, align: u32) -> i32 {
+        shims::ApuCreateHeap(out_heap, size, align)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn ApuIsVirtualAddressValid(va: u64) -> i32 {
+        shims::ApuIsVirtualAddressValid(va)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn ApuMapApuAddress(out_va: u64, pa: u64, size: u32) -> i32 {
+        shims::ApuMapApuAddress(out_va, pa, size)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XApuConnect(out_handle: u64) -> i32 {
+        shims::XApuConnect(out_handle)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XApuDisconnect(handle: u64) -> i32 {
+        shims::XApuDisconnect(handle)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XApuEnqueueCommand(handle: u64, command: u64) -> i32 {
+        shims::XApuEnqueueCommand(handle, command)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XApuDequeueResult(handle: u64, out_result: u64) -> i32 {
+        shims::XApuDequeueResult(handle, out_result)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XApuGetResultCount(handle: u64, out_count: u64) -> i32 {
+        shims::XApuGetResultCount(handle, out_count)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDspActivate(handle: u64) -> i32 {
+        shims::XDspActivate(handle)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDspDeactivate(handle: u64) -> i32 {
+        shims::XDspDeactivate(handle)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDspConnectWithMaximumStreamLimit(handle: u64, limit: u32) -> i32 {
+        shims::XDspConnectWithMaximumStreamLimit(handle, limit)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDspDisconnect(handle: u64) -> i32 {
+        shims::XDspDisconnect(handle)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XDspSubmitCommand(handle: u64, command: u64) -> i32 {
+        shims::XDspSubmitCommand(handle, command)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGCreateTextureComputer(desc_ptr: u64, out_computer: u64) -> i32 {
+        shims::XGCreateTextureComputer(desc_ptr, out_computer)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XGSuggestSwizzleMode(
+        dim: u32,
+        fmt: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        bind: u32,
+    ) -> u32 {
+        shims::XGSuggestSwizzleMode(dim, fmt, width, height, depth, bind)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemGetWorkingSetStatistics(out_stats: u64) -> i32 {
+        shims::XMemGetWorkingSetStatistics(out_stats)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemIsToolsMemAvailable() -> i32 {
+        shims::XMemIsToolsMemAvailable()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn XMemTransferMemory(dst: u64, src: u64, size: u64) -> i32 {
+        shims::XMemTransferMemory(dst, src, size)
     }
 
     #[no_mangle]

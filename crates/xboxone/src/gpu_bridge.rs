@@ -380,6 +380,149 @@ impl D3D12XPipelineTranslator {
     }
 }
 
+/// Interleaves 3-bit `(x, y)` coordinates inside an 8x8 RDNA2 micro-tile (Morton / Z-order).
+#[inline]
+fn morton_8x8(x: u32, y: u32) -> usize {
+    let x = x & 7;
+    let y = y & 7;
+    let m = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
+    m as usize
+}
+
+/// Clean-room RDNA2 2D 8x8 micro-tile swizzle: converts tightly-packed linear surface blocks
+/// (`blocks_w * blocks_h * bpb` bytes) into 8x8 Morton micro-tiled console layout.
+pub fn swizzle_2d_microtile(linear: &[u8], blocks_w: u32, blocks_h: u32, bpb: u32) -> Vec<u8> {
+    let bpb_u = bpb.max(1) as usize;
+    let tiles_x = blocks_w.div_ceil(8) as usize;
+    let tiles_y = blocks_h.div_ceil(8) as usize;
+    let mut out = vec![0u8; tiles_x * tiles_y * 64 * bpb_u];
+    for y in 0..blocks_h {
+        for x in 0..blocks_w {
+            let src_off = ((y * blocks_w + x) as usize) * bpb_u;
+            if src_off + bpb_u > linear.len() {
+                continue;
+            }
+            let tile_idx = ((y / 8) as usize) * tiles_x + ((x / 8) as usize);
+            let dst_off = (tile_idx * 64 + morton_8x8(x, y)) * bpb_u;
+            out[dst_off..dst_off + bpb_u].copy_from_slice(&linear[src_off..src_off + bpb_u]);
+        }
+    }
+    out
+}
+
+/// Clean-room RDNA2 2D 8x8 micro-tile deswizzle: converts console-tiled 8x8 Morton micro-tiled
+/// texture data back into linear PC D3D12 upload layout.
+pub fn deswizzle_2d_microtile(tiled: &[u8], blocks_w: u32, blocks_h: u32, bpb: u32) -> Vec<u8> {
+    let bpb_u = bpb.max(1) as usize;
+    let tiles_x = blocks_w.div_ceil(8) as usize;
+    let mut out = vec![0u8; (blocks_w as usize) * (blocks_h as usize) * bpb_u];
+    for y in 0..blocks_h {
+        for x in 0..blocks_w {
+            let tile_idx = ((y / 8) as usize) * tiles_x + ((x / 8) as usize);
+            let src_off = (tile_idx * 64 + morton_8x8(x, y)) * bpb_u;
+            if src_off + bpb_u > tiled.len() {
+                continue;
+            }
+            let dst_off = ((y * blocks_w + x) as usize) * bpb_u;
+            out[dst_off..dst_off + bpb_u].copy_from_slice(&tiled[src_off..src_off + bpb_u]);
+        }
+    }
+    out
+}
+
+/// Clean-room COM vtable for `XGTextureAddressComputer` (`xg_xs.dll!XGCreateTexture2DComputer`).
+#[repr(C)]
+#[allow(non_snake_case)]
+pub struct XgComputerVtable {
+    pub QueryInterface: unsafe extern "system" fn(*mut XgTextureComputer, *const u8, *mut *mut std::ffi::c_void) -> i32,
+    pub AddRef: unsafe extern "system" fn(*mut XgTextureComputer) -> u32,
+    pub Release: unsafe extern "system" fn(*mut XgTextureComputer) -> u32,
+    pub GetResourceSizeBytes: unsafe extern "system" fn(*mut XgTextureComputer) -> u64,
+    pub GetResourceBaseAlignmentBytes: unsafe extern "system" fn(*mut XgTextureComputer) -> u64,
+    pub GetMipLevelOffsetBytes: unsafe extern "system" fn(*mut XgTextureComputer, u32, u32) -> u64,
+}
+
+#[repr(C)]
+pub struct XgTextureComputer {
+    pub vtbl: *const XgComputerVtable,
+    ref_count: std::sync::atomic::AtomicU32,
+    layout: XgTextureLayout,
+}
+
+static XG_COMP_VTABLE: XgComputerVtable = XgComputerVtable {
+    QueryInterface: xg_qi,
+    AddRef: xg_addref,
+    Release: xg_release,
+    GetResourceSizeBytes: xg_size_bytes,
+    GetResourceBaseAlignmentBytes: xg_align_bytes,
+    GetMipLevelOffsetBytes: xg_mip_offset,
+};
+
+unsafe extern "system" fn xg_qi(
+    this: *mut XgTextureComputer,
+    _riid: *const u8,
+    out: *mut *mut std::ffi::c_void,
+) -> i32 {
+    if out.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    xg_addref(this);
+    *out = this.cast();
+    0
+}
+
+unsafe extern "system" fn xg_addref(this: *mut XgTextureComputer) -> u32 {
+    (*this).ref_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn xg_release(this: *mut XgTextureComputer) -> u32 {
+    let prev = (*this).ref_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    if prev == 1 {
+        drop(Box::from_raw(this));
+        0
+    } else {
+        prev - 1
+    }
+}
+
+unsafe extern "system" fn xg_size_bytes(this: *mut XgTextureComputer) -> u64 {
+    (*this).layout.total_bytes
+}
+
+unsafe extern "system" fn xg_align_bytes(this: *mut XgTextureComputer) -> u64 {
+    (*this).layout.alignment_bytes
+}
+
+unsafe extern "system" fn xg_mip_offset(this: *mut XgTextureComputer, _plane: u32, mip: u32) -> u64 {
+    (&(*this).layout.mips).get(mip as usize).map(|m| m.offset_bytes).unwrap_or(0)
+}
+
+/// Allocates a live COM `XGTextureAddressComputer` instance for a 2D texture.
+pub fn create_texture2d_computer(width: u32, height: u32, mip_levels: u32, format: XgFormat) -> *mut std::ffi::c_void {
+    let layout = compute_texture2d_layout(width.max(1), height.max(1), mip_levels.max(1), format, XgTileMode::Thin2D);
+    let comp = Box::new(XgTextureComputer {
+        vtbl: &XG_COMP_VTABLE,
+        ref_count: std::sync::atomic::AtomicU32::new(1),
+        layout,
+    });
+    Box::into_raw(comp).cast()
+}
+
+/// Allocates a live COM `XGTextureAddressComputer` from an optional raw `XG_TEXTURE2D_DESC` pointer.
+pub fn create_texture_computer(desc_ptr: u64) -> *mut std::ffi::c_void {
+    let (w, h, mips) = if desc_ptr != 0 {
+        unsafe {
+            let w = std::ptr::read_unaligned(desc_ptr as *const u32).max(1);
+            let h = std::ptr::read_unaligned((desc_ptr + 4) as *const u32).max(1);
+            let m = std::ptr::read_unaligned((desc_ptr + 8) as *const u32).clamp(1, 16);
+            (w, h, m)
+        }
+    } else {
+        (256, 256, 1)
+    };
+    create_texture2d_computer(w, h, mips, XgFormat::R8G8B8A8Unorm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +626,27 @@ mod tests {
 
         let hdr = compute_texture2d_layout(512, 512, 1, XgFormat::Bc6hUf16, XgTileMode::Thin2D);
         assert_eq!(hdr.mips[0].row_pitch_bytes, 2048);
+    }
+
+    #[test]
+    fn rdna2_2d_microtile_swizzle_deswizzle_and_xg_computer_round_trip() {
+        // 16x16 BC7 blocks (16 bytes each) round-trip losslessly through 8x8 Morton micro-tiling
+        let linear: Vec<u8> = (0..(16 * 16 * 16)).map(|i| ((i * 37 + 11) & 0xFF) as u8).collect();
+        let tiled = swizzle_2d_microtile(&linear, 16, 16, 16);
+        assert_eq!(tiled.len(), linear.len());
+        assert_ne!(tiled, linear);
+        let back = deswizzle_2d_microtile(&tiled, 16, 16, 16);
+        assert_eq!(back, linear);
+
+        // Live COM XGTextureAddressComputer vtable check
+        unsafe {
+            let comp = create_texture2d_computer(256, 256, 4, XgFormat::Bc7Unorm).cast::<XgTextureComputer>();
+            assert!(!comp.is_null());
+            assert!(((*(*comp).vtbl).GetResourceSizeBytes)(comp) >= 65536);
+            assert_eq!(((*(*comp).vtbl).GetResourceBaseAlignmentBytes)(comp), 65536);
+            assert_eq!(((*(*comp).vtbl).GetMipLevelOffsetBytes)(comp, 0, 0), 0);
+            assert!(((*(*comp).vtbl).GetMipLevelOffsetBytes)(comp, 0, 1) > 0);
+            assert_eq!(((*(*comp).vtbl).Release)(comp), 0);
+        }
     }
 }
