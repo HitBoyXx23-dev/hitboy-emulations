@@ -29,6 +29,232 @@ use crate::gpu_bridge::{sanitize_root_signature_flags, D3D12XPipelineTranslator}
 const S_OK: i32 = 0;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
 const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
+const CMDLIST_MAGIC: u64 = 0x5842_434D_444C_5354; // "XBCMDLST"
+
+/// Full 32-slot COM vtable for `ID3D12CommandQueueX`:
+/// - Slots `0..=18` match exact standard Windows `ID3D12CommandQueue` layout, unwrapping
+///   `D3D12CmdListX*` arguments inside `ExecuteCommandLists` (slot 10) before calling desktop D3D12.
+/// - Slot `19` implements Xbox `PresentX` with live frame-time telemetry.
+#[repr(C)]
+pub struct D3D12CmdQueueXVtable {
+    // IUnknown (0..=2)
+    pub QueryInterface: unsafe extern "system" fn(*mut D3D12CmdQueueX, *const u8, *mut *mut c_void) -> i32,
+    pub AddRef: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> u32,
+    pub Release: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> u32,
+    // ID3D12Object (3..=6)
+    pub GetPrivateData: unsafe extern "system" fn(*mut D3D12CmdQueueX, u64, u64, u64) -> i32,
+    pub SetPrivateData: unsafe extern "system" fn(*mut D3D12CmdQueueX, u64, u64, u64) -> i32,
+    pub SetPrivateDataInterface: unsafe extern "system" fn(*mut D3D12CmdQueueX, u64, u64) -> i32,
+    pub SetName: unsafe extern "system" fn(*mut D3D12CmdQueueX, u64) -> i32,
+    // ID3D12DeviceChild (7)
+    pub GetDevice: unsafe extern "system" fn(*mut D3D12CmdQueueX, u64, u64) -> i32,
+    // ID3D12CommandQueue (8..=18)
+    pub UpdateTileMappings: unsafe extern "system" fn(*mut D3D12CmdQueueX, u64, u64, u64, u64, u64, u64, u64, u64),
+    pub CopyTileMappings: unsafe extern "system" fn(*mut D3D12CmdQueueX, u64, u64, u64, u64, u64, u64),
+    pub ExecuteCommandLists: unsafe extern "system" fn(*mut D3D12CmdQueueX, u32, *const *mut c_void),
+    pub SetMarker: unsafe extern "system" fn(*mut D3D12CmdQueueX, u32, u64, u32),
+    pub BeginEvent: unsafe extern "system" fn(*mut D3D12CmdQueueX, u32, u64, u32),
+    pub EndEvent: unsafe extern "system" fn(*mut D3D12CmdQueueX),
+    pub Signal: unsafe extern "system" fn(*mut D3D12CmdQueueX, *mut c_void, u64) -> i32,
+    pub Wait: unsafe extern "system" fn(*mut D3D12CmdQueueX, *mut c_void, u64) -> i32,
+    pub GetTimestampFrequency: unsafe extern "system" fn(*mut D3D12CmdQueueX, *mut u64) -> i32,
+    pub GetClockCalibration: unsafe extern "system" fn(*mut D3D12CmdQueueX, *mut u64, *mut u64) -> i32,
+    pub GetDesc: unsafe extern "system" fn(*mut D3D12CmdQueueX, *mut u64) -> *mut u64,
+    // Xbox CommandQueue Extensions (19..=31)
+    pub PresentX: unsafe extern "system" fn(*mut D3D12CmdQueueX, u32, *const c_void, *const c_void) -> i32,
+    pub QueueExt20: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt21: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt22: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt23: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt24: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt25: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt26: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt27: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt28: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt29: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt30: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+    pub QueueExt31: unsafe extern "system" fn(*mut D3D12CmdQueueX) -> i32,
+}
+
+#[repr(C)]
+pub struct D3D12CmdQueueX {
+    pub vtbl: *const D3D12CmdQueueXVtable,
+    ref_count: AtomicU32,
+    pub inner_desktop_queue: *mut c_void,
+    pub executed_batches: AtomicU32,
+    pub executed_lists: AtomicU32,
+    pub presents: AtomicU32,
+    pub pacer: Mutex<crate::exe_convert::FramePacer>,
+}
+
+static CMDQUEUE_VTABLE: D3D12CmdQueueXVtable = D3D12CmdQueueXVtable {
+    QueryInterface: q_qi,
+    AddRef: q_addref,
+    Release: q_release,
+    GetPrivateData: q_hr3,
+    SetPrivateData: q_hr4,
+    SetPrivateDataInterface: q_hr5,
+    SetName: q_hr6,
+    GetDevice: q_hr7,
+    UpdateTileMappings: q_v8,
+    CopyTileMappings: q_v9,
+    ExecuteCommandLists: q_execute_command_lists,
+    SetMarker: q_v11,
+    BeginEvent: q_v12,
+    EndEvent: q_v13,
+    Signal: q_signal,
+    Wait: q_wait,
+    GetTimestampFrequency: q_get_ts_freq,
+    GetClockCalibration: q_get_clock_cal,
+    GetDesc: q_get_desc,
+    PresentX: q_present_x,
+    QueueExt20: q_notimpl,
+    QueueExt21: q_notimpl,
+    QueueExt22: q_notimpl,
+    QueueExt23: q_notimpl,
+    QueueExt24: q_notimpl,
+    QueueExt25: q_notimpl,
+    QueueExt26: q_notimpl,
+    QueueExt27: q_notimpl,
+    QueueExt28: q_notimpl,
+    QueueExt29: q_notimpl,
+    QueueExt30: q_notimpl,
+    QueueExt31: q_notimpl,
+};
+
+unsafe fn forward_q_hr(this: *mut D3D12CmdQueueX, slot: usize, a1: u64, a2: u64, a3: u64) -> i32 {
+    let inner = (*this).inner_desktop_queue;
+    if inner.is_null() {
+        return S_OK;
+    }
+    let vtbl = *(inner as *const *const usize);
+    let func: RawFn6 = std::mem::transmute(*vtbl.add(slot));
+    func(inner, a1, a2, a3, 0, 0, 0)
+}
+
+unsafe fn forward_q_void(this: *mut D3D12CmdQueueX, slot: usize, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) {
+    let inner = (*this).inner_desktop_queue;
+    if inner.is_null() {
+        return;
+    }
+    let vtbl = *(inner as *const *const usize);
+    let func: VoidFn6 = std::mem::transmute(*vtbl.add(slot));
+    func(inner, a1, a2, a3, a4, a5, a6);
+}
+
+unsafe extern "system" fn q_qi(this: *mut D3D12CmdQueueX, _riid: *const u8, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    q_addref(this);
+    *out = this.cast();
+    S_OK
+}
+
+unsafe extern "system" fn q_addref(this: *mut D3D12CmdQueueX) -> u32 {
+    (*this).ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn q_release(this: *mut D3D12CmdQueueX) -> u32 {
+    let prev = (*this).ref_count.fetch_sub(1, Ordering::AcqRel);
+    if prev == 1 {
+        let inner = (*this).inner_desktop_queue;
+        if !inner.is_null() {
+            release_com_object(inner);
+        }
+        drop(Box::from_raw(this));
+        0
+    } else {
+        prev - 1
+    }
+}
+
+unsafe extern "system" fn q_hr3(t: *mut D3D12CmdQueueX, a: u64, b: u64, c: u64) -> i32 { forward_q_hr(t, 3, a, b, c) }
+unsafe extern "system" fn q_hr4(t: *mut D3D12CmdQueueX, a: u64, b: u64, c: u64) -> i32 { forward_q_hr(t, 4, a, b, c) }
+unsafe extern "system" fn q_hr5(t: *mut D3D12CmdQueueX, a: u64, b: u64) -> i32 { forward_q_hr(t, 5, a, b, 0) }
+unsafe extern "system" fn q_hr6(t: *mut D3D12CmdQueueX, a: u64) -> i32 { forward_q_hr(t, 6, a, 0, 0) }
+unsafe extern "system" fn q_hr7(t: *mut D3D12CmdQueueX, a: u64, b: u64) -> i32 { forward_q_hr(t, 7, a, b, 0) }
+unsafe extern "system" fn q_v8(t: *mut D3D12CmdQueueX, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, _g: u64, _h: u64) {
+    forward_q_void(t, 8, a, b, c, d, e, f);
+}
+unsafe extern "system" fn q_v9(t: *mut D3D12CmdQueueX, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) {
+    forward_q_void(t, 9, a, b, c, d, e, f);
+}
+
+unsafe extern "system" fn q_execute_command_lists(this: *mut D3D12CmdQueueX, num: u32, pp_lists: *const *mut c_void) {
+    (*this).executed_batches.fetch_add(1, Ordering::Relaxed);
+    (*this).executed_lists.fetch_add(num, Ordering::Relaxed);
+    let inner = (*this).inner_desktop_queue;
+    if inner.is_null() || num == 0 || pp_lists.is_null() {
+        return;
+    }
+    let slice = std::slice::from_raw_parts(pp_lists, num as usize);
+    let mut unwrapped: Vec<*mut c_void> = Vec::with_capacity(slice.len());
+    for &ptr in slice {
+        if !ptr.is_null() {
+            let candidate = ptr.cast::<D3D12CmdListX>();
+            if (*candidate).vtbl == &CMDLIST_VTABLE && (*candidate).magic == CMDLIST_MAGIC {
+                if !(*candidate).inner_desktop_cmd.is_null() {
+                    unwrapped.push((*candidate).inner_desktop_cmd);
+                }
+            } else {
+                unwrapped.push(ptr);
+            }
+        }
+    }
+    if !unwrapped.is_empty() {
+        let vtbl = *(inner as *const *const usize);
+        let func: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+            std::mem::transmute(*vtbl.add(10));
+        func(inner, unwrapped.len() as u32, unwrapped.as_ptr());
+    }
+}
+
+unsafe extern "system" fn q_v11(t: *mut D3D12CmdQueueX, a: u32, b: u64, c: u32) { forward_q_void(t, 11, a as u64, b, c as u64, 0, 0, 0); }
+unsafe extern "system" fn q_v12(t: *mut D3D12CmdQueueX, a: u32, b: u64, c: u32) { forward_q_void(t, 12, a as u64, b, c as u64, 0, 0, 0); }
+unsafe extern "system" fn q_v13(t: *mut D3D12CmdQueueX) { forward_q_void(t, 13, 0, 0, 0, 0, 0, 0); }
+unsafe extern "system" fn q_signal(t: *mut D3D12CmdQueueX, fence: *mut c_void, value: u64) -> i32 {
+    forward_q_hr(t, 14, fence as u64, value, 0)
+}
+unsafe extern "system" fn q_wait(t: *mut D3D12CmdQueueX, fence: *mut c_void, value: u64) -> i32 {
+    forward_q_hr(t, 15, fence as u64, value, 0)
+}
+unsafe extern "system" fn q_get_ts_freq(t: *mut D3D12CmdQueueX, out_freq: *mut u64) -> i32 {
+    if (*t).inner_desktop_queue.is_null() {
+        if !out_freq.is_null() {
+            *out_freq = 1_000_000_000;
+        }
+        return S_OK;
+    }
+    forward_q_hr(t, 16, out_freq as u64, 0, 0)
+}
+unsafe extern "system" fn q_get_clock_cal(t: *mut D3D12CmdQueueX, gpu_ts: *mut u64, cpu_ts: *mut u64) -> i32 {
+    forward_q_hr(t, 17, gpu_ts as u64, cpu_ts as u64, 0)
+}
+unsafe extern "system" fn q_get_desc(t: *mut D3D12CmdQueueX, out_desc: *mut u64) -> *mut u64 {
+    let inner = (*t).inner_desktop_queue;
+    if !inner.is_null() && !out_desc.is_null() {
+        let vtbl = *(inner as *const *const usize);
+        let func: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(*vtbl.add(18));
+        return func(inner, out_desc);
+    }
+    out_desc
+}
+unsafe extern "system" fn q_present_x(
+    this: *mut D3D12CmdQueueX,
+    _plane_count: u32,
+    _plane_params: *const c_void,
+    _present_params: *const c_void,
+) -> i32 {
+    (*this).presents.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut p) = (*this).pacer.lock() {
+        p.schedule_present();
+    }
+    S_OK
+}
+unsafe extern "system" fn q_notimpl(_this: *mut D3D12CmdQueueX) -> i32 {
+    E_NOTIMPL
+}
 
 type RawFn6 = unsafe extern "system" fn(*mut c_void, u64, u64, u64, u64, u64, u64) -> i32;
 type RawFn8 = unsafe extern "system" fn(*mut c_void, u64, u64, u64, u64, u64, u64, u64, u64) -> i32;
@@ -157,6 +383,7 @@ pub struct D3D12CmdListXVtable {
 #[repr(C)]
 pub struct D3D12CmdListX {
     pub vtbl: *const D3D12CmdListXVtable,
+    pub magic: u64,
     ref_count: AtomicU32,
     pub inner_desktop_cmd: *mut c_void,
     pub draw_calls: AtomicU32,
@@ -631,7 +858,29 @@ unsafe extern "system" fn dev_get_node_count(t: *mut D3D12DeviceX) -> u32 {
     let func: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(7));
     func(inner)
 }
-unsafe extern "system" fn dev_slot8(t: *mut D3D12DeviceX, a: u64, b: u64, c: u64) -> i32 { forward_slot6(t, 8, a, b, c, 0, 0, 0) }
+unsafe extern "system" fn dev_slot8(t: *mut D3D12DeviceX, desc: u64, riid: u64, out_q: u64) -> i32 {
+    if out_q == 0 {
+        return E_INVALIDARG;
+    }
+    let mut inner_q: *mut c_void = std::ptr::null_mut();
+    if !(*t).inner_desktop_device.is_null() && desc != 0 && riid != 0 {
+        let hr = forward_slot6(t, 8, desc, riid, &mut inner_q as *mut *mut c_void as u64, 0, 0, 0);
+        if hr != S_OK {
+            return hr;
+        }
+    }
+    let q = Box::new(D3D12CmdQueueX {
+        vtbl: &CMDQUEUE_VTABLE,
+        ref_count: AtomicU32::new(1),
+        inner_desktop_queue: inner_q,
+        executed_batches: AtomicU32::new(0),
+        executed_lists: AtomicU32::new(0),
+        presents: AtomicU32::new(0),
+        pacer: Mutex::new(crate::exe_convert::FramePacer::default()),
+    });
+    *(out_q as *mut *mut c_void) = Box::into_raw(q).cast();
+    S_OK
+}
 unsafe extern "system" fn dev_slot9(t: *mut D3D12DeviceX, a: u64, b: u64, c: u64) -> i32 { forward_slot6(t, 9, a, b, c, 0, 0, 0) }
 unsafe extern "system" fn dev_slot10(t: *mut D3D12DeviceX, a: u64, b: u64, c: u64) -> i32 { forward_slot6(t, 10, a, b, c, 0, 0, 0) }
 unsafe extern "system" fn dev_slot11(t: *mut D3D12DeviceX, a: u64, b: u64, c: u64) -> i32 { forward_slot6(t, 11, a, b, c, 0, 0, 0) }
@@ -663,6 +912,7 @@ unsafe extern "system" fn dev_create_cmdlist(
     }
     let list = Box::new(D3D12CmdListX {
         vtbl: &CMDLIST_VTABLE,
+        magic: CMDLIST_MAGIC,
         ref_count: AtomicU32::new(1),
         inner_desktop_cmd: inner_cmd,
         draw_calls: AtomicU32::new(0),
@@ -1056,6 +1306,7 @@ mod tests {
         unsafe {
             assert_eq!(std::mem::size_of::<D3D12DeviceXVtable>(), 64 * std::mem::size_of::<usize>());
             assert_eq!(std::mem::size_of::<D3D12CmdListXVtable>(), 80 * std::mem::size_of::<usize>());
+            assert_eq!(std::mem::size_of::<D3D12CmdQueueXVtable>(), 32 * std::mem::size_of::<usize>());
 
             let dev = create_device().cast::<D3D12DeviceX>();
             assert!(!dev.is_null());
@@ -1067,8 +1318,15 @@ mod tests {
             assert_eq!(luid_ptr, &mut luid as *mut u64);
             assert_ne!(luid, 0);
 
-            // If desktop hardware D3D12 is present on this PC, test real CommandAllocator + CommandList creation
+            // If desktop hardware D3D12 is present on this PC, test real CommandQueue + CommandAllocator + CommandList + Fence
+            let mut queue_ptr: *mut c_void = std::ptr::null_mut();
             let mut alloc: *mut c_void = std::ptr::null_mut();
+            let mut fence: *mut c_void = std::ptr::null_mut();
+            // IID_ID3D12CommandQueue = {0ec870a6-5d7e-4c22-8cfc-5baae07616ed}
+            let iid_queue: [u8; 16] = [
+                0xA6, 0x70, 0xC8, 0x0E, 0x7E, 0x5D, 0x22, 0x4C,
+                0x8C, 0xFC, 0x5B, 0xAA, 0xE0, 0x76, 0x16, 0xED,
+            ];
             // IID_ID3D12CommandAllocator = {6102dee4-af59-4b09-b999-b44d73f09b24}
             let iid_alloc: [u8; 16] = [
                 0xE4, 0xDE, 0x02, 0x61, 0x59, 0xAF, 0x09, 0x4B,
@@ -1079,7 +1337,33 @@ mod tests {
                 0x0F, 0x0D, 0x16, 0x5B, 0x1B, 0xAC, 0x85, 0x41,
                 0x8B, 0xA8, 0xB3, 0xAE, 0x42, 0xA5, 0xA4, 0x55,
             ];
+            // IID_ID3D12Fence = {0a753dcf-c4d8-4b91-adf6-be5a60d95a76}
+            let iid_fence: [u8; 16] = [
+                0xCF, 0x3D, 0x75, 0x0A, 0xD8, 0xC4, 0x91, 0x4B,
+                0xAD, 0xF6, 0xBE, 0x5A, 0x60, 0xD9, 0x5A, 0x76,
+            ];
+            #[repr(C)]
+            struct QueueDesc {
+                kind: u32,
+                priority: i32,
+                flags: u32,
+                node_mask: u32,
+            }
+            let qdesc = QueueDesc { kind: 0, priority: 0, flags: 0, node_mask: 0 };
+            assert_eq!(
+                ((*(*dev).vtbl).CreateCommandQueue)(
+                    dev,
+                    &qdesc as *const QueueDesc as u64,
+                    iid_queue.as_ptr() as u64,
+                    &mut queue_ptr as *mut *mut c_void as u64,
+                ),
+                S_OK
+            );
+            let queue = queue_ptr.cast::<D3D12CmdQueueX>();
+            assert!(!queue.is_null());
+
             if (*dev).has_desktop_device() {
+                assert!(!(*queue).inner_desktop_queue.is_null());
                 let hr_alloc = ((*(*dev).vtbl).CreateCommandAllocator)(
                     dev,
                     0, // DIRECT
@@ -1088,6 +1372,16 @@ mod tests {
                 );
                 assert_eq!(hr_alloc, S_OK);
                 assert!(!alloc.is_null());
+
+                let hr_fence = ((*(*dev).vtbl).CreateFence)(
+                    dev,
+                    0,
+                    0,
+                    iid_fence.as_ptr() as u64,
+                    &mut fence as *mut *mut c_void as u64,
+                );
+                assert_eq!(hr_fence, S_OK);
+                assert!(!fence.is_null());
             }
 
             // QueryInterface stays on our Xbox-ABI-safe wrapper
@@ -1131,8 +1425,19 @@ mod tests {
                 assert!(!(*cmd).inner_desktop_cmd.is_null());
             }
 
-            // Close + Reset + nested Xbox occlusion queries + DrawInstanced + Dispatch + DispatchMesh
+            // Close -> ExecuteCommandLists (unwraps D3D12CmdListX to real desktop GPU!) -> Signal -> PresentX
             assert_eq!(((*(*cmd).vtbl).Close)(cmd), S_OK);
+            let list_arr = [cmd_ptr];
+            ((*(*queue).vtbl).ExecuteCommandLists)(queue, 1, list_arr.as_ptr());
+            assert_eq!((*queue).executed_batches.load(Ordering::Relaxed), 1);
+            assert_eq!((*queue).executed_lists.load(Ordering::Relaxed), 1);
+            if !fence.is_null() {
+                assert_eq!(((*(*queue).vtbl).Signal)(queue, fence, 1), S_OK);
+            }
+            assert_eq!(((*(*queue).vtbl).PresentX)(queue, 1, std::ptr::null(), std::ptr::null()), S_OK);
+            assert_eq!((*queue).presents.load(Ordering::Relaxed), 1);
+            assert_eq!(((*(*queue).vtbl).QueueExt20)(queue), E_NOTIMPL);
+
             if !alloc.is_null() {
                 assert_eq!(((*(*cmd).vtbl).Reset)(cmd, alloc, std::ptr::null_mut()), S_OK);
             }
@@ -1146,9 +1451,13 @@ mod tests {
             assert_eq!(((*(*cmd).vtbl).CmdExt61)(cmd), E_NOTIMPL);
 
             assert_eq!(((*(*cmd).vtbl).Release)(cmd), 0);
+            if !fence.is_null() {
+                release_com_object(fence);
+            }
             if !alloc.is_null() {
                 release_com_object(alloc);
             }
+            assert_eq!(((*(*queue).vtbl).Release)(queue), 0);
             assert_eq!(((*(*dev).vtbl).Release)(dev), 0);
         }
     }

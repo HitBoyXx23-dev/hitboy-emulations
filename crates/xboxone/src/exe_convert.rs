@@ -86,7 +86,7 @@ pub fn mapped_windows_dll(xbox_dll: &str) -> Option<&'static str> {
         "xcurl.dll" => Some("x2w.dll"),
         "d3d11_x.dll" => Some("d3d11.dll"),
         "kernelx.dll" => Some("kernel32.dll"),
-        "xcrdapi.dll" => Some("advapi32.dll"),
+        "xcrdapi.dll" => Some("x2w.dll"),
         _ => None,
     }
 }
@@ -243,20 +243,23 @@ impl OcclusionQueryUnnester {
     }
 }
 
-/// Clean-room Console Frame Pacer (`SetFrameIntervalX` / `ScheduleFrameEventX`).
+/// Clean-room Console Frame Pacer (`SetFrameIntervalX` / `ScheduleFrameEventX` / `PresentX`)
+/// with rolling frame-time telemetry for average FPS and 1% low measurement.
 #[derive(Debug, Clone)]
 pub struct FramePacer {
     pub interval_us: u64,
     pub frame_count: u64,
     pub pending_events: VecDeque<u64>,
+    pub frame_times_us: VecDeque<u64>,
 }
 
 impl Default for FramePacer {
     fn default() -> Self {
         Self {
-            interval_us: 16_667, // 60 Hz default
+            interval_us: 16_667, // 60 Hz default (8,333 us for 120 Hz)
             frame_count: 0,
             pending_events: VecDeque::new(),
+            frame_times_us: VecDeque::new(),
         }
     }
 }
@@ -271,6 +274,32 @@ impl FramePacer {
         let token = self.frame_count;
         self.pending_events.push_back(token);
         token
+    }
+
+    pub fn record_frame_time_us(&mut self, dt_us: u64) {
+        if self.frame_times_us.len() >= 256 {
+            self.frame_times_us.pop_front();
+        }
+        self.frame_times_us.push_back(dt_us.max(1));
+    }
+
+    pub fn average_fps(&self) -> f64 {
+        if self.frame_times_us.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = self.frame_times_us.iter().copied().sum();
+        let avg_us = sum as f64 / self.frame_times_us.len() as f64;
+        1_000_000.0 / avg_us
+    }
+
+    pub fn one_percent_low_fps(&self) -> f64 {
+        if self.frame_times_us.is_empty() {
+            return 0.0;
+        }
+        let mut sorted: Vec<u64> = self.frame_times_us.iter().copied().collect();
+        sorted.sort_unstable();
+        let idx = ((sorted.len() * 99) / 100).min(sorted.len() - 1);
+        1_000_000.0 / (sorted[idx] as f64)
     }
 
     pub fn complete_next(&mut self) -> Option<u64> {
@@ -359,6 +388,15 @@ mod tests {
         let (mc, mbody) = svc.handle_http("/Match/CreateMatchmakingTicket");
         assert_eq!(mc, 200);
         assert!(mbody.contains("private-local-match"));
+
+        let mut pacer = FramePacer::default();
+        pacer.set_interval_us(8_333);
+        for _ in 0..99 {
+            pacer.record_frame_time_us(8_333);
+        }
+        pacer.record_frame_time_us(10_000);
+        assert!((pacer.average_fps() - 119.7).abs() < 1.0);
+        assert!((pacer.one_percent_low_fps() - 100.0).abs() < 0.5);
     }
 
     #[test]

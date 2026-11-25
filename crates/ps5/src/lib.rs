@@ -8,6 +8,7 @@
 //! a "NID"), so the app can say what the game needs from our reimplementation of those
 //! libraries. Running the program is the next stage and builds on this loader.
 
+pub mod agc;
 pub mod elf;
 pub mod exe_convert;
 pub mod firmware;
