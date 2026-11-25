@@ -62,7 +62,35 @@ mod exports {
         attributes: u64,
         protection: u32,
     ) -> *mut c_void {
-        shims::XMemVirtualAlloc(address, size, flags, attributes, protection)
+        shims::guest_xmem_virtual_alloc(address, size, flags, attributes, protection)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn XMemAllocatePhysicalPages(
+        attributes: u64,
+        count: *mut usize,
+        output: *mut usize,
+    ) -> i32 {
+        unsafe { xboxone::native_pages::allocate_pages(attributes, count, output) }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn XMemFreePhysicalPages(count: usize, ids: *const usize) -> i32 {
+        unsafe { xboxone::native_pages::free_pages(count, ids) }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn XMemMapPhysicalPages(address: usize, count: usize, ids: *const usize) -> usize {
+        unsafe { xboxone::native_pages::map_pages(address, count, ids) }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(
+        addresses: *const usize,
+        count: u32,
+        ids: *const usize,
+    ) -> i32 {
+        unsafe { xboxone::native_pages::map_pages_scatter(addresses, count, ids) }
     }
 
     #[no_mangle]
@@ -107,12 +135,33 @@ mod exports {
         shims::D3D12XBOX_CreateDevice(params, riid, pp_device)
     }
 
+    /// The converted title imports this spelling; Windows export lookup is case-sensitive.
+    #[no_mangle]
+    pub extern "system" fn D3D12XboxCreateDevice(params: u64, riid: u64, pp_device: u64) -> i32 {
+        shims::D3D12XBOX_CreateDevice(params, riid, pp_device)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn D3D12ConfigureVirtualMemoryX(config: u64) -> i32 {
+        shims::D3D12ConfigureVirtualMemoryX(config)
+    }
+
     #[no_mangle]
     pub extern "system" fn D3D12CreateDevice(
-        adapter: *mut c_void,
-        min_feature_level: u32,
+        _adapter: *mut c_void,
+        _min_feature_level: u32,
         riid: u64,
         pp_device: u64,
+    ) -> i32 {
+        shims::D3D12XBOX_CreateDevice(0, riid, pp_device)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn D3D12EnableExperimentalFeatures(
+        num_features: u32,
+        iids: *const c_void,
+        configs: *mut c_void,
+        config_sizes: *mut u32,
     ) -> i32 {
         #[link(name = "kernel32")]
         extern "system" {
@@ -121,17 +170,126 @@ mod exports {
         }
         let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
         if !d3d12.is_null() {
-            let sym = unsafe { GetProcAddress(d3d12, b"D3D12CreateDevice\0".as_ptr()) };
+            let sym = unsafe { GetProcAddress(d3d12, b"D3D12EnableExperimentalFeatures\0".as_ptr()) };
             if !sym.is_null() {
-                let func: extern "system" fn(*mut c_void, u32, u64, u64) -> i32 =
+                let func: extern "system" fn(u32, *const c_void, *mut c_void, *mut u32) -> i32 =
                     unsafe { std::mem::transmute(sym) };
-                let hr = func(adapter, min_feature_level, riid, pp_device);
-                if hr == shims::S_OK {
-                    return hr;
-                }
+                return func(num_features, iids, configs, config_sizes);
             }
         }
-        shims::D3D12XBOX_CreateDevice(0, riid, pp_device)
+        shims::E_FAIL
+    }
+
+    #[no_mangle]
+    pub extern "system" fn D3D12CreateRootSignatureDeserializer(
+        src: *const c_void,
+        src_len: usize,
+        riid: *const u8,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
+        if !d3d12.is_null() {
+            let sym = unsafe { GetProcAddress(d3d12, b"D3D12CreateRootSignatureDeserializer\0".as_ptr()) };
+            if !sym.is_null() {
+                let func: extern "system" fn(*const c_void, usize, *const u8, *mut *mut c_void) -> i32 =
+                    unsafe { std::mem::transmute(sym) };
+                return func(src, src_len, riid, out);
+            }
+        }
+        shims::E_FAIL
+    }
+
+    #[no_mangle]
+    pub extern "system" fn D3D12CreateVersionedRootSignatureDeserializer(
+        src: *const c_void,
+        src_len: usize,
+        riid: *const u8,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
+        if !d3d12.is_null() {
+            let sym = unsafe { GetProcAddress(d3d12, b"D3D12CreateVersionedRootSignatureDeserializer\0".as_ptr()) };
+            if !sym.is_null() {
+                let func: extern "system" fn(*const c_void, usize, *const u8, *mut *mut c_void) -> i32 =
+                    unsafe { std::mem::transmute(sym) };
+                return func(src, src_len, riid, out);
+            }
+        }
+        shims::E_FAIL
+    }
+
+    #[no_mangle]
+    pub extern "system" fn D3D12GetInterface(rclsid: *const u8, riid: *const u8, out: *mut *mut c_void) -> i32 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
+        if !d3d12.is_null() {
+            let sym = unsafe { GetProcAddress(d3d12, b"D3D12GetInterface\0".as_ptr()) };
+            if !sym.is_null() {
+                let func: extern "system" fn(*const u8, *const u8, *mut *mut c_void) -> i32 =
+                    unsafe { std::mem::transmute(sym) };
+                return func(rclsid, riid, out);
+            }
+        }
+        shims::E_FAIL
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn XMemVirtualFree(address: *mut c_void, size: usize, flags: u32) -> i32 {
+        xboxone::native_pages::guest_virtual_free(address, size, flags)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn XMemVirtualProtect(
+        address: *mut c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn VirtualProtect(addr: *mut c_void, sz: usize, np: u32, op: *mut u32) -> i32;
+        }
+        VirtualProtect(address, size, new_protect, old_protect)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn ApuIsMemoryInApuRange(_va: u64) -> bool {
+        true
+    }
+
+    #[no_mangle]
+    pub extern "system" fn ApuMapVirtualAddress(va: u64, out_apu: *mut u32) -> i32 {
+        if !out_apu.is_null() {
+            unsafe { *out_apu = va as u32 };
+        }
+        shims::S_OK
+    }
+
+    #[no_mangle]
+    pub extern "system" fn DStorageCreateCompressionCodec(
+        _format: u32,
+        _num_threads: u32,
+        _riid: *const u8,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        if !out.is_null() {
+            unsafe { *out = std::ptr::null_mut() };
+        }
+        0x8000_4001u32 as i32
     }
 
     #[no_mangle]
@@ -142,6 +300,47 @@ mod exports {
         out_err: u64,
     ) -> i32 {
         shims::D3D12SerializeRootSignatureX(desc, version, out_blob, out_err)
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(
+        description: *const c_void,
+        blob: *mut *mut c_void,
+        error_blob: *mut *mut c_void,
+    ) -> i32 {
+        type Serializer = unsafe extern "system" fn(
+            *const c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+        const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+        static SERIALIZER: std::sync::OnceLock<Option<Serializer>> = std::sync::OnceLock::new();
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryExA(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+
+        let serializer = SERIALIZER.get_or_init(|| unsafe {
+            let module = LoadLibraryExA(
+                b"d3d12.dll\0".as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
+            if module.is_null() {
+                return None;
+            }
+            let address = GetProcAddress(module, b"D3D12SerializeVersionedRootSignature\0".as_ptr());
+            if address.is_null() {
+                return None;
+            }
+            Some(std::mem::transmute::<*mut c_void, Serializer>(address))
+        });
+        match serializer {
+            Some(serialize) => unsafe { serialize(description, blob, error_blob) },
+            None => shims::E_FAIL,
+        }
     }
 
     #[no_mangle]
@@ -599,6 +798,31 @@ mod tests {
     use super::exports::*;
 
     #[test]
+    fn standalone_physical_memory_exports_share_backing_and_release_it() {
+        let page_bytes = xboxone::era_mem::PAGE_SIZE_64K as usize;
+        let window = XMemVirtualAlloc(0, page_bytes * 2, 0x42000, 0, 1);
+        assert!(!window.is_null());
+        let first = window as usize;
+        let aliases = [first, first + page_bytes];
+        let mut count = 1;
+        let mut page = 0;
+        assert_eq!(unsafe { XMemAllocatePhysicalPages(0, &mut count, &mut page) }, 1);
+        assert_ne!(page, 0);
+
+        assert_eq!(unsafe { XMemMapPhysicalPages(first, 1, &page) }, first);
+        assert_eq!(unsafe { XMemMapPhysicalPagesScatter(&aliases[1], 1, &page) }, 1);
+        unsafe { (first as *mut u64).write(0x1234_5678) };
+        assert_eq!(unsafe { (aliases[1] as *const u64).read() }, 0x1234_5678);
+        assert_eq!(unsafe { XMemFreePhysicalPages(1, &page) }, 0);
+
+        assert_eq!(unsafe { XMemMapPhysicalPages(first, 2, std::ptr::null()) }, first);
+        assert_eq!(unsafe { XMemFreePhysicalPages(1, &page) }, 1);
+        for address in aliases {
+            assert_ne!(unsafe { xboxone::native_pages::guest_virtual_free(address as *mut _, 0, 0x8000) }, 0);
+        }
+    }
+
+    #[test]
     fn x2w_exports_initialize_directstorage_d3d12x_and_acp() {
         assert_eq!(XGameRuntimeInitialize(0, 0), 0);
         assert_eq!(XSystemGetDeviceType(), 7);
@@ -608,8 +832,15 @@ mod tests {
         assert_ne!(fac, 0);
 
         let mut dev = 0u64;
+        let mut cfg = [0u8; 32];
+        cfg[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(D3D12ConfigureVirtualMemoryX(cfg.as_ptr() as u64), 0);
+        assert_eq!(D3D12ConfigureVirtualMemoryX(0), 0x8007_0057u32 as i32);
         assert_eq!(D3D12XBOX_CreateDevice(0, 0, &mut dev as *mut u64 as u64), 0);
         assert_ne!(dev, 0);
+        let mut dev2 = 0u64;
+        assert_eq!(D3D12XboxCreateDevice(0, 0, &mut dev2 as *mut u64 as u64), 0);
+        assert_ne!(dev2, 0);
 
         let mut hal = 0u64;
         assert_eq!(AcpHalCreate(&mut hal as *mut u64 as u64), 0);

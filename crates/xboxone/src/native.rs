@@ -134,9 +134,15 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
         f(g.as_mut().expect("a native run is active"))
     }
 
-    pub(crate) fn with_physical_pages<R>(f: impl FnOnce(&mut PhysicalPages) -> R) -> Option<R> {
+    pub(crate) fn with_physical_pages<R>(f: impl FnOnce(&mut PhysicalPages) -> R) -> R {
+        static STANDALONE: std::sync::OnceLock<Mutex<PhysicalPages>> = std::sync::OnceLock::new();
         let mut state = RUN.lock().unwrap_or_else(|e| e.into_inner());
-        state.as_mut().map(|run| f(&mut run.physical_pages))
+        if let Some(run) = state.as_mut() {
+            return f(&mut run.physical_pages);
+        }
+        drop(state);
+        let mut pages = STANDALONE.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut pages)
     }
 
     /// The libraries a running game pulled in, so a shim can tell where a call came from.

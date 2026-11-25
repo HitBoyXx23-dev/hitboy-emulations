@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-const USAGE: &str = "Game Dump Helper (HitBoyXx23 / Navuryx)
+const USAGE: &str = "Game Dump Helper (HitBoy's Emulations)
 
   gamedump check <file or folder>   Say what a dump is and whether it looks complete
   gamedump hash <file>              SHA-1 and CRC-32 (compare with redump.org)
@@ -93,7 +93,7 @@ fn xbox_emu(path: &str, steps: Option<&String>) -> i32 {
         Ok(title) => title,
         Err(error) => { eprintln!("{error}"); return 1; }
     };
-    let mut core = match xboxone::x64_emu::XboxX64Emu::load_pe(&image) {
+    let mut core = match xboxone::x64_emu::XboxX64Emu::load_pe_with_executable_name(&image, &game.executable) {
         Ok(core) => core,
         Err(error) => { eprintln!("{error}"); return 1; }
     };

@@ -11,6 +11,8 @@ use std::collections::HashMap;
 const EXIT_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_0000;
 const THREAD_EXIT_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_0010;
 const TLS_RETURN_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_0020;
+const CRT_RETURN_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_0030;
+const CRT_EXIT_RETURN_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_0040;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
@@ -19,11 +21,38 @@ const XMEM_PAGE_MODE_MASK: u32 = 0x2040_0000;
 const THUNK_BASE: u64 = 0xFFFF_FFFF_FFFE_0000;
 const THUNK_STRIDE: u64 = 8;
 const XGAME_RUNTIME_HANDLE: u64 = 0xFFFF_FFFF_FFFD_0000;
+const SYNCH_MODULE_HANDLE: u64 = 0xFFFF_FFFF_FFFD_0008;
+const SYNCH_MODULE_DLL: &str = "api-ms-win-core-synch-l1-2-0.dll";
 const LAST_ERROR_OFFSET: u64 = 0x68;
+const CRT_ERRNO_OFFSET: u64 = 0xFF0;
+const CRT_THREAD_LOCALE_OFFSET: u64 = 0xFF4;
+const CRT_ENABLE_THREAD_LOCALE: u32 = 1;
+const CRT_DISABLE_THREAD_LOCALE: u32 = 2;
+const CRT_COMMODE_OFFSET: u64 = 0xF00;
+const CRT_FMODE_OFFSET: u64 = 0xF04;
+const CRT_EINVAL: u32 = 22;
+const CRT_TEXT_MODE: u32 = 0x4000;
+const CRT_BINARY_MODE: u32 = 0x8000;
+const CRT_WIDE_TEXT_MODE: u32 = 0x1_0000;
+const CRT_ARGC_OFFSET: u64 = 0;
+const CRT_ARGV_OFFSET: u64 = 8;
+const CRT_ARGV_ARRAY_OFFSET: u64 = 16;
+const CRT_ENV_OFFSET: u64 = 32;
+const CRT_ENV_ARRAY_OFFSET: u64 = 40;
+const CRT_EMPTY_STRING_OFFSET: u64 = 48;
+const CRT_PROGRAM_OFFSET: u64 = 64;
+const WAIT_HANDLE_BASE: u64 = 0x1000_0000;
+const WAIT_TIMEOUT: u64 = 258;
+const WAIT_FAILED: u64 = u32::MAX as u64;
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+const SEMAPHORE_MODIFY_ACCESS: u32 = 2;
+const FILETIME_UNIX_EPOCH_SECONDS: i64 = 11_644_473_600;
+const FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
 
 const RAX: usize = 0;
 const RCX: usize = 1;
 const RDX: usize = 2;
+const RBX: usize = 3;
 const RSP: usize = 4;
 const RSI: usize = 6;
 const RDI: usize = 7;
@@ -32,6 +61,7 @@ const R9: usize = 9;
 
 const CF: u64 = 1 << 0;
 const PF: u64 = 1 << 2;
+const AF: u64 = 1 << 4;
 const ZF: u64 = 1 << 6;
 const SF: u64 = 1 << 7;
 const DF: u64 = 1 << 10;
@@ -66,12 +96,33 @@ struct GuestThread {
     id: u32,
     regs: [u64; 16],
     xmm: [u128; 16],
+    ymm_high: [u128; 16],
     rip: u64,
     rflags: u64,
     teb_va: u64,
     finished: bool,
     exit_code: u32,
     tls_startup: Option<TlsStartup>,
+    crt_initializers: Vec<CrtInitializers>,
+}
+
+#[derive(Debug, Clone)]
+struct CrtInitializers {
+    next: u64,
+    end: u64,
+    caller_stack: u64,
+    fail_on_error: bool,
+}
+
+struct CrtExit {
+    thread: usize,
+    caller_stack: u64,
+    exit_code: Option<i32>,
+}
+
+enum GuestWaitObject {
+    Event { manual_reset: bool, signaled: bool },
+    Semaphore { count: i32, maximum: i32, access: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +202,7 @@ impl ImageTls {
 pub struct XboxX64Emu {
     pub regs: [u64; 16],
     pub xmm: [u128; 16],
+    ymm_high: [u128; 16],
     pub rip: u64,
     pub rflags: u64,
     pub mem: TitleAddressSpace,
@@ -161,6 +213,12 @@ pub struct XboxX64Emu {
     threads: Vec<GuestThread>,
     active_thread: usize,
     next_tid: u32,
+    crt_app_type: u32,
+    crt_arguments: u64,
+    crt_exit_callbacks: Vec<u64>,
+    crt_exit: Option<CrtExit>,
+    wait_objects: HashMap<u64, GuestWaitObject>,
+    next_wait_handle: u64,
     image_tls: Option<ImageTls>,
     tls_slots: Vec<Option<u64>>,
     audio_samples: Vec<f32>,
@@ -182,6 +240,10 @@ pub struct XboxX64Emu {
 impl XboxX64Emu {
     /// Loads a PE32+ image into a fresh sandboxed 64-bit address space ready to run.
     pub fn load_pe(file: &[u8]) -> Result<Self, String> {
+        Self::load_pe_with_executable_name(file, "default.exe")
+    }
+
+    pub fn load_pe_with_executable_name(file: &[u8], executable: &str) -> Result<Self, String> {
         let pe = Pe::parse_bytes(file)?;
         if !pe.is_x64() {
             return Err(format!("PE machine {:#x} is not x86-64", pe.machine));
@@ -246,6 +308,16 @@ impl XboxX64Emu {
 
         // Allocate guest PEB and main-thread TEB (`gs:` segment base).
         let peb_va = mem.alloc(None, PAGE_SIZE_4K, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true)?;
+        mem.write_u32(peb_va + CRT_FMODE_OFFSET, CRT_TEXT_MODE)?;
+        let crt_arguments = mem.alloc(None, PAGE_SIZE_4K, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true)?;
+        let executable = executable.rsplit(['/', '\\']).next().unwrap_or_default();
+        if executable.is_empty() || executable.contains('\0')
+            || executable.len() as u64 >= PAGE_SIZE_4K - CRT_PROGRAM_OFFSET
+        {
+            return Err("Invalid guest executable name".into());
+        }
+        mem.write_bytes(crt_arguments + CRT_PROGRAM_OFFSET, executable.as_bytes())?;
+        mem.write_u64(crt_arguments + CRT_ARGV_ARRAY_OFFSET, crt_arguments + CRT_PROGRAM_OFFSET)?;
         mem.write_u64(peb_va + 0x10, base)?; // ImageBaseAddress
         let teb_va = mem.alloc(None, PAGE_SIZE_4K, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true)?;
         mem.write_u64(teb_va + 0x08, stack_base + stack_size)?; // StackBase
@@ -268,17 +340,20 @@ impl XboxX64Emu {
             id: 0x1001,
             regs,
             xmm,
+            ymm_high: [0; 16],
             rip: entry_rip,
             rflags: 0x202,
             teb_va,
             finished: false,
             exit_code: 0,
             tls_startup: image_tls.as_ref().and_then(|tls| tls.startup(entry_rip, initial_rsp, 0, 1)),
+            crt_initializers: Vec::new(),
         };
 
         Ok(Self {
             regs,
             xmm,
+            ymm_high: [0; 16],
             rip: entry_rip,
             rflags: 0x202,
             mem,
@@ -289,6 +364,12 @@ impl XboxX64Emu {
             threads: vec![main_thread],
             active_thread: 0,
             next_tid: 0x1002,
+            crt_app_type: 0,
+            crt_arguments,
+            crt_exit_callbacks: Vec::new(),
+            crt_exit: None,
+            wait_objects: HashMap::new(),
+            next_wait_handle: WAIT_HANDLE_BASE,
             image_tls,
             tls_slots: Vec::new(),
             audio_samples: Vec::new(),
@@ -319,6 +400,7 @@ impl XboxX64Emu {
         let tls = self.image_tls.as_ref().ok_or("Missing image TLS state")?;
         self.regs = [0; 16];
         self.xmm = [0; 16];
+        self.ymm_high = [0; 16];
         self.rflags = 0x202;
         self.regs[RSP] = startup.stack;
         if let Some(&callback) = tls.callbacks.get(startup.next_callback) {
@@ -337,10 +419,78 @@ impl XboxX64Emu {
         Ok(())
     }
 
+    fn begin_crt_initializers(&mut self, first: u64, end: u64, fail_on_error: bool) -> Result<(), String> {
+        if end.checked_sub(first).is_none_or(|size| size % 8 != 0 || size > 512 * 1024) {
+            return Err("Invalid guest CRT initializer table".into());
+        }
+        self.threads[self.active_thread].crt_initializers.push(CrtInitializers {
+            next: first,
+            end,
+            caller_stack: self.regs[RSP],
+            fail_on_error,
+        });
+        self.advance_crt_initializers(0)
+    }
+
+    fn advance_crt_initializers(&mut self, callback_result: u32) -> Result<(), String> {
+        let pending = &mut self.threads[self.active_thread].crt_initializers;
+        let initializers = pending.last_mut().ok_or("Unexpected guest CRT initializer return")?;
+        let result = if initializers.fail_on_error { callback_result } else { 0 };
+        while result == 0 && initializers.next < initializers.end {
+            let callback = self.mem.read_u64(initializers.next)?;
+            initializers.next += 8;
+            if callback != 0 {
+                let caller_stack = initializers.caller_stack;
+                return self.enter_crt_callback(caller_stack, callback, CRT_RETURN_SENTINEL);
+            }
+        }
+        let caller_stack = initializers.caller_stack;
+        self.rip = self.mem.read_u64(caller_stack)?;
+        self.regs[RSP] = caller_stack + 8;
+        self.regs[RAX] = u64::from(result);
+        pending.pop();
+        Ok(())
+    }
+
+    fn enter_crt_callback(&mut self, caller_stack: u64, callback: u64, return_ip: u64) -> Result<(), String> {
+        let stack = caller_stack.checked_sub(0x30).ok_or("Guest stack underflow in CRT callback")?;
+        self.mem.write_u64(stack, return_ip)?;
+        self.regs[RSP] = stack;
+        self.rip = callback;
+        Ok(())
+    }
+
+    fn begin_crt_exit(&mut self, exit_code: Option<i32>) -> Result<(), String> {
+        if self.crt_exit.is_some() {
+            return Err("A guest CRT exit is already in progress".into());
+        }
+        self.crt_exit = Some(CrtExit { thread: self.active_thread, caller_stack: self.regs[RSP], exit_code });
+        self.advance_crt_exit()
+    }
+
+    fn advance_crt_exit(&mut self) -> Result<(), String> {
+        let exit = self.crt_exit.as_ref().filter(|exit| exit.thread == self.active_thread)
+            .ok_or("Unexpected guest CRT exit callback return")?;
+        let caller_stack = exit.caller_stack;
+        if let Some(callback) = self.crt_exit_callbacks.pop() {
+            return self.enter_crt_callback(caller_stack, callback, CRT_EXIT_RETURN_SENTINEL);
+        }
+        if let Some(code) = exit.exit_code {
+            self.exit_code = code;
+            self.exited = true;
+        } else {
+            self.rip = self.mem.read_u64(caller_stack)?;
+            self.regs[RSP] = caller_stack + 8;
+        }
+        self.crt_exit = None;
+        Ok(())
+    }
+
     fn save_active_thread(&mut self) {
         if let Some(t) = self.threads.get_mut(self.active_thread) {
             t.regs = self.regs;
             t.xmm = self.xmm;
+            t.ymm_high = self.ymm_high;
             t.rip = self.rip;
             t.rflags = self.rflags;
             t.teb_va = self.teb_va;
@@ -352,6 +502,7 @@ impl XboxX64Emu {
         let t = &self.threads[idx];
         self.regs = t.regs;
         self.xmm = t.xmm;
+        self.ymm_high = t.ymm_high;
         self.rip = t.rip;
         self.rflags = t.rflags;
         self.teb_va = t.teb_va;
@@ -451,6 +602,18 @@ impl XboxX64Emu {
             if let Err(error) = self.advance_tls_startup() {
                 return EmuStepState::Stopped(error);
             }
+            if self.rip == CRT_RETURN_SENTINEL {
+                if let Err(error) = self.advance_crt_initializers(self.regs[RAX] as u32) {
+                    return EmuStepState::Stopped(error);
+                }
+                continue;
+            }
+            if self.rip == CRT_EXIT_RETURN_SENTINEL {
+                if let Err(error) = self.advance_crt_exit() {
+                    return EmuStepState::Stopped(error);
+                }
+                continue;
+            }
             if self.rip == EXIT_SENTINEL {
                 self.exit_code = self.regs[RAX] as i32;
                 self.exited = true;
@@ -538,6 +701,86 @@ impl XboxX64Emu {
         }
 
         let ret_val: u64 = match name {
+            "_initterm" | "_initterm_e" => return self.begin_crt_initializers(rcx, rdx, name == "_initterm_e"),
+            "_crt_atexit" | "atexit" => {
+                if rcx == 0 || self.crt_exit_callbacks.try_reserve(1).is_err() {
+                    u64::from(u32::MAX)
+                } else {
+                    self.crt_exit_callbacks.push(rcx);
+                    0
+                }
+            }
+            "exit" => return self.begin_crt_exit(Some(rcx as i32)),
+            "_cexit" => return self.begin_crt_exit(None),
+            "_exit" | "_Exit" => {
+                self.exit_code = rcx as i32;
+                self.exited = true;
+                return Ok(());
+            }
+            "_set_app_type" => {
+                self.crt_app_type = rcx as u32;
+                0
+            }
+            "_query_app_type" => u64::from(self.crt_app_type),
+            "_configure_narrow_argv" => match rcx as u32 {
+                0..=2 => {
+                    let argc = u32::from(rcx as u32 != 0);
+                    let argv = if argc == 0 { 0 } else { self.crt_arguments + CRT_ARGV_ARRAY_OFFSET };
+                    self.mem.write_u32(self.crt_arguments + CRT_ARGC_OFFSET, argc)?;
+                    self.mem.write_u64(self.crt_arguments + CRT_ARGV_OFFSET, argv)?;
+                    0
+                }
+                _ => self.crt_error(CRT_EINVAL)?,
+            },
+            "__p___argc" => self.crt_arguments + CRT_ARGC_OFFSET,
+            "__p___argv" => self.crt_arguments + CRT_ARGV_OFFSET,
+            "_get_narrow_winmain_command_line" => self.crt_arguments + CRT_EMPTY_STRING_OFFSET,
+            "_initialize_narrow_environment" => {
+                self.mem.write_u64(self.crt_arguments + CRT_ENV_OFFSET, self.crt_arguments + CRT_ENV_ARRAY_OFFSET)?;
+                0
+            }
+            "__p__environ" => self.crt_arguments + CRT_ENV_OFFSET,
+            "__p__commode" => self.peb_va + CRT_COMMODE_OFFSET,
+            "__p__fmode" => self.peb_va + CRT_FMODE_OFFSET,
+            "_set_fmode" => match rcx as u32 {
+                mode @ (CRT_TEXT_MODE | CRT_BINARY_MODE | CRT_WIDE_TEXT_MODE) => {
+                    self.mem.write_u32(self.peb_va + CRT_FMODE_OFFSET, mode)?;
+                    0
+                }
+                _ => self.crt_error(CRT_EINVAL)?,
+            },
+            "_get_fmode" if rcx != 0 => {
+                let mode = self.mem.read_u32(self.peb_va + CRT_FMODE_OFFSET)?;
+                self.mem.write_u32(rcx, mode)?;
+                0
+            }
+            "_get_fmode" | "_get_errno" if rcx == 0 => self.crt_error(CRT_EINVAL)?,
+            "_errno" => self.teb_va + CRT_ERRNO_OFFSET,
+            "_get_errno" => {
+                let errno = self.mem.read_u32(self.teb_va + CRT_ERRNO_OFFSET)?;
+                self.mem.write_u32(rcx, errno)?;
+                0
+            }
+            "_set_errno" => {
+                self.mem.write_u32(self.teb_va + CRT_ERRNO_OFFSET, rcx as u32)?;
+                0
+            }
+            "_configthreadlocale" => {
+                let address = self.teb_va + CRT_THREAD_LOCALE_OFFSET;
+                let stored = self.mem.read_u32(address)?;
+                let previous = if stored == 0 { CRT_DISABLE_THREAD_LOCALE } else { stored };
+                match rcx as u32 {
+                    0 => u64::from(previous),
+                    mode @ (CRT_ENABLE_THREAD_LOCALE | CRT_DISABLE_THREAD_LOCALE) => {
+                        self.mem.write_u32(address, mode)?;
+                        u64::from(previous)
+                    }
+                    _ => {
+                        self.crt_error(CRT_EINVAL)?;
+                        u64::from(u32::MAX)
+                    }
+                }
+            }
             "GetModuleHandleA" | "GetModuleHandleW" if rcx == 0 => self.mem.read_u64(self.peb_va + 0x10)?,
             "GetModuleHandleA" | "GetModuleHandleW" => {
                 self.get_runtime_module(rcx, name.ends_with('W'), false)?
@@ -551,9 +794,99 @@ impl XboxX64Emu {
                 self.runtime_module_refs -= 1;
                 1
             }
+            "FreeLibrary" if rcx == SYNCH_MODULE_HANDLE => 1,
             "FreeLibrary" => self.library_error(6)?,
             "GetLastError" => u64::from(self.mem.read_u32(self.teb_va + LAST_ERROR_OFFSET)?),
             "SetLastError" => self.library_error(rcx as u32)?,
+            n if n.eq_ignore_ascii_case("sinf")
+                || n.eq_ignore_ascii_case("cosf")
+                || n.eq_ignore_ascii_case("tanf")
+                || n.eq_ignore_ascii_case("asinf")
+                || n.eq_ignore_ascii_case("acosf")
+                || n.eq_ignore_ascii_case("atanf")
+                || n.eq_ignore_ascii_case("atan2f")
+                || n.eq_ignore_ascii_case("sqrtf")
+                || n.eq_ignore_ascii_case("fabsf")
+                || n.eq_ignore_ascii_case("floorf")
+                || n.eq_ignore_ascii_case("ceilf")
+                || n.eq_ignore_ascii_case("roundf")
+                || n.eq_ignore_ascii_case("truncf")
+                || n.eq_ignore_ascii_case("expf")
+                || n.eq_ignore_ascii_case("exp2f")
+                || n.eq_ignore_ascii_case("logf")
+                || n.eq_ignore_ascii_case("log2f")
+                || n.eq_ignore_ascii_case("log10f")
+                || n.eq_ignore_ascii_case("powf")
+                || n.eq_ignore_ascii_case("fmodf") => {
+                // Single-precision CRT math: the argument arrives in xmm0, a second argument in
+                // xmm1, and the result is returned in xmm0.
+                let a = f32::from_bits(self.xmm[0] as u32);
+                let b = f32::from_bits(self.xmm[1] as u32);
+                let r = match n.to_ascii_lowercase().as_str() {
+                    "sinf" => a.sin(),
+                    "cosf" => a.cos(),
+                    "tanf" => a.tan(),
+                    "asinf" => a.asin(),
+                    "acosf" => a.acos(),
+                    "atanf" => a.atan(),
+                    "atan2f" => a.atan2(b),
+                    "sqrtf" => a.sqrt(),
+                    "fabsf" => a.abs(),
+                    "floorf" => a.floor(),
+                    "ceilf" => a.ceil(),
+                    "roundf" => a.round(),
+                    "truncf" => a.trunc(),
+                    "expf" => a.exp(),
+                    "exp2f" => a.exp2(),
+                    "logf" => a.ln(),
+                    "log2f" => a.log2(),
+                    "log10f" => a.log10(),
+                    "powf" => a.powf(b),
+                    _ => a % b,
+                };
+                self.xmm[0] = u128::from(r.to_bits());
+                0
+            }
+            n if n.eq_ignore_ascii_case("SetUnhandledExceptionFilter") => 0,
+            n if n.eq_ignore_ascii_case("_set_new_mode")
+                || n.eq_ignore_ascii_case("_set_purecall_handler")
+                || n.eq_ignore_ascii_case("_set_invalid_parameter_handler")
+                || n.eq_ignore_ascii_case("_set_error_mode") => 0,
+            "RegOpenKeyW" => {
+                let predefined = rcx as u32;
+                if !(0x8000_0000..=0x8000_0005).contains(&predefined)
+                    || rcx != (predefined as i32 as i64 as u64)
+                {
+                    6
+                } else if r8 == 0 {
+                    87
+                } else if rdx != 0 && self.mem.read_u16(rdx)? != 0 {
+                    2
+                } else {
+                    self.mem.write_u64(r8, rcx)?;
+                    0
+                }
+            }
+            "IsProcessorFeaturePresent" => 0,
+            "memset" => {
+                let end = rcx.checked_add(r8).ok_or("Guest memset address overflow")?;
+                let bytes = [rdx as u8; PAGE_SIZE_4K as usize];
+                let mut address = rcx;
+                while address < end {
+                    let page_remaining = PAGE_SIZE_4K - address % PAGE_SIZE_4K;
+                    let count = (end - address).min(page_remaining);
+                    self.mem.write_bytes(address, &bytes[..count as usize])?;
+                    address += count;
+                }
+                rcx
+            }
+            "InitializeSListHead" => {
+                if rcx == 0 || rcx % 16 != 0 {
+                    return Err("Unaligned guest SLIST header".into());
+                }
+                self.mem.write_bytes(rcx, &[0; 16])?;
+                0
+            }
             n if n.eq_ignore_ascii_case("XGameRuntimeInitialize")
                 || n.eq_ignore_ascii_case("XGameRuntimeUninitialize")
                 || n.eq_ignore_ascii_case("XGameFeatureInitialize") =>
@@ -696,6 +1029,12 @@ impl XboxX64Emu {
                 self.tick_counter += 16;
                 self.tick_counter
             }
+            "GetSystemTimeAsFileTime" => {
+                let filetime_seconds = state::wall_clock_secs().saturating_add(FILETIME_UNIX_EPOCH_SECONDS);
+                let filetime = u64::try_from(filetime_seconds).unwrap_or(0).saturating_mul(FILETIME_TICKS_PER_SECOND);
+                self.mem.write_u64(rcx, filetime)?;
+                0
+            }
             n if n.eq_ignore_ascii_case("QueryPerformanceCounter") => {
                 self.tick_counter += 1000;
                 if rcx != 0 {
@@ -708,6 +1047,42 @@ impl XboxX64Emu {
                     let _ = self.mem.write_u64(rcx, 10_000_000);
                 }
                 1
+            }
+            n if n.eq_ignore_ascii_case("GetLogicalProcessorInformation") => {
+                // SYSTEM_LOGICAL_PROCESSOR_INFORMATION is 32 bytes on x64: 8-byte mask, 4-byte
+                // relationship, 4 bytes of padding, then a 16-byte union.
+                const ENTRY: usize = 32;
+                const RELATION_PROCESSOR_CORE: u32 = 0;
+                const RELATION_PROCESSOR_PACKAGE: u32 = 3;
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .clamp(1, 64);
+                let needed = (cores + 1) * ENTRY;
+                if rdx == 0 {
+                    return Ok(());
+                }
+                let capacity = self.mem.read_u32(rdx).unwrap_or(0) as usize;
+                if rcx == 0 || capacity < needed {
+                    let _ = self.mem.write_u32(rdx, needed as u32);
+                    self.library_error(122)?; // ERROR_INSUFFICIENT_BUFFER
+                    0
+                } else {
+                    let mut buf = vec![0u8; needed];
+                    for i in 0..cores {
+                        let base = i * ENTRY;
+                        buf[base..base + 8].copy_from_slice(&(1u64 << i).to_le_bytes());
+                        buf[base + 8..base + 12].copy_from_slice(&RELATION_PROCESSOR_CORE.to_le_bytes());
+                        buf[base + 16] = 1; // ProcessorCore.Flags
+                    }
+                    let base = cores * ENTRY;
+                    let mask = if cores >= 64 { u64::MAX } else { (1u64 << cores) - 1 };
+                    buf[base..base + 8].copy_from_slice(&mask.to_le_bytes());
+                    buf[base + 8..base + 12].copy_from_slice(&RELATION_PROCESSOR_PACKAGE.to_le_bytes());
+                    self.mem.write_bytes(rcx, &buf)?;
+                    let _ = self.mem.write_u32(rdx, needed as u32);
+                    1
+                }
             }
             n if n.eq_ignore_ascii_case("GetCurrentProcessId") => 0x1000,
             n if n.eq_ignore_ascii_case("GetCurrentThreadId") => {
@@ -744,12 +1119,14 @@ impl XboxX64Emu {
                     id: tid,
                     regs,
                     xmm: [0u128; 16],
+                    ymm_high: [0; 16],
                     rip: start_addr,
                     rflags: 0x202,
                     teb_va: teb,
                     finished: false,
                     exit_code: 0,
                     tls_startup: self.image_tls.as_ref().and_then(|tls| tls.startup(start_addr, rsp, param, 2)),
+                    crt_initializers: Vec::new(),
                 });
                 if tid_out != 0 {
                     let _ = self.mem.write_u32(tid_out, tid);
@@ -757,7 +1134,7 @@ impl XboxX64Emu {
                 handle
             }
             n if n.eq_ignore_ascii_case("WaitForSingleObject") => {
-                if rcx >= 0x2000 {
+                if (0x2000..WAIT_HANDLE_BASE).contains(&rcx) {
                     let idx = (rcx - 0x2000) as usize;
                     if let Some(target) = self.threads.get(idx) {
                         if !target.finished {
@@ -768,7 +1145,11 @@ impl XboxX64Emu {
                         }
                     }
                 }
-                0 // WAIT_OBJECT_0
+                if rcx < WAIT_HANDLE_BASE {
+                    0
+                } else {
+                    self.poll_wait_object(rcx, rdx as u32)?
+                }
             }
             n if n.eq_ignore_ascii_case("GetExitCodeThread") => {
                 if rcx >= 0x2000 && rdx != 0 {
@@ -805,14 +1186,50 @@ impl XboxX64Emu {
                 }
                 return Ok(());
             }
+            "CreateEventA" | "CreateEventW" if rcx == 0 && r9 == 0 => {
+                self.create_wait_object(GuestWaitObject::Event { manual_reset: rdx as u32 != 0, signaled: r8 as u32 != 0 })?
+            }
+            "CreateEventA" | "CreateEventW" => self.library_error(50)?,
+            "CreateSemaphoreW" | "CreateSemaphoreExW" if rcx == 0 && r9 == 0 => {
+                let count = rdx as i32;
+                let maximum = r8 as i32;
+                let stack = self.regs[RSP];
+                if count < 0 || maximum <= 0 || count > maximum
+                    || (name == "CreateSemaphoreExW" && self.mem.read_u32(stack + 0x28)? != 0)
+                {
+                    self.library_error(87)?
+                } else {
+                    let access = if name == "CreateSemaphoreExW" {
+                        self.mem.read_u32(stack + 0x30)?
+                    } else {
+                        SYNCHRONIZE_ACCESS | SEMAPHORE_MODIFY_ACCESS
+                    };
+                    self.create_wait_object(GuestWaitObject::Semaphore { count, maximum, access })?
+                }
+            }
+            "CreateSemaphoreW" | "CreateSemaphoreExW" => self.library_error(50)?,
+            "ReleaseSemaphore" => self.release_semaphore(rcx, rdx as i32, r8)?,
+            "SetEvent" | "ResetEvent" => {
+                if let Some(GuestWaitObject::Event { signaled, .. }) = self.wait_objects.get_mut(&rcx) {
+                    *signaled = name == "SetEvent";
+                    1
+                } else {
+                    self.library_error(6)?
+                }
+            }
+            "CloseHandle" if rcx >= WAIT_HANDLE_BASE => {
+                if self.wait_objects.remove(&rcx).is_some() { 1 } else { self.library_error(6)? }
+            }
             n if n.eq_ignore_ascii_case("CloseHandle") => 1,
             n if n.eq_ignore_ascii_case("InitializeCriticalSection")
                 || n.eq_ignore_ascii_case("InitializeCriticalSectionEx")
                 || n.eq_ignore_ascii_case("InitializeCriticalSectionAndSpinCount") =>
             {
-                if rcx != 0 {
-                    let _ = self.mem.write_bytes(rcx, &[0u8; 40]);
-                }
+                let spin_count = if n.eq_ignore_ascii_case("InitializeCriticalSection") { 0 } else { rdx as u32 };
+                let mut section = [0; 40];
+                section[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+                section[32..40].copy_from_slice(&u64::from(spin_count).to_le_bytes());
+                self.mem.write_bytes(rcx, &section)?;
                 1
             }
             n if n.eq_ignore_ascii_case("EnterCriticalSection")
@@ -860,8 +1277,26 @@ impl XboxX64Emu {
                 self.exited = true;
                 return Ok(());
             }
+            n if n.eq_ignore_ascii_case("D3D12ConfigureVirtualMemoryX") => {
+                if rcx == 0 {
+                    0x8007_0057 // E_INVALIDARG
+                } else {
+                    let mut raw = [0u8; 32];
+                    if self.mem.read_bytes(rcx, &mut raw).is_err() {
+                        0x8007_0057
+                    } else {
+                        let cfg = crate::era_mem::D3D12XboxVirtualMemoryConfig::from_le_bytes(&raw);
+                        if self.mem.configure_gpu_virtual_memory(cfg).is_ok() {
+                            0 // S_OK
+                        } else {
+                            0x8007_0057
+                        }
+                    }
+                }
+            }
             n if n.eq_ignore_ascii_case("XDeviceCreate")
                 || n.eq_ignore_ascii_case("D3D12XBOX_CreateDevice")
+                || n.eq_ignore_ascii_case("D3D12XboxCreateDevice")
                 || n.eq_ignore_ascii_case("D3D12CreateDevice")
                 || n.eq_ignore_ascii_case("D3D11XCreateDeviceX") =>
             {
@@ -980,6 +1415,64 @@ impl XboxX64Emu {
         Ok(0)
     }
 
+    fn crt_error(&mut self, error: u32) -> Result<u64, String> {
+        self.mem.write_u32(self.teb_va + CRT_ERRNO_OFFSET, error)?;
+        Ok(u64::from(error))
+    }
+
+    fn create_wait_object(&mut self, object: GuestWaitObject) -> Result<u64, String> {
+        if self.wait_objects.try_reserve(1).is_err() {
+            return self.library_error(8);
+        }
+        let handle = self.next_wait_handle;
+        self.next_wait_handle = handle.checked_add(1).ok_or("Guest wait handle overflow")?;
+        self.wait_objects.insert(handle, object);
+        Ok(handle)
+    }
+
+    fn poll_wait_object(&mut self, handle: u64, timeout: u32) -> Result<u64, String> {
+        match self.wait_objects.get_mut(&handle) {
+            Some(GuestWaitObject::Event { manual_reset, signaled }) if *signaled => {
+                *signaled = *manual_reset;
+                Ok(0)
+            }
+            Some(GuestWaitObject::Semaphore { access, .. }) if *access & SYNCHRONIZE_ACCESS == 0 => {
+                self.library_error(5)?;
+                Ok(WAIT_FAILED)
+            }
+            Some(GuestWaitObject::Semaphore { count, .. }) if *count > 0 => {
+                *count -= 1;
+                Ok(0)
+            }
+            Some(_) if timeout == 0 => Ok(WAIT_TIMEOUT),
+            Some(_) => Err("Blocking guest event and semaphore waits are not implemented".into()),
+            None => {
+                self.library_error(6)?;
+                Ok(WAIT_FAILED)
+            }
+        }
+    }
+
+    fn release_semaphore(&mut self, handle: u64, release: i32, previous: u64) -> Result<u64, String> {
+        let Some(GuestWaitObject::Semaphore { count, maximum, access }) = self.wait_objects.get_mut(&handle) else {
+            return self.library_error(6);
+        };
+        if *access & SEMAPHORE_MODIFY_ACCESS == 0 {
+            return self.library_error(5);
+        }
+        if release <= 0 {
+            return self.library_error(87);
+        }
+        let Some(new_count) = count.checked_add(release).filter(|value| *value <= *maximum) else {
+            return self.library_error(298);
+        };
+        if previous != 0 {
+            self.mem.write_u32(previous, *count as u32)?;
+        }
+        *count = new_count;
+        Ok(1)
+    }
+
     fn read_library_name(&self, address: u64, wide: bool) -> Option<String> {
         if !wide {
             return self.mem.read_cstr(address, 260).ok();
@@ -999,6 +1492,9 @@ impl XboxX64Emu {
         let Some(name) = self.read_library_name(address, wide) else {
             return self.library_error(126);
         };
+        if name.eq_ignore_ascii_case(SYNCH_MODULE_DLL) {
+            return Ok(SYNCH_MODULE_HANDLE);
+        }
         let is_runtime = name.eq_ignore_ascii_case(XGAME_RUNTIME_DLL) || name.eq_ignore_ascii_case("xgameruntime");
         if !is_runtime || (!load && self.runtime_module_refs == 0) {
             return self.library_error(126);
@@ -1010,26 +1506,33 @@ impl XboxX64Emu {
     }
 
     fn get_runtime_export(&mut self, handle: u64, address: u64) -> Result<u64, String> {
-        if handle != XGAME_RUNTIME_HANDLE || self.runtime_module_refs == 0 {
-            return self.library_error(6);
-        }
+        let (dll, exports): (&str, &[&str]) = match handle {
+            XGAME_RUNTIME_HANDLE if self.runtime_module_refs != 0 => (XGAME_RUNTIME_DLL, XGAME_RUNTIME_EXPORTS),
+            SYNCH_MODULE_HANDLE => (SYNCH_MODULE_DLL, &["InitializeCriticalSectionEx"]),
+            _ => return self.library_error(6),
+        };
         let Ok(name) = self.mem.read_cstr(address, 256) else {
             return self.library_error(127);
         };
-        if !XGAME_RUNTIME_EXPORTS.contains(&name.as_str()) {
+        if !exports.contains(&name.as_str()) {
             return self.library_error(127);
         }
         if let Some(thunk_address) = self.thunks.iter().filter_map(|(&address, thunk)| {
-            (thunk.dll.eq_ignore_ascii_case(XGAME_RUNTIME_DLL) && thunk.name == name).then_some(address)
+            (thunk.dll.eq_ignore_ascii_case(dll) && thunk.name == name).then_some(address)
         }).min() {
             return Ok(thunk_address);
         }
         let thunk_address = THUNK_BASE + self.thunks.len() as u64 * THUNK_STRIDE;
-        self.thunks.insert(thunk_address, ThunkEntry { dll: XGAME_RUNTIME_DLL.to_owned(), name });
+        self.thunks.insert(thunk_address, ThunkEntry { dll: dll.to_owned(), name });
         Ok(thunk_address)
     }
 
     fn xmem_virtual_alloc(&mut self, address: u64, size: u64, flags: u32, protection: u32) -> Option<u64> {
+        if flags == (XMEM_PAGE_MODE_MASK | MEM_RESERVE | MEM_REPLACE_PLACEHOLDER)
+            && self.mem.carve_physical_window(address, size)
+        {
+            return Some(address);
+        }
         let allocation_type = flags & !XMEM_PAGE_MODE_MASK;
         let reserve_placeholder = allocation_type & MEM_RESERVE_PLACEHOLDER != 0;
         let replace_placeholder = allocation_type & MEM_REPLACE_PLACEHOLDER != 0;
@@ -1360,6 +1863,36 @@ impl XboxX64Emu {
         }
     }
 
+    fn read_ymm_rm(&self, target: ModRmResolved) -> Result<(u128, u128), String> {
+        match target {
+            ModRmResolved::Reg(reg) => Ok((self.xmm[reg], self.ymm_high[reg])),
+            ModRmResolved::Mem(address) => {
+                let mut bytes = [0; 32];
+                self.mem.read_bytes(address, &mut bytes)?;
+                Ok((
+                    u128::from_le_bytes(bytes[..16].try_into().unwrap()),
+                    u128::from_le_bytes(bytes[16..].try_into().unwrap()),
+                ))
+            }
+        }
+    }
+
+    fn write_ymm_rm(&mut self, target: ModRmResolved, low: u128, high: u128) -> Result<(), String> {
+        match target {
+            ModRmResolved::Reg(reg) => {
+                self.xmm[reg] = low;
+                self.ymm_high[reg] = high;
+                Ok(())
+            }
+            ModRmResolved::Mem(address) => {
+                let mut bytes = [0; 32];
+                bytes[..16].copy_from_slice(&low.to_le_bytes());
+                bytes[16..].copy_from_slice(&high.to_le_bytes());
+                self.mem.write_bytes(address, &bytes)
+            }
+        }
+    }
+
     fn read_xmm_f32(&self, t: ModRmResolved) -> Result<f32, String> {
         Ok(f32::from_bits(match t {
             ModRmResolved::Reg(r) => self.xmm[r & 15] as u32,
@@ -1596,6 +2129,11 @@ impl XboxX64Emu {
         match op {
             // VEX 3-byte (0xC4) BMI1 / BMI2
             0xC4 => self.step_vex3(start_rip),
+            0xC5 => {
+                let prefix = self.fetch_u8()?;
+                let opcode = self.fetch_u8()?;
+                self.step_vex_vector(prefix, 0, 0, false, opcode, start_rip)
+            }
             // ALU r/m, r and r, r/m and AL/rAX, imm
             0x00..=0x3D if (op & 7) <= 5 => {
                 let alu = op >> 3;
@@ -2364,6 +2902,25 @@ impl XboxX64Emu {
                 let v = if self.eval_cc(op2 & 0xF) { 1 } else { 0 };
                 self.write_rm(r, 1, has_rex, v)
             }
+            0xA2 => {
+                let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match self.regs[RAX] as u32 {
+                    0 => (
+                        1,
+                        u32::from_le_bytes(*b"HitB"),
+                        u32::from_le_bytes(*b"4CPU"),
+                        u32::from_le_bytes(*b"oyX6"),
+                    ),
+                    1 => (0, 1 << 16, 0, 1 << 15),
+                    0x8000_0000 => (0x8000_0001, 0, 0, 0),
+                    0x8000_0001 => (0, 0, 0, 1 << 29),
+                    _ => (0, 0, 0, 0),
+                };
+                self.regs[RAX] = u64::from(eax);
+                self.regs[RBX] = u64::from(ebx);
+                self.regs[RCX] = u64::from(ecx);
+                self.regs[RDX] = u64::from(edx);
+                Ok(())
+            }
             // BT / BTS / BTR / BTC r/m, r
             0xA3 | 0xAB | 0xB3 | 0xBB => {
                 let (reg, t) = self.decode_modrm(rex_r, rex_x, rex_b_bit)?;
@@ -2404,6 +2961,25 @@ impl XboxX64Emu {
                 let a = Self::sign_ext(self.read_reg(reg, op_size, has_rex), op_size) as i64;
                 let b = Self::sign_ext(self.read_rm(r, op_size, has_rex)?, op_size) as i64;
                 self.write_reg(reg, op_size, has_rex, a.wrapping_mul(b) as u64);
+                Ok(())
+            }
+            0xB0 | 0xB1 => {
+                let size = if op2 == 0xB0 { 1 } else { op_size };
+                let (source, target) = self.decode_modrm(rex_r, rex_x, rex_b_bit)?;
+                let target = self.resolve_target(target, 0);
+                let expected = self.read_reg(RAX, size, has_rex);
+                let current = self.read_rm(target, size, has_rex)?;
+                if expected == current {
+                    let replacement = self.read_reg(source, size, has_rex);
+                    self.write_rm(target, size, has_rex, replacement)?;
+                } else {
+                    if matches!(target, ModRmResolved::Mem(_)) {
+                        self.write_rm(target, size, has_rex, current)?;
+                    }
+                    self.write_reg(RAX, size, has_rex, current);
+                }
+                let difference = self.alu_op(7, expected, current, size);
+                self.rflags = (self.rflags & !AF) | ((expected ^ current ^ difference) & AF);
                 Ok(())
             }
             // MOVZX r, r/m8 / r/m16
@@ -2511,6 +3087,465 @@ impl XboxX64Emu {
         }
     }
 
+    fn step_vex_vector(
+        &mut self,
+        prefix: u8,
+        rex_x: usize,
+        rex_b: usize,
+        operand_64: bool,
+        opcode: u8,
+        start_rip: u64,
+    ) -> Result<(), String> {
+        let rex_r = usize::from((!prefix >> 7) & 1);
+        let source = usize::from((!prefix >> 3) & 15);
+        let vector_256 = prefix & 4 != 0;
+        let mandatory_prefix = prefix & 3;
+        if opcode == 0x77 && mandatory_prefix == 0 && source == 0 {
+            self.ymm_high.fill(0);
+            if vector_256 {
+                self.xmm.fill(0);
+            }
+            return Ok(());
+        }
+        match (mandatory_prefix, opcode) {
+            (0 | 1, 0x10 | 0x11 | 0x28 | 0x29) | (1 | 2, 0x6F | 0x7F) if source == 0 => {
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let align = if vector_256 { 32 } else { 16 };
+                let aligned_move = matches!(opcode, 0x28 | 0x29)
+                    || matches!((mandatory_prefix, opcode), (1, 0x6F | 0x7F));
+                if aligned_move
+                    && matches!(target, ModRmResolved::Mem(address) if address % align != 0)
+                {
+                    return Err(format!("Unaligned AVX move at {start_rip:#x}"));
+                }
+                if matches!(opcode, 0x10 | 0x28 | 0x6F) {
+                    let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                    self.xmm[reg] = low;
+                    self.ymm_high[reg] = high;
+                } else if vector_256 {
+                    self.write_ymm_rm(target, self.xmm[reg], self.ymm_high[reg])?;
+                } else {
+                    self.write_xmm_rm(target, self.xmm[reg])?;
+                    if let ModRmResolved::Reg(target_reg) = target {
+                        self.ymm_high[target_reg] = 0;
+                    }
+                }
+            }
+            (0 | 1, 0x57) | (1, 0xEF) => {
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                self.xmm[reg] = self.xmm[source] ^ low;
+                self.ymm_high[reg] = if vector_256 { self.ymm_high[source] ^ high } else { 0 };
+            }
+            (1, 0xD4) => {
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let add_lanes = |lhs: u128, rhs: u128| {
+                    let first = (lhs as u64).wrapping_add(rhs as u64);
+                    let second = ((lhs >> 64) as u64).wrapping_add((rhs >> 64) as u64);
+                    u128::from(first) | (u128::from(second) << 64)
+                };
+                self.xmm[reg] = add_lanes(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { add_lanes(self.ymm_high[source], high) } else { 0 };
+            }
+            (1, 0x6E | 0x7E) if !vector_256 && source == 0 => {
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let size = if operand_64 { 8 } else { 4 };
+                if opcode == 0x6E {
+                    self.xmm[reg] = u128::from(self.read_rm(target, size, true)?);
+                    self.ymm_high[reg] = 0;
+                } else {
+                    self.write_rm(target, size, true, self.xmm[reg] as u64)?;
+                }
+            }
+            (1, 0x16 | 0x17) if !vector_256 => {
+                // VMOVHPS: 0x16 loads m64 into the low quadword and vvvv into the high quadword;
+                // 0x17 stores the high quadword of the ModRM register to m64.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                if opcode == 0x16 {
+                    let low = self.read_rm(target, 8, true)?;
+                    self.xmm[reg] = u128::from(low) | (self.xmm[source] << 64);
+                    self.ymm_high[reg] = 0;
+                } else {
+                    self.write_rm(target, 8, true, (self.xmm[reg] >> 64) as u64)?;
+                }
+            }
+            (2, 0x12 | 0x16) => {
+                // VMOVSLDUP / VMOVSHDUP: duplicate the even (0x12) or odd (0x16) single-precision
+                // lane of each pair across the destination.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let odd = opcode == 0x16;
+                let dup = |v: u128| {
+                    let mut out: u128 = 0;
+                    for i in 0..2u32 {
+                        let lane = (v >> (32 * (2 * i + u32::from(odd)))) & 0xFFFF_FFFF;
+                        out |= (lane << (64 * i)) | (lane << (64 * i + 32));
+                    }
+                    out
+                };
+                self.xmm[reg] = dup(low);
+                self.ymm_high[reg] = if vector_256 { dup(high) } else { 0 };
+            }
+            (0, 0x16 | 0x17) if !vector_256 => {
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                if opcode == 0x16 {
+                    let low = self.read_rm(target, 8, true)?;
+                    self.xmm[reg] = u128::from(low) | (self.xmm[source] << 64);
+                    self.ymm_high[reg] = 0;
+                } else {
+                    self.write_rm(target, 8, true, (self.xmm[reg] >> 64) as u64)?;
+                }
+            }
+            (2, 0x10 | 0x11) => {
+                // VMOVSS: 0x10 merges the low single of the source into vvvv's upper lanes (or
+                // zero-extends when vvvv is absent); 0x11 stores the low single.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                if opcode == 0x10 {
+                    let low = self.read_rm(target, 4, true)? as u32;
+                    self.xmm[reg] = if source == 0 {
+                        u128::from(low)
+                    } else {
+                        (self.xmm[source] & !u128::from(u32::MAX)) | u128::from(low)
+                    };
+                    self.ymm_high[reg] = 0;
+                } else {
+                    self.write_rm(target, 4, true, u64::from(self.xmm[reg] as u32))?;
+                }
+            }
+            (3, 0x10 | 0x11) => {
+                // VMOVSD: 0x10 merges the low double of the source into vvvv's upper lane (or
+                // zero-extends when vvvv is absent); 0x11 stores the low double.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                if opcode == 0x10 {
+                    let low = self.read_rm(target, 8, true)?;
+                    self.xmm[reg] = if source == 0 {
+                        u128::from(low)
+                    } else {
+                        (self.xmm[source] & !u128::from(u64::MAX)) | u128::from(low)
+                    };
+                    self.ymm_high[reg] = 0;
+                } else {
+                    self.write_rm(target, 8, true, self.xmm[reg] as u64)?;
+                }
+            }
+            (2 | 3, 0x2A) => {
+                // VCVTSI2SS / VCVTSI2SD: convert a signed integer to a scalar float, keeping
+                // vvvv's upper lanes.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let size = if operand_64 { 8 } else { 4 };
+                let raw = self.read_rm(target, size, true)?;
+                let integer = if operand_64 { raw as i64 } else { i64::from(raw as u32 as i32) };
+                let bits = if mandatory_prefix == 2 {
+                    u128::from((integer as f32).to_bits())
+                } else {
+                    u128::from((integer as f64).to_bits())
+                };
+                let keep: u128 = if mandatory_prefix == 2 { u128::from(u32::MAX) } else { u128::from(u64::MAX) };
+                self.xmm[reg] = if source == 0 {
+                    bits
+                } else {
+                    (self.xmm[source] & !keep) | bits
+                };
+                self.ymm_high[reg] = 0;
+            }
+            (pp @ 0..=3, op @ (0x58 | 0x59 | 0x5C | 0x5D | 0x5E | 0x5F)) => {
+                // VADD / VMUL / VSUB / VMIN / VDIV / VMAX in packed-single (pp=0), packed-double
+                // (pp=1), scalar-single (pp=2) and scalar-double (pp=3) forms.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let scalar = pp >= 2;
+                let double = pp == 1 || pp == 3;
+                let apply = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    let lanes = if double { if scalar { 1 } else { 2 } } else if scalar { 1 } else { 4 };
+                    for i in 0..lanes {
+                        let shift = if double { 64 * i } else { 32 * i };
+                        let mask: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                        let (x, y) = if double {
+                            (
+                                f64::from_bits(((a >> shift) & mask) as u64),
+                                f64::from_bits(((b >> shift) & mask) as u64),
+                            )
+                        } else {
+                            (
+                                f64::from(f32::from_bits(((a >> shift) & mask) as u32)),
+                                f64::from(f32::from_bits(((b >> shift) & mask) as u32)),
+                            )
+                        };
+                        // x86 MIN/MAX return the second operand when either input is NaN or both
+                        // are zero, which differs from Rust's f64::min/f64::max.
+                        let r = match op {
+                            0x58 => x + y,
+                            0x59 => x * y,
+                            0x5C => x - y,
+                            0x5D => if x.is_nan() || y.is_nan() || (x == 0.0 && y == 0.0) { y } else if x < y { x } else { y },
+                            0x5E => x / y,
+                            _ => if x.is_nan() || y.is_nan() || (x == 0.0 && y == 0.0) { y } else if x > y { x } else { y },
+                        };
+                        let bits = if double { u128::from(r.to_bits()) } else { u128::from((r as f32).to_bits()) };
+                        out |= bits << shift;
+                    }
+                    out
+                };
+                let result = apply(self.xmm[source], low);
+                self.xmm[reg] = if scalar {
+                    let keep: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                    (self.xmm[source] & !keep) | (result & keep)
+                } else {
+                    result
+                };
+                self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[source], high) } else { 0 };
+            }
+            (0, 0x12 | 0x13) if !vector_256 => {
+                // VMOVLPS: 0x12 loads m64 into the low quadword and vvvv into the high quadword;
+                // 0x13 stores the low quadword of the ModRM register to m64.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                if opcode == 0x12 {
+                    let low = self.read_rm(target, 8, true)?;
+                    self.xmm[reg] = u128::from(low) | (self.xmm[source] << 64);
+                    self.ymm_high[reg] = 0;
+                } else {
+                    self.write_rm(target, 8, true, self.xmm[reg] as u64)?;
+                }
+            }
+            (3, 0x7C | 0x7D) => {
+                // VHADDPS / VHSUBPS: pairwise horizontal add or subtract within each 128-bit lane.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let subtract = opcode == 0x7D;
+                let horizontal = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for i in 0..4u32 {
+                        let v = if i < 2 { a } else { b };
+                        let idx = (i % 2) * 2;
+                        let x = f32::from_bits(((v >> (32 * idx)) & 0xFFFF_FFFF) as u32);
+                        let y = f32::from_bits(((v >> (32 * (idx + 1))) & 0xFFFF_FFFF) as u32);
+                        let r = if subtract { x - y } else { x + y };
+                        out |= u128::from(r.to_bits()) << (32 * i);
+                    }
+                    out
+                };
+                self.xmm[reg] = horizontal(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { horizontal(self.ymm_high[source], high) } else { 0 };
+            }
+            (pp @ (0 | 1), op @ (0x52 | 0x53)) => {
+                // VRSQRTPS / VRCPPS and their double-precision forms.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let double = pp == 1;
+                let apply = |v: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    let lanes = if double { 2 } else { 4 };
+                    for i in 0..lanes {
+                        let shift = if double { 64 * i } else { 32 * i };
+                        let mask: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                        let x = if double {
+                            f64::from_bits(((v >> shift) & mask) as u64)
+                        } else {
+                            f64::from(f32::from_bits(((v >> shift) & mask) as u32))
+                        };
+                        let r = if op == 0x52 { 1.0 / x.sqrt() } else { 1.0 / x };
+                        let bits = if double { u128::from(r.to_bits()) } else { u128::from((r as f32).to_bits()) };
+                        out |= bits << shift;
+                    }
+                    out
+                };
+                self.xmm[reg] = apply(low);
+                self.ymm_high[reg] = if vector_256 { apply(high) } else { 0 };
+            }
+            (pp @ 0..=3, 0x51) => {
+                // VSQRTPS / VSQRTPD / VSQRTSS / VSQRTSD.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let scalar = pp >= 2;
+                let double = pp == 1 || pp == 3;
+                let apply = |v: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    let lanes = if double { if scalar { 1 } else { 2 } } else if scalar { 1 } else { 4 };
+                    for i in 0..lanes {
+                        let shift = if double { 64 * i } else { 32 * i };
+                        let mask: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                        let bits = if double {
+                            u128::from(f64::from_bits(((v >> shift) & mask) as u64).sqrt().to_bits())
+                        } else {
+                            u128::from(f32::from_bits(((v >> shift) & mask) as u32).sqrt().to_bits())
+                        };
+                        out |= bits << shift;
+                    }
+                    out
+                };
+                let result = apply(low);
+                self.xmm[reg] = if scalar {
+                    let keep: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                    (self.xmm[source] & !keep) | (result & keep)
+                } else {
+                    result
+                };
+                self.ymm_high[reg] = if vector_256 { apply(high) } else { 0 };
+            }
+            (0, 0xC6) => {
+                // VSHUFPS: two lanes from vvvv then two from the source, selected by imm8.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let imm = self.fetch_u8()?;
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let shuffle = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for i in 0..4u32 {
+                        let sel = u32::from((imm >> (2 * i)) & 3);
+                        let v = if i < 2 { a } else { b };
+                        out |= ((v >> (32 * sel)) & 0xFFFF_FFFF) << (32 * i);
+                    }
+                    out
+                };
+                self.xmm[reg] = shuffle(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { shuffle(self.ymm_high[source], high) } else { 0 };
+            }
+            (1, 0xC6) => {
+                // VSHUFPD: the low double comes from either operand, the high from the other.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let imm = self.fetch_u8()?;
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let shuffle = |a: u128, b: u128| -> u128 {
+                    let lo = if imm & 1 != 0 { b } else { a };
+                    let hi = if imm & 2 != 0 { a >> 64 } else { b >> 64 };
+                    (lo & u128::from(u64::MAX)) | (hi << 64)
+                };
+                self.xmm[reg] = shuffle(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { shuffle(self.ymm_high[source], high) } else { 0 };
+            }
+            (pp @ 0..=3, 0x5B) => {
+                // VCVTDQ2PS / VCVTDQ2PD / VCVTTPS2DQ / VCVTTPD2DQ.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let indefinite: u32 = 0x8000_0000;
+                let convert = |v: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    match pp {
+                        0 => {
+                            for i in 0..4u32 {
+                                let x = (v >> (32 * i)) as u32 as i32;
+                                out |= u128::from((x as f32).to_bits()) << (32 * i);
+                            }
+                        }
+                        1 => {
+                            for i in 0..2u32 {
+                                let x = (v >> (32 * i)) as u32 as i32;
+                                out |= u128::from((f64::from(x)).to_bits()) << (64 * i);
+                            }
+                        }
+                        2 => {
+                            for i in 0..4u32 {
+                                let x = f32::from_bits(((v >> (32 * i)) & 0xFFFF_FFFF) as u32);
+                                let r = if x.is_nan() || x >= 2_147_483_648.0 || x < -2_147_483_648.0 {
+                                    indefinite
+                                } else {
+                                    (x as i32) as u32
+                                };
+                                out |= u128::from(r) << (32 * i);
+                            }
+                        }
+                        _ => {
+                            for i in 0..2u32 {
+                                let x = f64::from_bits(((v >> (64 * i)) & u128::from(u64::MAX)) as u64);
+                                let r = if x.is_nan() || x >= 2_147_483_648.0 || x < -2_147_483_648.0 {
+                                    indefinite
+                                } else {
+                                    (x as i32) as u32
+                                };
+                                out |= u128::from(r) << (32 * i);
+                            }
+                        }
+                    }
+                    out
+                };
+                self.xmm[reg] = convert(low);
+                self.ymm_high[reg] = if vector_256 { convert(high) } else { 0 };
+            }
+            (1, 0x6B) => {
+                // VPACKSSDW: pack eight signed dwords into eight signed words with saturation.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let pack = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    for (half, v) in [a, b].into_iter().enumerate() {
+                        for i in 0..4u32 {
+                            let x = ((v >> (32 * i)) as u32) as i32;
+                            let s = x.clamp(-32768, 32767) as i16 as u16;
+                            out |= u128::from(s) << (16 * (half as u32 * 4 + i));
+                        }
+                    }
+                    out
+                };
+                self.xmm[reg] = pack(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { pack(self.ymm_high[source], high) } else { 0 };
+            }
+            (0 | 1, 0x2E | 0x2F) => {
+                // VUCOMISS / VUCOMISD / VCOMISS / VCOMISD.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                if mandatory_prefix == 1 {
+                    let a = f64::from_bits(self.xmm[reg] as u64);
+                    let b = self.read_xmm_f64(target)?;
+                    self.set_fp_cmp_flags(a, b);
+                } else {
+                    let a = f64::from(f32::from_bits(self.xmm[reg] as u32));
+                    let b = f64::from(self.read_xmm_f32(target)?);
+                    self.set_fp_cmp_flags(a, b);
+                }
+            }
+            (pp @ (0 | 1), op @ (0x14 | 0x15)) => {
+                // VUNPCKLPS/HPS and VUNPCKLPD/HPD: interleave the low or high lanes of both
+                // operands within each 128-bit lane.
+                let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+                let target = self.resolve_target(target, 0);
+                let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+                let double = pp == 1;
+                let high_half = op == 0x15;
+                let unpack = |a: u128, b: u128| -> u128 {
+                    let mut out: u128 = 0;
+                    if double {
+                        let base = if high_half { 1 } else { 0 };
+                        let a_lane = (a >> (64 * base)) & u128::from(u64::MAX);
+                        let b_lane = (b >> (64 * base)) & u128::from(u64::MAX);
+                        out = a_lane | (b_lane << 64);
+                    } else {
+                        let base = if high_half { 2 } else { 0 };
+                        for i in 0..2u32 {
+                            let a_lane = (a >> (32 * (base + i))) & u128::from(u32::MAX);
+                            let b_lane = (b >> (32 * (base + i))) & u128::from(u32::MAX);
+                            out |= (a_lane << (64 * i)) | (b_lane << (64 * i + 32));
+                        }
+                    }
+                    out
+                };
+                self.xmm[reg] = unpack(self.xmm[source], low);
+                self.ymm_high[reg] = if vector_256 { unpack(self.ymm_high[source], high) } else { 0 };
+            }
+            _ => return Err(format!("Unsupported VEX vector operation {opcode:#04x} (pp={mandatory_prefix}, l={vector_256}) at {start_rip:#x}")),
+        }
+        Ok(())
+    }
+
     fn step_vex3(&mut self, start_rip: u64) -> Result<(), String> {
         let b1 = self.fetch_u8()?;
         let b2 = self.fetch_u8()?;
@@ -2519,12 +3554,229 @@ impl XboxX64Emu {
         let rex_x = (((b1 >> 6) & 1) ^ 1) as usize;
         let rex_b = (((b1 >> 5) & 1) ^ 1) as usize;
         let map = b1 & 0x1F;
+        if map == 1 {
+            return self.step_vex_vector((b2 & 0x7F) | (b1 & 0x80), rex_x, rex_b, b2 & 0x80 != 0, op, start_rip);
+        }
         let w = (b2 & 0x80) != 0;
         let vvvv = (((!b2) >> 3) & 0xF) as usize;
         let pp = b2 & 3;
         let sz: u8 = if w { 8 } else { 4 };
         let bits = (sz as u32) * 8;
         let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+
+        if map == 2 && pp == 1 && matches!(op, 0x98..=0x9F | 0xA8..=0xAF | 0xB8..=0xBF) {
+            // FMA3: 0x98/0xA8/0xB8 are the 132/213/231 add forms, the odd opcodes are their
+            // scalar variants, 0x9A/0xAA/0xBA subtract the third operand, and the 0x9C block
+            // negates the product.
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let target = self.resolve_target(target, 0);
+            let vector_256 = b2 & 4 != 0;
+            let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+            let scalar = op & 1 != 0;
+            let negate = matches!(op, 0x9C..=0x9F | 0xAC..=0xAF | 0xBC..=0xBF);
+            let subtract = matches!(
+                op,
+                0x9A | 0x9B | 0xAA | 0xAB | 0xBA | 0xBB | 0x9E | 0x9F | 0xAE | 0xAF | 0xBE | 0xBF
+            );
+            let order = (op >> 4) - 9;
+            let apply = |a: u128, b: u128, c: u128| -> u128 {
+                let mut out: u128 = 0;
+                let lanes = if w { if scalar { 1 } else { 2 } } else if scalar { 1 } else { 4 };
+                for i in 0..lanes {
+                    let shift = if w { 64 * i } else { 32 * i };
+                    let mask: u128 = if w { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                    let (x, y, z) = if w {
+                        (
+                            f64::from_bits(((a >> shift) & mask) as u64),
+                            f64::from_bits(((b >> shift) & mask) as u64),
+                            f64::from_bits(((c >> shift) & mask) as u64),
+                        )
+                    } else {
+                        (
+                            f64::from(f32::from_bits(((a >> shift) & mask) as u32)),
+                            f64::from(f32::from_bits(((b >> shift) & mask) as u32)),
+                            f64::from(f32::from_bits(((c >> shift) & mask) as u32)),
+                        )
+                    };
+                    let (product, addend) = match order {
+                        0 => (x * z, y),
+                        1 => (y * x, z),
+                        _ => (y * z, x),
+                    };
+                    let product = if negate { -product } else { product };
+                    let r = if subtract { product - addend } else { product + addend };
+                    let bits = if w { u128::from(r.to_bits()) } else { u128::from((r as f32).to_bits()) };
+                    out |= bits << shift;
+                }
+                out
+            };
+            let result = apply(self.xmm[reg], self.xmm[vvvv], low);
+            self.xmm[reg] = if scalar {
+                let keep: u128 = if w { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                (self.xmm[vvvv] & !keep) | (result & keep)
+            } else {
+                result
+            };
+            self.ymm_high[reg] = if vector_256 { apply(self.ymm_high[reg], self.ymm_high[vvvv], high) } else { 0 };
+            return Ok(());
+        }
+
+        if map == 3 && pp == 1 && matches!(op, 0x0C | 0x0D) && !w {
+            // VBLENDPS / VBLENDPD: pick each lane from vvvv or the source by the imm8 mask.
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let target = self.resolve_target(target, 0);
+            let imm = self.fetch_u8()?;
+            let vector_256 = b2 & 4 != 0;
+            let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+            let double = op == 0x0D;
+            let blend = |a: u128, b: u128, base: u32| -> u128 {
+                let mut out: u128 = 0;
+                let lanes = if double { 2 } else { 4 };
+                for i in 0..lanes {
+                    let shift = if double { 64 * i } else { 32 * i };
+                    let mask: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                    let v = if (imm >> (base + i)) & 1 != 0 { b } else { a };
+                    out |= ((v >> shift) & mask) << shift;
+                }
+                out
+            };
+            self.xmm[reg] = blend(self.xmm[vvvv], low, 0);
+            self.ymm_high[reg] = if vector_256 { blend(self.ymm_high[vvvv], high, 4) } else { 0 };
+            return Ok(());
+        }
+
+        if map == 3 && pp == 1 && matches!(op, 0x08 | 0x09) && !w {
+            // VROUNDPS / VROUNDPD: imm8[1:0] selects nearest, floor, ceil or truncate.
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let target = self.resolve_target(target, 0);
+            let imm = self.fetch_u8()?;
+            let vector_256 = b2 & 4 != 0;
+            let (low, high) = if vector_256 { self.read_ymm_rm(target)? } else { (self.read_xmm_rm(target)?, 0) };
+            let double = op == 0x09;
+            let mode = imm & 3;
+            let round = |v: u128| -> u128 {
+                let mut out: u128 = 0;
+                let lanes = if double { 2 } else { 4 };
+                for i in 0..lanes {
+                    let shift = if double { 64 * i } else { 32 * i };
+                    let mask: u128 = if double { u128::from(u64::MAX) } else { u128::from(u32::MAX) };
+                    let bits = if double {
+                        let x = f64::from_bits(((v >> shift) & mask) as u64);
+                        let r = match mode { 0 => x.round_ties_even(), 1 => x.floor(), 2 => x.ceil(), _ => x.trunc() };
+                        u128::from(r.to_bits())
+                    } else {
+                        let x = f32::from_bits(((v >> shift) & mask) as u32);
+                        let r = match mode { 0 => x.round_ties_even(), 1 => x.floor(), 2 => x.ceil(), _ => x.trunc() };
+                        u128::from(r.to_bits())
+                    };
+                    out |= bits << shift;
+                }
+                out
+            };
+            self.xmm[reg] = round(low);
+            self.ymm_high[reg] = if vector_256 { round(high) } else { 0 };
+            return Ok(());
+        }
+
+        if (map, pp, op) == (3, 1, 0x21) && !w && b2 & 4 == 0 {
+            // VINSERTPS: insert one lane of the source into vvvv, then apply the zero mask.
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let target = self.resolve_target(target, 0);
+            let imm = self.fetch_u8()?;
+            let src2 = match target {
+                ModRmResolved::Reg(r) => self.xmm[r],
+                ModRmResolved::Mem(address) => u128::from(self.mem.read_u32(address)?),
+            };
+            let lane_mask = u128::from(u32::MAX);
+            let mut out = self.xmm[vvvv];
+            let dst_lane = u32::from((imm >> 4) & 3);
+            let src_lane = u32::from((imm >> 6) & 3);
+            let value = (src2 >> (32 * src_lane)) & lane_mask;
+            out = (out & !(lane_mask << (32 * dst_lane))) | (value << (32 * dst_lane));
+            for i in 0..4u32 {
+                if (imm >> i) & 1 != 0 {
+                    out &= !(lane_mask << (32 * i));
+                }
+            }
+            self.xmm[reg] = out;
+            self.ymm_high[reg] = 0;
+            return Ok(());
+        }
+
+        if (map, pp, op) == (2, 1, 0x59) && !w && vvvv == 0 {
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let value = match self.resolve_target(target, 0) {
+                ModRmResolved::Reg(reg) => self.xmm[reg] as u64,
+                ModRmResolved::Mem(address) => self.mem.read_u64(address)?,
+            };
+            let packed = u128::from(value) | (u128::from(value) << 64);
+            self.xmm[reg] = packed;
+            self.ymm_high[reg] = if b2 & 4 != 0 { packed } else { 0 };
+            return Ok(());
+        }
+
+        if (map, pp, op) == (2, 1, 0x1A) && !w && b2 & 4 != 0 {
+            // VBROADCASTF128: replicate a 128-bit memory operand into both halves of the ymm.
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let target = self.resolve_target(target, 0);
+            let value = match target {
+                ModRmResolved::Reg(r) => self.xmm[r],
+                ModRmResolved::Mem(address) => {
+                    let lo = self.mem.read_u64(address)?;
+                    let hi = self.mem.read_u64(address + 8)?;
+                    u128::from(lo) | (u128::from(hi) << 64)
+                }
+            };
+            self.xmm[reg] = value;
+            self.ymm_high[reg] = value;
+            return Ok(());
+        }
+
+        if (map, pp, op) == (2, 1, 0x18) && !w && vvvv == 0 {
+            // VBROADCASTSS: replicate the low single of an xmm/m32 source across the destination.
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let target = self.resolve_target(target, 0);
+            let value = match target {
+                ModRmResolved::Reg(r) => self.xmm[r] as u32,
+                ModRmResolved::Mem(address) => self.mem.read_u32(address)?,
+            };
+            let fill = u128::from(value) * 0x0000_0001_0000_0001_0000_0001_0000_0001u128;
+            self.xmm[reg] = fill;
+            self.ymm_high[reg] = if b2 & 4 != 0 { fill } else { 0 };
+            return Ok(());
+        }
+
+        if (map, pp, op) == (2, 1, 0x78) && !w && vvvv == 0 {
+            // VPBROADCASTB: replicate the low byte of an xmm/m8 source across the destination.
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let target = self.resolve_target(target, 0);
+            let byte = match target {
+                ModRmResolved::Reg(r) => self.xmm[r] as u8,
+                ModRmResolved::Mem(address) => self.mem.read_u8(address)?,
+            };
+            let fill = u128::from(byte) * 0x0101_0101_0101_0101_0101_0101_0101_0101u128;
+            self.xmm[reg] = fill;
+            self.ymm_high[reg] = if b2 & 4 != 0 { fill } else { 0 };
+            return Ok(());
+        }
+
+        if (map, pp, op) == (3, 1, 0) && w && b2 & 4 != 0 && vvvv == 0 {
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let selector = self.fetch_u8()?;
+            let (low, high) = self.read_ymm_rm(self.resolve_target(target, 0))?;
+            let lanes = [low as u64, (low >> 64) as u64, high as u64, (high >> 64) as u64];
+            let lane = |index: u32| u128::from(lanes[usize::from((selector >> index) & 3)]);
+            self.xmm[reg] = lane(0) | (lane(2) << 64);
+            self.ymm_high[reg] = lane(4) | (lane(6) << 64);
+            return Ok(());
+        }
+
+        if (map, pp, op) == (3, 1, 0x16) && b2 & 4 == 0 && vvvv == 0 {
+            let (reg, target) = self.decode_modrm(rex_r, rex_x, rex_b)?;
+            let lane = u32::from(self.fetch_u8()?) & (128 / bits - 1);
+            let target = self.resolve_target(target, 0);
+            return self.write_rm(target, sz, true, (self.xmm[reg] >> (lane * bits)) as u64 & mask);
+        }
 
         let (reg, t) = self.decode_modrm(rex_r, rex_x, rex_b)?;
         let is_rorx = map == 3 && pp == 3 && op == 0xF0;
@@ -2666,6 +3918,405 @@ impl Pe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_semaphore_consumes_counts_and_reports_previous_count_on_release() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        let stack = emu.regs[RSP];
+        let previous = stack - 8;
+        let call = |emu: &mut XboxX64Emu, name: &str, first, second, third| {
+            emu.regs[RSP] = stack;
+            emu.regs[RCX] = first;
+            emu.regs[RDX] = second;
+            emu.regs[R8] = third;
+            emu.dispatch_hle(&ThunkEntry {
+                dll: "api-ms-win-core-synch-l1-1-0.dll".to_owned(),
+                name: name.to_owned(),
+            }).unwrap();
+            emu.regs[RAX]
+        };
+
+        emu.mem.write_u32(stack + 0x30, SYNCHRONIZE_ACCESS | SEMAPHORE_MODIFY_ACCESS).unwrap();
+        let handle = call(&mut emu, "CreateSemaphoreExW", 0, 1, 2);
+        assert_ne!(handle, 0);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", handle, 0, 0), 0);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", handle, 0, 0), WAIT_TIMEOUT);
+        assert_eq!(call(&mut emu, "ReleaseSemaphore", handle, 2, previous), 1);
+        assert_eq!(emu.mem.read_u32(previous).unwrap(), 0);
+        assert_eq!(call(&mut emu, "ReleaseSemaphore", handle, 1, previous), 0);
+        assert_eq!(emu.mem.read_u32(emu.teb_va + LAST_ERROR_OFFSET).unwrap(), 298);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", handle, 0, 0), 0);
+        assert_eq!(call(&mut emu, "ReleaseSemaphore", handle, 1, previous), 1);
+        assert_eq!(emu.mem.read_u32(previous).unwrap(), 1);
+    }
+
+    #[test]
+    fn vex_128_xor_and_aligned_moves_preserve_the_vector_result() {
+        let code = [0xC5, 0xF0, 0x57, 0xC2, 0xC5, 0xF8, 0x29, 0x01, 0xC5, 0xF8, 0x28, 0x19, 0xC3];
+        let image = build_test_pe(&code, None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        emu.regs[RCX] = (emu.regs[RSP] - 32) & !15;
+        emu.xmm[1] = 0xFEDC_BA98_7654_3210;
+        emu.xmm[2] = 0xAAAA;
+        assert_eq!(emu.step_budget(3), EmuStepState::Running);
+        let expected = 0xFEDC_BA98_7654_3210 ^ 0xAAAA;
+        assert_eq!(emu.xmm[0], expected);
+        assert_eq!(emu.xmm[3], expected);
+    }
+
+    #[test]
+    fn avx_256_moves_both_halves_and_vzeroupper_clears_only_the_upper_half() {
+        let code = [0xC5, 0xFC, 0x11, 0x01, 0xC5, 0xFC, 0x10, 0x19, 0xC5, 0xF8, 0x77, 0xC3];
+        let image = build_test_pe(&code, None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        emu.regs[RCX] = emu.regs[RSP] - 64;
+        emu.xmm[0] = 0xFEDC_BA98;
+        emu.ymm_high[0] = 0x7654_3210;
+        assert_eq!(emu.step_budget(2), EmuStepState::Running);
+        assert_eq!((emu.xmm[3], emu.ymm_high[3]), (0xFEDC_BA98, 0x7654_3210));
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert_eq!((emu.xmm[3], emu.ymm_high[3]), (0xFEDC_BA98, 0));
+    }
+
+    #[test]
+    fn avx_packed_qword_add_wraps_per_lane_and_extracts_both_low_lanes() {
+        let code = [
+            0xC5, 0xF5, 0xD4, 0xC2,
+            0xC4, 0xE1, 0xF9, 0x7E, 0xC2,
+            0xC4, 0xE3, 0xF9, 0x16, 0xC3, 1,
+            0xC3,
+        ];
+        let image = build_test_pe(&code, None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        emu.xmm[1] = (4u128 << 64) | u128::from(u64::MAX);
+        emu.xmm[2] = (7u128 << 64) | 2;
+        emu.ymm_high[1] = (8u128 << 64) | 9;
+        emu.ymm_high[2] = (3u128 << 64) | 1;
+
+        assert_eq!(emu.step_budget(3), EmuStepState::Running);
+        assert_eq!(emu.regs[RDX], 1);
+        assert_eq!(emu.regs[RBX], 11);
+        assert_eq!(emu.ymm_high[0], (11u128 << 64) | 10);
+    }
+
+    #[test]
+    fn avx_broadcast_uses_vector_source_and_permute_can_cross_lane_halves() {
+        let code = [0xC4, 0xE2, 0x79, 0x59, 0xD1, 0xC4, 0xE3, 0xFD, 0x00, 0xD8, 0x1B, 0xC3];
+        let image = build_test_pe(&code, None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        emu.xmm[0] = (2u128 << 64) | 1;
+        emu.ymm_high[0] = (4u128 << 64) | 3;
+        emu.xmm[1] = (99u128 << 64) | 7;
+        emu.ymm_high[2] = u128::MAX;
+        assert_eq!(emu.step_budget(2), EmuStepState::Running);
+        assert_eq!(emu.xmm[2], (7u128 << 64) | 7);
+        assert_eq!(emu.ymm_high[2], 0);
+        assert_eq!(emu.xmm[3], (3u128 << 64) | 4);
+        assert_eq!(emu.ymm_high[3], (1u128 << 64) | 2);
+    }
+
+    #[test]
+    fn guest_events_support_auto_reset_manual_reset_and_nonblocking_waits() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        let stack = emu.regs[RSP];
+        let call = |emu: &mut XboxX64Emu, name: &str, first, second, third| {
+            emu.regs[RSP] = stack;
+            emu.regs[RCX] = first;
+            emu.regs[RDX] = second;
+            emu.regs[R8] = third;
+            emu.dispatch_hle(&ThunkEntry {
+                dll: "api-ms-win-core-synch-l1-1-0.dll".to_owned(),
+                name: name.to_owned(),
+            }).unwrap();
+            emu.regs[RAX]
+        };
+
+        let auto = call(&mut emu, "CreateEventW", 0, 0, 1);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", auto, 0, 0), 0);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", auto, 0, 0), WAIT_TIMEOUT);
+        let manual = call(&mut emu, "CreateEventW", 0, 1, 0);
+        assert_eq!(call(&mut emu, "SetEvent", manual, 0, 0), 1);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", manual, 0, 0), 0);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", manual, 0, 0), 0);
+        assert_eq!(call(&mut emu, "ResetEvent", manual, 0, 0), 1);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", manual, 0, 0), WAIT_TIMEOUT);
+        assert_eq!(call(&mut emu, "CloseHandle", manual, 0, 0), 1);
+        assert_eq!(call(&mut emu, "WaitForSingleObject", manual, 0, 0), WAIT_FAILED);
+    }
+
+    #[test]
+    fn synch_api_set_resolves_the_guest_critical_section_initializer() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        let scratch = emu.regs[RSP] - 384;
+        emu.mem.write_bytes(scratch, b"api-ms-win-core-synch-l1-2-0.dll\0").unwrap();
+        let handle = emu.get_runtime_module(scratch, false, false).unwrap();
+        assert_ne!(handle, 0);
+        emu.mem.write_bytes(scratch, b"InitializeCriticalSectionEx\0").unwrap();
+        let thunk = emu.get_runtime_export(handle, scratch).unwrap();
+        assert_ne!(thunk, 0);
+        assert_eq!(emu.get_runtime_export(handle, scratch).unwrap(), thunk);
+
+        emu.rip = thunk;
+        emu.regs[RCX] = scratch + 128;
+        emu.regs[RDX] = 2000;
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert_eq!(emu.mem.read_u32(scratch + 136).unwrap(), u32::MAX);
+        assert_eq!(emu.mem.read_u64(scratch + 160).unwrap(), 2000);
+        emu.mem.write_bytes(scratch, b"UnimplementedSymbol\0").unwrap();
+        assert_eq!(emu.get_runtime_export(handle, scratch).unwrap(), 0);
+    }
+
+    #[test]
+    fn crt_thread_locale_reports_previous_setting_and_invalid_arguments() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        let stack = emu.regs[RSP];
+        let thunk = ThunkEntry {
+            dll: "api-ms-win-crt-locale-l1-1-0.dll".to_owned(),
+            name: "_configthreadlocale".to_owned(),
+        };
+        for (arg, expected) in [(1u32, 2), (0, 1), (3, u32::MAX), (2, 1), (0, 2)] {
+            emu.regs[RSP] = stack;
+            emu.regs[RCX] = u64::from(arg);
+            emu.dispatch_hle(&thunk).unwrap();
+            assert_eq!(emu.regs[RAX], u64::from(expected));
+        }
+        assert_eq!(emu.mem.read_u32(emu.teb_va + CRT_ERRNO_OFFSET).unwrap(), CRT_EINVAL);
+    }
+
+    #[test]
+    fn memset_fills_guest_bytes_across_a_page_boundary_and_returns_destination() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        let base = emu.mem.alloc(None, PAGE_SIZE_4K * 2, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true).unwrap();
+        let dest = base + PAGE_SIZE_4K - 2;
+        emu.regs[RCX] = dest;
+        emu.regs[RDX] = 0x13A;
+        emu.regs[R8] = 5;
+        emu.dispatch_hle(&ThunkEntry {
+            dll: "VCRUNTIME140.dll".to_owned(),
+            name: "memset".to_owned(),
+        }).unwrap();
+        let mut bytes = [0; 7];
+        emu.mem.read_bytes(dest - 1, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0x3A, 0x3A, 0x3A, 0x3A, 0x3A, 0]);
+        assert_eq!(emu.regs[RAX], dest);
+    }
+
+    #[test]
+    fn initialize_slist_clears_exactly_one_aligned_header() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        let head = (emu.regs[RSP] - 32) & !15;
+        emu.mem.write_bytes(head, &[0xCC; 20]).unwrap();
+        emu.regs[RCX] = head;
+        let initialize = ThunkEntry {
+            dll: "api-ms-win-core-interlocked-l1-1-0.dll".to_owned(),
+            name: "InitializeSListHead".to_owned(),
+        };
+        emu.dispatch_hle(&initialize).unwrap();
+        assert_eq!(emu.mem.read_u64(head).unwrap(), 0);
+        assert_eq!(emu.mem.read_u64(head + 8).unwrap(), 0);
+        assert_eq!(emu.mem.read_u32(head + 16).unwrap(), 0xCCCC_CCCC);
+
+        emu.regs[RCX] = head + 8;
+        assert!(emu.dispatch_hle(&initialize).is_err());
+    }
+
+    #[test]
+    fn crt_argv_uses_guest_basename_and_an_empty_guest_environment() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe_with_executable_name(&image, r"package\Title Game.exe").unwrap();
+        emu.set_strict_imports();
+        let stack = emu.regs[RSP];
+        let call = |emu: &mut XboxX64Emu, name: &str, argument: u64| {
+            emu.regs[RSP] = stack;
+            emu.regs[RCX] = argument;
+            emu.dispatch_hle(&ThunkEntry {
+                dll: "api-ms-win-crt-runtime-l1-1-0.dll".to_owned(),
+                name: name.to_owned(),
+            }).unwrap();
+            emu.regs[RAX]
+        };
+
+        assert_eq!(call(&mut emu, "_configure_narrow_argv", 1), 0);
+        let argc = call(&mut emu, "__p___argc", 0);
+        let argv = call(&mut emu, "__p___argv", 0);
+        let args = emu.mem.read_u64(argv).unwrap();
+        let program = emu.mem.read_u64(args).unwrap();
+        assert_eq!(emu.mem.read_u32(argc).unwrap(), 1);
+        assert_eq!(emu.mem.read_cstr(program, 64).unwrap(), "Title Game.exe");
+        assert_eq!(emu.mem.read_u64(args + 8).unwrap(), 0);
+
+        assert_eq!(call(&mut emu, "_configure_narrow_argv", 0), 0);
+        assert_eq!(emu.mem.read_u32(argc).unwrap(), 0);
+        assert_eq!(emu.mem.read_u64(argv).unwrap(), 0);
+        assert_eq!(call(&mut emu, "_initialize_narrow_environment", 0), 0);
+        let environ = call(&mut emu, "__p__environ", 0);
+        let environment = emu.mem.read_u64(environ).unwrap();
+        assert_ne!(environment, 0);
+        assert_eq!(emu.mem.read_u64(environment).unwrap(), 0);
+    }
+
+    #[test]
+    fn crt_atexit_runs_guest_callbacks_in_reverse_order() {
+        let image = build_test_pe(&[0xC3, 0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        let entry = emu.rip;
+        let stack = emu.regs[RSP];
+        for callback in [entry, entry + 1] {
+            emu.regs[RCX] = callback;
+            emu.regs[RSP] = stack;
+            emu.dispatch_hle(&ThunkEntry {
+                dll: "ucrtbase.dll".to_owned(),
+                name: "_crt_atexit".to_owned(),
+            }).unwrap();
+            assert_eq!(emu.regs[RAX], 0);
+        }
+
+        emu.regs[RCX] = 7;
+        emu.regs[RSP] = stack;
+        emu.dispatch_hle(&ThunkEntry {
+            dll: "ucrtbase.dll".to_owned(),
+            name: "exit".to_owned(),
+        }).unwrap();
+        assert_eq!(emu.rip, entry + 1);
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert!(emu.crt_exit_callbacks.is_empty());
+        assert_eq!(emu.step_budget(1), EmuStepState::Exited(7));
+    }
+
+    #[test]
+    fn crt_file_mode_retains_valid_setting_and_reports_invalid_values() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        emu.set_strict_imports();
+        let stack = emu.regs[RSP];
+        let value = stack - 8;
+        let call = |emu: &mut XboxX64Emu, name: &str, argument: u64| {
+            emu.regs[RSP] = stack;
+            emu.regs[RCX] = argument;
+            emu.dispatch_hle(&ThunkEntry {
+                dll: "api-ms-win-crt-stdio-l1-1-0.dll".to_owned(),
+                name: name.to_owned(),
+            }).unwrap();
+            emu.regs[RAX]
+        };
+
+        assert_eq!(call(&mut emu, "_get_fmode", value), 0);
+        assert_eq!(emu.mem.read_u32(value).unwrap(), CRT_TEXT_MODE);
+        assert_eq!(call(&mut emu, "_set_fmode", u64::from(CRT_BINARY_MODE)), 0);
+        assert_eq!(call(&mut emu, "_set_fmode", 1), u64::from(CRT_EINVAL));
+        assert_eq!(call(&mut emu, "_get_fmode", value), 0);
+        assert_eq!(emu.mem.read_u32(value).unwrap(), CRT_BINARY_MODE);
+        assert_eq!(call(&mut emu, "_get_errno", value), 0);
+        assert_eq!(emu.mem.read_u32(value).unwrap(), CRT_EINVAL);
+
+        let file_mode = call(&mut emu, "__p__fmode", 0);
+        assert_eq!(emu.mem.read_u32(file_mode).unwrap(), CRT_BINARY_MODE);
+        let commit_mode = call(&mut emu, "__p__commode", 0);
+        assert_eq!(emu.mem.read_u32(commit_mode).unwrap(), 0);
+        emu.mem.write_u32(commit_mode, 1).unwrap();
+        assert_eq!(call(&mut emu, "__p__commode", 0), commit_mode);
+        assert_eq!(emu.mem.read_u32(commit_mode).unwrap(), 1);
+    }
+
+    #[test]
+    fn crt_initializers_run_in_order_and_resume_across_step_budgets() {
+        let code = [0xB8, 0x09, 0, 0, 0, 0xC3, 0xB8, 0x0C, 0, 0, 0, 0xC3];
+        let image = build_test_pe(&code, None, None);
+        for (name, expected_instructions, result) in [("_initterm_e", 2, 9), ("_initterm", 4, 0)] {
+            let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+            let entry = emu.rip;
+            let original_stack = emu.regs[RSP];
+            let table = original_stack - 0x90;
+            emu.mem.write_u64(table, 0).unwrap();
+            emu.mem.write_u64(table + 8, entry).unwrap();
+            emu.mem.write_u64(table + 16, entry + 6).unwrap();
+            emu.regs[RCX] = table;
+            emu.regs[RDX] = table + 24;
+            emu.dispatch_hle(&ThunkEntry {
+                dll: "api-ms-win-crt-runtime-l1-1-0.dll".to_owned(),
+                name: name.to_owned(),
+            }).unwrap();
+
+            for _ in 0..expected_instructions {
+                assert_eq!(emu.step_budget(1), EmuStepState::Running);
+            }
+            assert_eq!(emu.step_budget(1), EmuStepState::Exited(result));
+            assert_eq!(emu.regs[RSP], original_stack + 8);
+            assert!(emu.threads[0].crt_initializers.is_empty());
+        }
+    }
+
+    #[test]
+    fn cpuid_reports_virtual_features_and_zero_extends_results() {
+        let image = build_test_pe(&[0x0F, 0xA2, 0x0F, 0xA2, 0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        emu.regs[RAX] = 1 << 32;
+        emu.regs[RBX] = u64::MAX;
+        emu.regs[RCX] = u64::MAX;
+        emu.regs[RDX] = u64::MAX;
+        let flags = emu.rflags;
+
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert_eq!(emu.regs[RAX], 1);
+        assert_eq!(emu.regs[RBX], u64::from(u32::from_le_bytes(*b"HitB")));
+        assert_eq!(emu.regs[RCX], u64::from(u32::from_le_bytes(*b"4CPU")));
+        assert_eq!(emu.regs[RDX], u64::from(u32::from_le_bytes(*b"oyX6")));
+        assert_eq!(emu.rflags, flags);
+
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert_eq!(emu.regs[RCX], 0);
+        assert_eq!(emu.regs[RDX], 1 << 15);
+    }
+
+    #[test]
+    fn cmpxchg_updates_memory_only_on_a_matching_accumulator() {
+        let code = [0xF0, 0x0F, 0xB1, 0x11, 0xF0, 0x0F, 0xB1, 0x11, 0xC3];
+        let image = build_test_pe(&code, None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        let address = emu.regs[RSP] - 8;
+        emu.mem.write_u32(address, 7).unwrap();
+        emu.regs[RCX] = address;
+        emu.regs[RDX] = 12;
+        emu.regs[RAX] = (1 << 32) | 7;
+
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert_eq!(emu.mem.read_u32(address).unwrap(), 12);
+        assert_eq!(emu.regs[RAX], (1 << 32) | 7);
+        assert_ne!(emu.rflags & ZF, 0);
+
+        emu.regs[RDX] = 42;
+        assert_eq!(emu.step_budget(1), EmuStepState::Running);
+        assert_eq!(emu.mem.read_u32(address).unwrap(), 12);
+        assert_eq!(emu.regs[RAX], 12);
+        assert_eq!(emu.rflags & ZF, 0);
+        assert_ne!(emu.rflags & CF, 0);
+    }
+
+    #[test]
+    fn system_time_import_writes_utc_filetime_to_guest_memory() {
+        let image = build_test_pe(&[0xC3], None, None);
+        let mut emu = XboxX64Emu::load_pe(&image).unwrap();
+        emu.set_strict_imports();
+        let output = emu.regs[RSP] - 8;
+        emu.regs[RCX] = output;
+        let before = state::wall_clock_secs();
+        emu.dispatch_hle(&ThunkEntry {
+            dll: "api-ms-win-core-sysinfo-l1-1-0.dll".to_owned(),
+            name: "GetSystemTimeAsFileTime".to_owned(),
+        }).unwrap();
+        let after = state::wall_clock_secs();
+        let filetime = emu.mem.read_u64(output).unwrap();
+        let first = (before + FILETIME_UNIX_EPOCH_SECONDS) as u64 * FILETIME_TICKS_PER_SECOND;
+        let last = (after + FILETIME_UNIX_EPOCH_SECONDS) as u64 * FILETIME_TICKS_PER_SECOND;
+        assert!((first..=last).contains(&filetime));
+    }
 
     /// Builds a minimal runnable PE32+ with custom x86-64 code and optional imports for testing.
     fn build_test_pe(code: &[u8], dll: Option<&str>, func: Option<&str>) -> Vec<u8> {
@@ -2897,6 +4548,17 @@ mod tests {
         assert_eq!(placeholders.mem.committed_bytes(), before + 2 * PAGE_SIZE_64K);
         assert_eq!(placeholders.mem.read_u8(base).unwrap(), 0);
         assert_eq!(placeholders.mem.read_u8(base + 2 * PAGE_SIZE_64K).unwrap(), 0);
+
+        let (mut physical, before, result) = run(0x2040_2000, 4, 3 * PAGE_SIZE_64K);
+        assert!(result.stopped_reason.is_none(), "{:?}", result.stopped_reason);
+        let base = physical.regs[RAX];
+        let middle = base + PAGE_SIZE_64K;
+        assert_ne!(base, 0);
+        assert_eq!(physical.xmem_virtual_alloc(middle, PAGE_SIZE_64K, 0x2040_6000, 4), Some(middle));
+        assert!(physical.mem.free(middle));
+        assert!(physical.mem.free(base));
+        assert!(physical.mem.free(base + 2 * PAGE_SIZE_64K));
+        assert_eq!(physical.mem.committed_bytes(), before);
 
         let (_, _, result) = run(0x100000, 4, PAGE_SIZE_64K);
         assert!(result.stopped_reason.unwrap().contains("XMemVirtualAlloc allocation flags 0x100000"));

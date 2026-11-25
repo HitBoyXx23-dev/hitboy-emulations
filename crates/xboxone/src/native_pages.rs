@@ -230,9 +230,9 @@ impl Drop for PhysicalPages {
     }
 }
 
-pub(crate) unsafe extern "system" fn guest_virtual_free(address: *mut c_void, size: usize, flags: u32) -> i32 {
+pub unsafe extern "system" fn guest_virtual_free(address: *mut c_void, size: usize, flags: u32) -> i32 {
     crate::native::with_physical_pages(|pages| pages.release_window(address as usize, size, flags))
-        .flatten().unwrap_or_else(|| unsafe { VirtualFree(address, size, flags) })
+        .unwrap_or_else(|| unsafe { VirtualFree(address, size, flags) })
 }
 
 unsafe fn read_ids(count: usize, pointer: *const usize) -> Vec<usize> {
@@ -253,18 +253,18 @@ unsafe fn update_views(address: usize, count: usize, ids: *const usize, scatter:
         (address..end).step_by(PAGE_BYTES).collect()
     };
     let ids = if ids.is_null() { vec![0; count] } else { unsafe { read_ids(count, ids) } };
-    crate::native::with_physical_pages(|pages| pages.map(&addresses, &ids)).unwrap_or(false)
+    crate::native::with_physical_pages(|pages| pages.map(&addresses, &ids))
 }
 
-pub(crate) unsafe extern "system" fn map_pages(address: usize, count: usize, ids: *const usize) -> usize {
+pub unsafe extern "system" fn map_pages(address: usize, count: usize, ids: *const usize) -> usize {
     if unsafe { update_views(address, count, ids, false) } { address } else { 0 }
 }
 
-pub(crate) unsafe extern "system" fn map_pages_scatter(addresses: *const usize, count: u32, ids: *const usize) -> i32 {
+pub unsafe extern "system" fn map_pages_scatter(addresses: *const usize, count: u32, ids: *const usize) -> i32 {
     i32::from(unsafe { update_views(addresses as usize, count as usize, ids, true) })
 }
 
-pub(crate) unsafe extern "system" fn allocate_pages(
+pub unsafe extern "system" fn allocate_pages(
     _attributes: u64,
     count: *mut usize,
     output: *mut usize,
@@ -279,7 +279,7 @@ pub(crate) unsafe extern "system" fn allocate_pages(
     if output.is_null() {
         return 0;
     }
-    let pages = crate::native::with_physical_pages(|pages| pages.allocate(requested)).flatten();
+    let pages = crate::native::with_physical_pages(|pages| pages.allocate(requested));
     let Some(ids) = pages else {
         unsafe { count.write_unaligned(0) };
         return 0;
@@ -290,7 +290,7 @@ pub(crate) unsafe extern "system" fn allocate_pages(
     1
 }
 
-pub(crate) unsafe extern "system" fn free_pages(count: usize, ids: *const usize) -> i32 {
+pub unsafe extern "system" fn free_pages(count: usize, ids: *const usize) -> i32 {
     if count == 0 {
         return 1;
     }
@@ -298,7 +298,7 @@ pub(crate) unsafe extern "system" fn free_pages(count: usize, ids: *const usize)
         return 0;
     }
     let ids = unsafe { read_ids(count, ids) };
-    i32::from(crate::native::with_physical_pages(|pages| pages.free(&ids)).unwrap_or(false))
+    i32::from(crate::native::with_physical_pages(|pages| pages.free(&ids)))
 }
 
 #[cfg(test)]

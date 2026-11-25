@@ -104,7 +104,7 @@ mod win {
         xmem_virtual_alloc(address, size, flags, protection, false)
     }
 
-    extern "system" fn guest_xmem_virtual_alloc(
+    pub extern "system" fn guest_xmem_virtual_alloc(
         address: usize,
         size: usize,
         flags: u32,
@@ -160,7 +160,7 @@ mod win {
             if address == 0 || size == 0 || address % page_bytes != 0 || size % page_bytes != 0 {
                 return null;
             }
-            return if track_placeholders && crate::native::with_physical_pages(|pages| pages.carve_window(address, size)) == Some(true) {
+            return if track_placeholders && crate::native::with_physical_pages(|pages| pages.carve_window(address, size)) {
                 address as *mut c_void
             } else {
                 null
@@ -830,6 +830,25 @@ mod win {
         S_OK
     }
 
+    static GPU_VM_CONFIG: Mutex<Option<crate::era_mem::D3D12XboxVirtualMemoryConfig>> = Mutex::new(None);
+
+    pub extern "system" fn D3D12ConfigureVirtualMemoryX(config_ptr: u64) -> i32 {
+        const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+        if config_ptr == 0 {
+            return E_INVALIDARG;
+        }
+        let mut raw = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(config_ptr as *const u8, raw.as_mut_ptr(), raw.len());
+        }
+        let cfg = crate::era_mem::D3D12XboxVirtualMemoryConfig::from_le_bytes(&raw);
+        if cfg.validate().is_err() {
+            return E_INVALIDARG;
+        }
+        *GPU_VM_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
+        S_OK
+    }
+
     pub extern "system" fn D3D12SerializeRootSignatureX(
         desc: u64,
         version: u32,
@@ -1105,29 +1124,13 @@ mod win {
         crate::gpu_bridge::XgTileMode::Thin2D as u32
     }
 
-    /// D3D12XBOX_CreateDevice bridge: tries desktop `d3d12.dll!D3D12CreateDevice` first for
-    /// standard PC `ID3D12Device` IIDs, and falls back to our clean-room `ID3D12DeviceX` COM
-    /// vtable proxy when an Xbox-specific IID is requested or desktop D3D12 rejects the call.
-    pub extern "system" fn D3D12XBOX_CreateDevice(_params: u64, riid: u64, pp_device: u64) -> i32 {
+    /// D3D12XBOX_CreateDevice bridge: always returns our Xbox-ABI-safe `ID3D12DeviceX` COM
+    /// wrapper (which internally attaches a live desktop `ID3D12Device*` when `d3d12.dll` is
+    /// present) so Xbox extension slots (44..63, including slot 49) never mis-dispatch into
+    /// desktop `ID3D12Device1..11` methods.
+    pub extern "system" fn D3D12XBOX_CreateDevice(_params: u64, _riid: u64, pp_device: u64) -> i32 {
         if pp_device == 0 {
             return E_FAIL;
-        }
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn LoadLibraryA(name: *const u8) -> *mut c_void;
-            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-        }
-        let d3d12 = unsafe { LoadLibraryA(b"d3d12.dll\0".as_ptr()) };
-        if !d3d12.is_null() {
-            let sym = unsafe { GetProcAddress(d3d12, b"D3D12CreateDevice\0".as_ptr()) };
-            if !sym.is_null() && riid != 0 {
-                let create: extern "system" fn(*mut c_void, u32, u64, u64) -> i32 = unsafe { std::mem::transmute(sym) };
-                // D3D_FEATURE_LEVEL_12_0 = 0xC000
-                let hr = create(std::ptr::null_mut(), 0xC000, riid, pp_device);
-                if hr == S_OK {
-                    return S_OK;
-                }
-            }
         }
         let dev = crate::d3d12x_com::create_device();
         unsafe { std::ptr::write_unaligned(pp_device as *mut u64, dev as u64) };
@@ -1216,7 +1219,10 @@ mod win {
             _ if name.eq_ignore_ascii_case("XUserGetLocalId") => XUserGetLocalId as *mut c_void,
             _ if name.eq_ignore_ascii_case("XDeviceCreate") => XDeviceCreate as *mut c_void,
             _ if name.eq_ignore_ascii_case("XGComputeOptimalTileMode") => XGComputeOptimalTileMode as *mut c_void,
-            _ if name.eq_ignore_ascii_case("D3D12XBOX_CreateDevice") => D3D12XBOX_CreateDevice as *mut c_void,
+            _ if name.eq_ignore_ascii_case("D3D12XBOX_CreateDevice")
+                || name.eq_ignore_ascii_case("D3D12XboxCreateDevice") => D3D12XBOX_CreateDevice as *mut c_void,
+            _ if name.eq_ignore_ascii_case("D3D12XboxCreateDevice") => D3D12XBOX_CreateDevice as *mut c_void,
+            _ if name.eq_ignore_ascii_case("D3D12ConfigureVirtualMemoryX") => D3D12ConfigureVirtualMemoryX as *mut c_void,
             _ if name.eq_ignore_ascii_case("D3D11XCreateDeviceX") => D3D11XCreateDeviceX as *mut c_void,
             _ if name.eq_ignore_ascii_case("XUserGetLocale") => XUserGetLocale as *mut c_void,
             _ if name.eq_ignore_ascii_case("XStoreCreateContext") => XStoreCreateContext as *mut c_void,
@@ -1239,6 +1245,7 @@ mod win {
             _ if name.eq_ignore_ascii_case("AcpHalCreate") => AcpHalCreate as *mut c_void,
             _ if name.eq_ignore_ascii_case("AcpHalAllocateShapeContexts") => AcpHalAllocateShapeContexts as *mut c_void,
             _ if name.eq_ignore_ascii_case("AcpHalReleaseShapeContexts") => AcpHalReleaseShapeContexts as *mut c_void,
+            _ if name.eq_ignore_ascii_case("D3D12ConfigureVirtualMemoryX") => D3D12ConfigureVirtualMemoryX as *mut c_void,
             _ if name.eq_ignore_ascii_case("D3D12SerializeRootSignature") => D3D12SerializeRootSignatureX as *mut c_void,
             _ if name.eq_ignore_ascii_case("XcurlInitialize") => XcurlInitialize as *mut c_void,
             _ if name.eq_ignore_ascii_case("XcurlUninitialize") => XcurlUninitialize as *mut c_void,

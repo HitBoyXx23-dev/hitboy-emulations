@@ -83,6 +83,42 @@ pub struct TitleMemoryStatus {
     pub title_avail: u64,
 }
 
+/// Xbox Series X|S `D3D12ConfigureVirtualMemoryX` 32-byte configuration structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct D3D12XboxVirtualMemoryConfig {
+    pub flags: u32,
+    pub page_table_levels: u32,
+    pub reserved0: u64,
+    pub reserved1: u64,
+    pub reserved2: u64,
+}
+
+impl D3D12XboxVirtualMemoryConfig {
+    pub fn from_le_bytes(bytes: &[u8; 32]) -> Self {
+        Self {
+            flags: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            page_table_levels: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            reserved0: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            reserved1: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            reserved2: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+        }
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        if self.flags != 0 || self.reserved0 != 0 || self.reserved1 != 0 || self.reserved2 != 0 {
+            return Err("D3D12ConfigureVirtualMemoryX: unsupported non-zero flags or reserved fields".into());
+        }
+        if !matches!(self.page_table_levels, 0 | 3 | 4) {
+            return Err(format!(
+                "D3D12ConfigureVirtualMemoryX: unsupported page_table_levels {}",
+                self.page_table_levels
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Sandboxed 64-bit virtual address space for an Xbox One / Series X|S title.
 #[derive(Debug, Clone)]
 pub struct TitleAddressSpace {
@@ -90,6 +126,7 @@ pub struct TitleAddressSpace {
     gpu_aliases: Vec<GpuAliasWindow>,
     physical_pages: BTreeMap<u64, Vec<u8>>,
     physical_mappings: BTreeMap<u64, u64>,
+    gpu_vm_config: Option<D3D12XboxVirtualMemoryConfig>,
     next_physical_page: u64,
     next_alloc_va: u64,
     next_gpu_va: u64,
@@ -110,12 +147,24 @@ impl TitleAddressSpace {
             gpu_aliases: Vec::new(),
             physical_pages: BTreeMap::new(),
             physical_mappings: BTreeMap::new(),
+            gpu_vm_config: None,
             next_physical_page: 16,
             next_alloc_va: 0x0000_0001_0000_0000,
             next_gpu_va: 0x0000_0100_0000_0000,
             total_budget,
             peak_committed: 0,
         }
+    }
+
+    /// Validates and records the active `D3D12ConfigureVirtualMemoryX` configuration for this title.
+    pub fn configure_gpu_virtual_memory(&mut self, config: D3D12XboxVirtualMemoryConfig) -> Result<(), String> {
+        config.validate()?;
+        self.gpu_vm_config = Some(config);
+        Ok(())
+    }
+
+    pub fn gpu_virtual_memory_config(&self) -> Option<D3D12XboxVirtualMemoryConfig> {
+        self.gpu_vm_config
     }
 
     pub fn align_up(value: u64, align: u64) -> u64 {
@@ -247,8 +296,9 @@ impl TitleAddressSpace {
     /// Releases a region by its base address.
     pub fn free(&mut self, base: u64) -> bool {
         if let Some(region) = self.regions.remove(&base) {
-            self.physical_mappings.retain(|address, _| *address < base || *address >= base + region.size);
-            self.gpu_aliases.retain(|w| w.title_va != base);
+            let end = base + region.size;
+            self.physical_mappings.retain(|address, _| *address < base || *address >= end);
+            self.gpu_aliases.retain(|window| window.title_va >= end || window.title_va + window.size <= base);
             true
         } else {
             false
@@ -262,6 +312,28 @@ impl TitleAddressSpace {
                 region.protect = MemoryProtect::ReadWrite;
             }
         }
+    }
+
+    pub(crate) fn carve_physical_window(&mut self, base: u64, size: u64) -> bool {
+        if base % PAGE_SIZE_64K != 0 || size == 0 || size % PAGE_SIZE_64K != 0 {
+            return false;
+        }
+        let Some(end) = base.checked_add(size) else { return false };
+        let Some(region) = self.find_region(base).filter(|region| {
+            region.physical_window && !region.committed && end <= region.base + region.size
+        }) else { return false };
+        let original_base = region.base;
+        let original_end = region.base + region.size;
+        let original = self.regions.remove(&original_base).unwrap();
+        for (start, stop) in [(original_base, base), (base, end), (end, original_end)] {
+            if start < stop {
+                let mut region = original.clone();
+                region.base = start;
+                region.size = stop - start;
+                self.regions.insert(start, region);
+            }
+        }
+        true
     }
 
     pub(crate) fn allocate_physical_pages(&mut self, count: u64) -> Option<Vec<u64>> {
@@ -322,15 +394,20 @@ impl TitleAddressSpace {
         true
     }
 
-    fn physical_slices(&self, address: u64, length: usize, region_end: u64) -> Result<Vec<(u64, usize, usize)>, String> {
-        let end = address.checked_add(length as u64).filter(|end| *end <= region_end)
-            .ok_or("Physical memory access crosses its reserved window")?;
+    fn physical_slices(&self, address: u64, length: usize, write: bool) -> Result<Vec<(u64, usize, usize)>, String> {
+        let end = address.checked_add(length as u64).ok_or("Physical memory access range overflow")?;
         let mut slices = Vec::new();
         let mut cursor = address;
         while cursor < end {
             let base = cursor & !(PAGE_SIZE_64K - 1);
             let offset = cursor - base;
             let bytes = (PAGE_SIZE_64K - offset).min(end - cursor);
+            if !self.find_region(cursor).is_some_and(|region| {
+                region.physical_window && cursor + bytes <= region.base + region.size
+                    && if write { region.protect.is_writable() } else { region.protect.is_readable() }
+            }) {
+                return Err(format!("Physical memory access fault at {cursor:#x}"));
+            }
             let page = self.physical_mappings.get(&base)
                 .ok_or_else(|| format!("Unmapped physical page at {base:#x}"))?;
             slices.push((*page, offset as usize, bytes as usize));
@@ -340,14 +417,14 @@ impl TitleAddressSpace {
     }
 
     pub(crate) fn can_write_bytes(&self, address: u64, length: u64) -> bool {
-        let resolved = self.translate_gpu_va(address).unwrap_or(address);
+        let Ok(resolved) = self.resolve_access_address(address, length) else { return false };
         self.find_region(resolved).is_some_and(|region| {
             if !region.protect.is_writable() {
                 return false;
             }
             if region.physical_window {
                 return usize::try_from(length).ok().is_some_and(|length| {
-                    self.physical_slices(resolved, length, region.base + region.size).is_ok()
+                    self.physical_slices(resolved, length, true).is_ok()
                 });
             }
             region.committed && resolved.checked_add(length)
@@ -369,20 +446,31 @@ impl TitleAddressSpace {
         Ok(old)
     }
 
-    /// Creates a GPU-visible alias window backed by an existing committed title VA region.
     pub fn map_gpu_alias(&mut self, title_va: u64, size: u64) -> Result<GpuAliasWindow, String> {
+        if size == 0 {
+            return Err("GPU aliases must have a nonzero length".into());
+        }
         let region = self
             .find_region(title_va)
             .ok_or_else(|| format!("title VA {title_va:#x} is not mapped"))?;
-        if !region.committed {
+        if !region.committed && !region.physical_window {
             return Err(format!("title VA {title_va:#x} is reserved but not committed"));
         }
         let end = title_va.checked_add(size).ok_or("GPU alias range overflow")?;
         if end > region.base + region.size {
             return Err(format!("GPU alias range {title_va:#x}..{end:#x} exceeds region bounds"));
         }
-        let gpu_va = Self::align_up(self.next_gpu_va, PAGE_SIZE_64K);
-        self.next_gpu_va = Self::align_up(gpu_va + size.max(PAGE_SIZE_4K), PAGE_SIZE_64K);
+        let span = size.checked_add(PAGE_SIZE_64K - 1).ok_or("GPU alias range overflow")?
+            & !(PAGE_SIZE_64K - 1);
+        let mut gpu_va = self.next_gpu_va;
+        loop {
+            let next = gpu_va.checked_add(span).ok_or("GPU alias address space exhausted")?;
+            if !self.overlaps(gpu_va, size) {
+                self.next_gpu_va = next;
+                break;
+            }
+            gpu_va = next;
+        }
         let win = GpuAliasWindow { gpu_va, title_va, size };
         self.gpu_aliases.push(win);
         Ok(win)
@@ -390,17 +478,26 @@ impl TitleAddressSpace {
 
     /// Translates a GPU alias VA back to the backing title VA.
     pub fn translate_gpu_va(&self, gpu_va: u64) -> Option<u64> {
-        self.gpu_aliases.iter().find_map(|w| {
-            if gpu_va >= w.gpu_va && gpu_va < w.gpu_va + w.size {
-                Some(w.title_va + (gpu_va - w.gpu_va))
-            } else {
-                None
-            }
+        self.gpu_alias_at(gpu_va).map(|window| window.title_va + (gpu_va - window.gpu_va))
+    }
+
+    fn gpu_alias_at(&self, address: u64) -> Option<&GpuAliasWindow> {
+        self.gpu_aliases.iter().find(|window| {
+            address.checked_sub(window.gpu_va).is_some_and(|offset| offset < window.size)
         })
     }
 
+    fn resolve_access_address(&self, address: u64, size: u64) -> Result<u64, String> {
+        let Some(window) = self.gpu_alias_at(address) else { return Ok(address) };
+        let offset = address - window.gpu_va;
+        if size > window.size - offset {
+            return Err(format!("Access at {address:#x} crosses its GPU alias bounds"));
+        }
+        Ok(window.title_va + offset)
+    }
+
     pub fn read_bytes(&self, addr: u64, out: &mut [u8]) -> Result<(), String> {
-        let resolved = self.translate_gpu_va(addr).unwrap_or(addr);
+        let resolved = self.resolve_access_address(addr, out.len() as u64)?;
         let r = self
             .find_region(resolved)
             .ok_or_else(|| format!("memory read fault at {addr:#x}"))?;
@@ -409,7 +506,7 @@ impl TitleAddressSpace {
                 return Err(format!("Unreadable physical memory at {addr:#x}"));
             }
             let mut destination = 0;
-            for (page, offset, len) in self.physical_slices(resolved, out.len(), r.base + r.size)? {
+            for (page, offset, len) in self.physical_slices(resolved, out.len(), false)? {
                 out[destination..destination + len].copy_from_slice(&self.physical_pages[&page][offset..offset + len]);
                 destination += len;
             }
@@ -428,7 +525,7 @@ impl TitleAddressSpace {
     }
 
     pub fn write_bytes(&mut self, addr: u64, src: &[u8]) -> Result<(), String> {
-        let resolved = self.translate_gpu_va(addr).unwrap_or(addr);
+        let resolved = self.resolve_access_address(addr, src.len() as u64)?;
         let (&base, _) = self
             .regions
             .range(..=resolved)
@@ -441,7 +538,7 @@ impl TitleAddressSpace {
                 return Err(format!("Non-writable physical memory at {addr:#x}"));
             }
             let mut source = 0;
-            for (page, offset, len) in self.physical_slices(resolved, src.len(), base + region.size)? {
+            for (page, offset, len) in self.physical_slices(resolved, src.len(), true)? {
                 self.physical_pages.get_mut(&page).unwrap()[offset..offset + len]
                     .copy_from_slice(&src[source..source + len]);
                 source += len;
@@ -555,6 +652,7 @@ impl TitleAddressSpace {
     fn overlaps(&self, start: u64, size: u64) -> bool {
         let end = start.saturating_add(size);
         self.regions.values().any(|r| start < r.base + r.size && r.base < end)
+            || self.gpu_aliases.iter().any(|w| start < w.gpu_va + w.size && w.gpu_va < end)
     }
 
     fn find_region(&self, addr: u64) -> Option<&VaRegion> {
@@ -616,6 +714,83 @@ mod tests {
     }
 
     #[test]
+    fn gpu_subrange_alias_enforces_its_bounds_and_expires_with_its_backing() {
+        let mut space = TitleAddressSpace::default();
+        let base = space.alloc(None, 0x3000, PAGE_SIZE_64K, MemoryProtect::ReadWrite, true).unwrap();
+        let alias = space.map_gpu_alias(base + 0x1000, 0x800).unwrap();
+        let last_word = alias.gpu_va + alias.size - 4;
+        space.write_u32(last_word, 0x1122_3344).unwrap();
+        assert_eq!(space.read_u32(base + 0x17FC).unwrap(), 0x1122_3344);
+        assert!(!space.can_write_bytes(last_word, 8));
+        assert!(space.write_u64(last_word, u64::MAX).is_err());
+        assert!(space.read_u64(last_word).is_err());
+        assert_eq!(space.read_u64(base + 0x17FC).unwrap(), 0x1122_3344);
+
+        assert!(space.free(base));
+        space.alloc(Some(base), 0x3000, PAGE_SIZE_64K, MemoryProtect::ReadWrite, true).unwrap();
+        assert_eq!(space.translate_gpu_va(last_word), None);
+        assert!(space.read_u32(last_word).is_err());
+    }
+
+    #[test]
+    fn gpu_aliases_and_title_allocations_do_not_shadow_each_other() {
+        let mut space = TitleAddressSpace::default();
+        let initial_gpu_va = space.next_gpu_va;
+        let base = space.alloc(Some(initial_gpu_va), PAGE_SIZE_64K, PAGE_SIZE_64K, MemoryProtect::ReadWrite, true).unwrap();
+        assert!(space.map_gpu_alias(base, 0).is_err());
+        let alias = space.map_gpu_alias(base, PAGE_SIZE_64K).unwrap();
+        assert_eq!(alias.gpu_va, initial_gpu_va + PAGE_SIZE_64K);
+        assert!(space.alloc(Some(alias.gpu_va), PAGE_SIZE_4K, PAGE_SIZE_4K, MemoryProtect::ReadWrite, true).is_err());
+    }
+
+    #[test]
+    fn sparse_gpu_alias_tracks_shared_physical_backing_without_committing_its_reservation() {
+        let mut space = TitleAddressSpace::default();
+        let reserve_bytes = 24 * 1024 * 1024 * 1024;
+        let title = space.alloc(None, reserve_bytes, PAGE_SIZE_64K, MemoryProtect::ReadWrite, false).unwrap();
+        let second = space.alloc(None, reserve_bytes, PAGE_SIZE_64K, MemoryProtect::ReadWrite, false).unwrap();
+        space.mark_physical_window(title);
+        space.mark_physical_window(second);
+        let gpu = space.map_gpu_alias(title, reserve_bytes).unwrap();
+        assert_eq!(space.status().title_used, 0);
+        assert!(space.read_u64(gpu.gpu_va).is_err());
+
+        let pages = space.allocate_physical_pages(1).unwrap();
+        assert!(space.map_physical_pages(&[(title, pages[0]), (second, pages[0])]));
+        space.write_u64(gpu.gpu_va, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(space.read_u64(second).unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(space.status().title_used, PAGE_SIZE_64K);
+        assert!(space.read_u64(gpu.gpu_va + PAGE_SIZE_64K).is_err());
+
+        assert!(space.map_physical_pages(&[(title, 0)]));
+        assert!(space.read_u64(gpu.gpu_va).is_err());
+        assert_eq!(space.read_u64(second).unwrap(), 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn carving_physical_window_preserves_cross_boundary_access_and_release_invalidates_alias() {
+        let mut space = TitleAddressSpace::default();
+        let base = space.alloc(None, PAGE_SIZE_64K * 3, PAGE_SIZE_64K, MemoryProtect::ReadWrite, false).unwrap();
+        space.mark_physical_window(base);
+        let middle = base + PAGE_SIZE_64K;
+        let pages = space.allocate_physical_pages(2).unwrap();
+        assert!(space.map_physical_pages(&[(base, pages[0]), (middle, pages[1])]));
+        let alias = space.map_gpu_alias(base, PAGE_SIZE_64K * 3).unwrap();
+        let crossing = alias.gpu_va + PAGE_SIZE_64K - 4;
+        assert!(!space.carve_physical_window(middle + 4, PAGE_SIZE_64K));
+        assert!(space.carve_physical_window(middle, PAGE_SIZE_64K));
+
+        space.write_u64(crossing, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(space.read_u64(crossing).unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(space.read_u32(middle).unwrap(), 0x1122_3344);
+        assert!(space.free(middle));
+        assert_eq!(space.translate_gpu_va(alias.gpu_va), None);
+        assert_eq!(space.read_u32(middle - 4).unwrap(), 0x5566_7788);
+        assert!(space.read_u64(middle - 4).is_err());
+        assert!(space.free_physical_pages(&[pages[1]]));
+    }
+
+    #[test]
     fn enforces_page_protections_and_bounds() {
         let mut space = TitleAddressSpace::default();
         let va = space.alloc(Some(0x1_4000_0000), 0x1000, PAGE_SIZE_4K, MemoryProtect::ReadOnly, true).unwrap();
@@ -636,5 +811,32 @@ mod tests {
         assert_eq!(xmem_alignment_from_attributes(1), 4096);
         assert_eq!(xmem_alignment_from_attributes(2), 65536);
         assert_eq!(xmem_alignment_from_attributes(6), 128);
+    }
+
+    #[test]
+    fn d3d12_configure_virtual_memory_validates_and_backs_24gib_sparse_windows() {
+        let mut space = TitleAddressSpace::default();
+        let mut raw = [0u8; 32];
+        raw[4..8].copy_from_slice(&4u32.to_le_bytes());
+        let cfg = D3D12XboxVirtualMemoryConfig::from_le_bytes(&raw);
+        assert!(space.configure_gpu_virtual_memory(cfg).is_ok());
+        assert_eq!(space.gpu_virtual_memory_config(), Some(cfg));
+
+        // Reject invalid page table levels or non-zero flags
+        let bad = D3D12XboxVirtualMemoryConfig { flags: 1, page_table_levels: 4, ..Default::default() };
+        assert!(space.configure_gpu_virtual_memory(bad).is_err());
+        let bad_lvl = D3D12XboxVirtualMemoryConfig { flags: 0, page_table_levels: 99, ..Default::default() };
+        assert!(space.configure_gpu_virtual_memory(bad_lvl).is_err());
+
+        // Follow with two 24 GiB sparse physical windows + shared 64 KiB page mapping
+        let size_24g = 0x6_0000_0000u64;
+        let w1 = space.alloc(None, size_24g, PAGE_SIZE_64K, MemoryProtect::ReadWrite, false).unwrap();
+        let w2 = space.alloc(None, size_24g, PAGE_SIZE_64K, MemoryProtect::ReadWrite, false).unwrap();
+        space.mark_physical_window(w1);
+        space.mark_physical_window(w2);
+        let pages = space.allocate_physical_pages(1).unwrap();
+        assert!(space.map_physical_pages(&[(w1, pages[0]), (w2, pages[0])]));
+        space.write_u64(w1 + 0x10, 0xCAFE_BABE_1234_5678).unwrap();
+        assert_eq!(space.read_u64(w2 + 0x10).unwrap(), 0xCAFE_BABE_1234_5678);
     }
 }
